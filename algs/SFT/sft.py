@@ -12,9 +12,9 @@ class SFT:
 
         self.model_engine = model_engine
         self.optimizer = optimizer
-        self.device = device
         self.micro_batch_size_per_gpu = micro_batch_size_per_gpu
         self.use_cache = use_cache
+        self.device = device
 
         # use cross entropy loss
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
