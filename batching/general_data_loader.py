@@ -3,7 +3,7 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import os
 
-class GeneralDataLoader(Dataset):
+class SFTDataset(Dataset):
     '''
         This is a general dataloader that works for any source data that has the following formant:
         {
