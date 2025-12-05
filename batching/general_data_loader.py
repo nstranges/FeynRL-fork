@@ -7,7 +7,7 @@ class GeneralDataLoader(Dataset):
     '''
         This is a general dataloader that works for any source data that has the following formant:
         {
-            "prompt": "this is a prompt",
+            "prompt": [{"role": "system", "content": "this is a system prompt"}, {"role": "user", "content": "this is a user prompt"}],
             "answer": "this is an answer",
             ...
         }

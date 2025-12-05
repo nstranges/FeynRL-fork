@@ -105,9 +105,7 @@ class SFT:
                 ######## 
                 # compute loss pass
                 ########
-                loss = self.compute_loss(logits=logits,
-                                         y=y,
-                                         mask=mask)
+                loss = self.compute_loss(logits=logits, y=y, mask=mask)
 
                 val_loss += loss.item()
 
@@ -134,9 +132,7 @@ class SFT:
             ######## 
             # compute loss pass
             ########
-            loss = self.compute_loss(logits=logits,
-                                     y=y,
-                                     mask=mask)
+            loss = self.compute_loss(logits=logits, y=y, mask=mask)
 
             ########    
             # backward step

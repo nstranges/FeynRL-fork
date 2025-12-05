@@ -41,7 +41,7 @@ def make_map_fn(split, params):
         answer_raw = example.pop("answer")
         solution   = extract_solution(answer_raw)
         data       = {
-            "prompt": create_prompt(question, params.use_system_prompt),\
+            "prompt": create_prompt(question, params.use_system_prompt),
             "answer": solution,
             "reward_model": {"style": "rule", "ground_truth": solution},
             "split": split,
