@@ -1,17 +1,29 @@
+run:
+  experiment_id: "run_1"
+  world_size: 1
+  distributed_training_strategy: "ddp"
+  seed: 42
+
 train:
   epochs: 30
-  batch_size: 16
+  global_batch_size: 16
   lr: 0.0003
   seed: 42
 
 model:
   name: "my-transformer"
-  hidden_size: 768
-  num_layers: 12
-  dropout: 0.1
+  dtype: "float16"
+  ref_model: ""
+  ref_model_device: "cpu"
 
 data:
   train_path: "data/train.jsonl"
   val_path: "data/val.jsonl"
   num_workers: 4
 
+ 
+deepspeed:
+  config: "./ds_config.json"
+ 
+inference_engine:
+  name: "vllm"
