@@ -24,7 +24,7 @@ class PairedDataset(Dataset):
         assert max_seq_len > 0, "max_seq_len must be greater than 0"
         assert tokenizer is not None, "tokenizer cannot be None"
         assert isinstance(data_path, str), "data_path must be a string"
-        assert os.path.exists(data_path), "data does not exist"
+        assert os.path.exists(os.path.expanduser(data_path)), f"{data_path} does not exist"
         # add this assert yo mask sure that tokenizer has a pad token (or if not, we already added during loading)
         assert tokenizer.pad_token_id is not None, "tokenizer must have a pad token"
 
@@ -62,8 +62,9 @@ class PairedDataset(Dataset):
         answer  = current_sample[self.answer_key]
 
         # now tokenize the prompt
-        prompt_chat_str = self.tokenizer.apply_chat_template(messages=message, add_generation_prompt=True, tokenize=False)
+        prompt_chat_str = self.tokenizer.apply_chat_template(conversation=message, add_generation_prompt=True, tokenize=False)
         prompt_ids_output = self.tokenizer(prompt_chat_str, return_tensors='pt', add_special_tokens=False)
+
         prompt_ids = prompt_ids_output['input_ids'][0]
         prompt_attn_mask = prompt_ids_output['attention_mask'][0]
 
