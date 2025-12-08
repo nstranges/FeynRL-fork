@@ -86,7 +86,7 @@ class SFT:
 
         return logits, y, mask
 
-    def val_step(self, data):
+    def eval_step(self, data):
         '''
            This function implements a single validation step per rank/gpu.
         '''
