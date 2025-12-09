@@ -75,8 +75,9 @@ class PairedDataset(Dataset):
         answer_attn_mask = answer_ids_output['attention_mask'][0]
 
         total_seq_len_just_ids = len(prompt_ids) + len(answer_ids)
+
         # if data is text, it should be 1-dim. adding dim=-1 for future compatibility.
-        seq_ids = torch.cat((prompt_ids, answer_ids), dim=-1)
+        seq_ids = torch.cat((prompt_ids, answer_ids), dim=-1, dtype=torch.long)
         seq_attn_mask = torch.cat((prompt_attn_mask, answer_attn_mask), dim=-1)
 
         # length check
