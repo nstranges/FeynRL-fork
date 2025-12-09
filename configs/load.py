@@ -76,6 +76,7 @@ class Model(BaseModel):
     ref_model_device: str
     trust_remote_code: bool
     use_cache: bool
+    model_class: str
 
 class DeepSpeed(BaseModel):
     '''
@@ -104,7 +105,7 @@ class Config(BaseModel):
     deepspeed: DeepSpeed
     inference_engine: InferenceEngine
 
-def load_and_verify(input_yaml: str):
+def load_and_verify(input_yaml: str, experiment_id: str, world_size: int):
     '''
         input_yaml: path to the yaml file
     '''
@@ -114,6 +115,8 @@ def load_and_verify(input_yaml: str):
 
         # now verify the config
         config = Config(**raw_config)
+        config.run.experiment_id = experiment_id
+        config.run.world_size = world_size
         print( "\n" + 20*"=" + "Config" + 20*"=")
         print(f"Contents of {input_yaml}")
         print(config.model_dump_json(indent=4))
@@ -136,4 +139,4 @@ def load_and_verify(input_yaml: str):
 
 if __name__ == "__main__":
     # load config
-    config = load_and_verify("./configs/sl_args.yaml")
+    config = load_and_verify("./configs/sl_args.yaml", experiment_id="run_1", world_size=1)
