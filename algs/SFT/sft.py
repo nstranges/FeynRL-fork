@@ -22,7 +22,8 @@ class SFT:
          y is target label [B, T -1]
          logits is model prediction [B, T -1, vocab_size]
         '''
-        B, T, vocab_size = logits.shape
+        # [B, T -1, vocab_size]
+        _, _, vocab_size = logits.shape
 
         # flatten logits across batch and seq_len before computing loss
         # so logits is [B * (T -1), vocab_size]
@@ -35,6 +36,7 @@ class SFT:
 
         # We need to apply mask to loss to remove any things 
         # which should not be considered in loss (e.g., padding tokens)
+        mask = mask.view(-1).to(dtype=per_token_loss.dtype)  # [B * (T - 1)]
         masked_loss = per_token_loss * mask
 
         # To avoid gardient accumulation error caused by loss.mean(),
@@ -76,7 +78,8 @@ class SFT:
         # so logits is [B, T -1, vocab_size]
         logits = every_token_logits[:, :-1, :].contiguous()
 
-        # last input token is EOS, so we ignore loss theal  e. so mask is [B, T -1]
+        # last input token is EOS, so we don't compute loss for it, hence
+        # we remove it from mask. so mask is [B, T -1]
         mask = batch['loss_mask'][:, :-1].contiguous()
 
         return logits, y, mask
@@ -86,7 +89,6 @@ class SFT:
            This function implements a single validation step per rank/gpu.
         '''
         # we need to split data into micro batches
-        val_loss = 0
         self.model_engine.eval()
         with torch.no_grad():
             # forward pass per gpu/rank
@@ -94,9 +96,9 @@ class SFT:
 
             # compute loss pass
             loss = self.compute_loss(logits=logits, y=y, mask=mask)
-            val_loss += loss.item()
+            val_loss = loss.item()
 
-        return {"loss": val_loss}
+        return {"loss": float(val_loss)}
 
     def train_step(self, micro_batch):
         '''
@@ -104,7 +106,6 @@ class SFT:
            The batch size for each gpu/rank should be micro_batch_size_per_gpu. 
            The DataLoader already yields micro-batches. 
         '''
-        step_loss = 0
         # make sure model is in training mode
         self.model_engine.train()
 
@@ -115,8 +116,8 @@ class SFT:
         loss = self.compute_loss(logits=logits, y=y, mask=mask)
 
         # 3. backward step
-        self.model_engine.zero_grad()
         # DeepSpeed backward handles gradient accumulation logic automatically.
+        self.model_engine.zero_grad()
         # It aggregates gradients and only updates weights when accumulation_steps is reached.
         self.model_engine.backward(loss)
 
@@ -125,5 +126,5 @@ class SFT:
         self.model_engine.step()
 
         # return loss
-        step_loss = loss.item()
-        return {"loss": step_loss}
+        train_loss = loss.item()
+        return {"loss": float(train_loss)}
