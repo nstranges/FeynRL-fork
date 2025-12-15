@@ -1,5 +1,4 @@
 import torch
-import pandas as pd
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import os
 from datasets import load_dataset
@@ -49,7 +48,6 @@ class PairedDataset(Dataset):
             # Dataset({...})
             # split here doesn't mean our actual splits. it is just for compatibility with huggingface datasets.
             self.data = load_dataset("parquet", data_files=self.data_path, split="train")
-            self.data = pd.DataFrame(self.data)
 
         except Exception as e:
             raise Exception(f"Failed to load data from {self.data_path}: {str(e)}")
@@ -66,70 +64,110 @@ class PairedDataset(Dataset):
            }
            Note system prompt is optional.
         '''
-        current_sample = self.data.iloc[idx]
+        current_sample = self.data[idx]
         message = current_sample[self.prompt_key]
         answer  = current_sample[self.answer_key]
 
-        # now tokenize the prompt
-        prompt_chat_str = self.tokenizer.apply_chat_template(conversation=message, add_generation_prompt=True, tokenize=False)
-        prompt_ids_output = self.tokenizer(prompt_chat_str, return_tensors='pt', add_special_tokens=False)
+        # answer cannot be empty
+        if not answer or (isinstance(answer, str) and answer.strip() == ""):
+            raise ValueError(f"Sample {current_sample}: Answer cannot be empty or whitespace-only")
 
-        prompt_ids = prompt_ids_output['input_ids'][0]
-        prompt_attn_mask = prompt_ids_output['attention_mask'][0]
+        # message cannot be empty
+        if not message or (isinstance(message, list) and len(message) == 0):
+            raise ValueError(f"Sample {idx}:{current_sample}: Prompt/message cannot be empty")
 
-        # label/answer
-        answer_chat_str = answer + self.tokenizer.eos_token
-        answer_ids_output = self.tokenizer(answer_chat_str, return_tensors='pt', add_special_tokens=False)
-        answer_ids = answer_ids_output['input_ids'][0]
-        answer_attn_mask = answer_ids_output['attention_mask'][0]
+        # 1. Tokenize the prompt
+        # When tokenize=True and return_tensors='pt', it returns shape [1, seq_len]
+        # [0]: [1, seq_len] -> [seq_len]
+        prompt_ids = self.tokenizer.apply_chat_template(
+                                                        conversation=message,
+                                                        add_generation_prompt=True,
+                                                        tokenize=True,
+                                                        return_tensors='pt'
+                                                        )[0]
+        prompt_attn_mask = torch.ones_like(prompt_ids)
+        prompt_len = len(prompt_ids)
 
-        total_seq_len_just_ids = len(prompt_ids) + len(answer_ids)
-        # this to make sure that we don't have empty sequences
-        # if this assert fails, it means that the data is not in the expected format
-        assert total_seq_len_just_ids > 0, "total_seq_len_just_ids should be greater than 0"
+        # 2. Validate prompt length
+        if prompt_len > self.max_seq_len or prompt_len == 0:
+            raise ValueError(f"Prompt in sample {idx}:{current_sample}: too long or empty: "
+                             f"prompt must be at most {self.max_seq_len} tokens (got {prompt_len})")
 
-        # if data is text, it should be 1-dim. adding dim=-1 for future compatibility.
+        # 3. Tokenize answer + add EOS
+        answer_ids_output = self.tokenizer(answer,
+                                           return_tensors='pt',
+                                           add_special_tokens=False)
+        # Append eos token id manually
+        # this is usefult to cover cases where the answer doesn't end with a space,
+        # the tokenizer might merge the last word and the EOS token into a
+        # single unknown or different token.
+        eos_tensor = torch.tensor([self.tokenizer.eos_token_id],
+                                   dtype=answer_ids_output['input_ids'].dtype)
+        answer_ids = torch.cat([answer_ids_output['input_ids'][0], eos_tensor], dim=0)
+        answer_attn_mask = torch.cat([answer_ids_output['attention_mask'][0],
+                                      torch.tensor([1], dtype=answer_ids_output['attention_mask'].dtype)], dim=0)
+        # Validate answer has at least one token besides EOS
+        if len(answer_ids) <= 1:
+            raise ValueError(
+                f"Sample {idx}:{current_sample}: Answer must tokenize to at least one token (excluding EOS). "
+                f"Got {len(answer_ids)} tokens total."
+            )
+
         seq_ids = torch.cat((prompt_ids, answer_ids), dim=-1).to(dtype=torch.long)
         seq_attn_mask = torch.cat((prompt_attn_mask, answer_attn_mask), dim=-1)
+        total_seq_len = len(seq_ids)
 
-        # length check
-        if total_seq_len_just_ids > self.max_seq_len:
+        # 4. Validate minimum sequence length
+        if total_seq_len < 2:
+            raise ValueError(f"Sequence too short: prompt + answer must be at least 2 tokens (got {total_seq_len})")
+
+        # 5. length check
+        if total_seq_len > self.max_seq_len:
             # this should be ideally handled in data-preprocessing step
-            raise ValueError(f"Total length of prompt and answer is {total_seq_len_just_ids}, which is greater than max_seq_len {self.max_seq_len}")
+            # we might lose the EOS token here. This is acceptable in SFT training though
+            # as the model learns max length reached.
+            seq_ids = seq_ids[:self.max_seq_len]
+            seq_attn_mask = seq_attn_mask[:self.max_seq_len]
+            total_seq_len = len(seq_ids)
 
-        elif total_seq_len_just_ids < self.max_seq_len:
-            # pad the sequence
-            padding_len = self.max_seq_len - total_seq_len_just_ids
+        # 6. pad if necessary
+        elif total_seq_len < self.max_seq_len:
+            padding_len = self.max_seq_len - total_seq_len
+
             # add padding tokens to ids
-            padding_tokens = torch.ones(size=(padding_len,), dtype=seq_ids.dtype) * self.tokenizer.pad_token_id
+            padding_tokens = torch.full((padding_len,), self.tokenizer.pad_token_id, dtype=seq_ids.dtype)
             seq_ids = torch.cat((seq_ids, padding_tokens), dim=-1)
 
             # add zeros to attention mask as padding
             padding_attn_mask = torch.zeros(size=(padding_len,), dtype=seq_attn_mask.dtype)
             seq_attn_mask = torch.cat((seq_attn_mask, padding_attn_mask), dim=-1)
 
-        # loss mask
-        # We added eos to end of each seq, so we need to make sure we do not include it in loss.
-        # also we don't include prompt in the loss calculation. so we need to account for that too.
-        # so we need to make a loss mask that is 1 for all tokens except those tokens.
-        loss_mask = seq_attn_mask.clone().to(dtype=seq_attn_mask.dtype)
+        # Loss mask:
+        # Labels are created by shifting seq_ids by one position, so they have length T-1.
+        # Therefore, the loss mask must also be of shape [T-1].
+        # Padding is already handled by seq_attn_mask if any (pads are zero),
+        # so no extra padding logic is needed.
+        loss_mask = seq_attn_mask[1:].clone()
 
-        # Prompt tokens are not included in loss
-        if  len(prompt_ids) > 1:
-            # min should be there when there is truncation as prompt_ids might be longer than truncated seq
-            loss_mask[:len(prompt_ids) - 1] = 0
+        # Mask out prompt tokens.
+        # Since labels are shifted by one position, the prompt appears in indices
+        # [:len(prompt_ids) - 1] in the label sequence (not [:len(prompt_ids)]).
+        if prompt_len > 1:
+            loss_mask[:prompt_len - 1] = 0
 
-        # Exclude the last token (eos) from loss.
-        # eos token is not included in loss but inorder to that we need to consider min(total_seq_len_just_ids - 1, max_seq_len - 1)
-        # because we might have already padded the sequence.
-        last_index = min(total_seq_len_just_ids - 1, self.max_seq_len - 1)
-        loss_mask[last_index] = 0
+        # After masking, we should have at least 1 unmasked answer token
+        if loss_mask.sum().item() == 0:
+            raise ValueError(f"Sample {idx}:{current_sample[self.prompt_key]}: No training tokens left after masking "
+                         f"Prompt length: {len(prompt_ids)}, Answer length: {len(answer_ids)}, "
+                         f"Total length: {total_seq_len}.")
 
         return {
-            "seq_ids": seq_ids,
-            "seq_attn_mask": seq_attn_mask,
-            "loss_mask": loss_mask,
+            "seq_ids": seq_ids, # T
+            "seq_attn_mask": seq_attn_mask, # T
+            "loss_mask": loss_mask, # T-1
         }
 
     def __len__(self):
         return self.len_data
+
+if __name__ == "__main__":
