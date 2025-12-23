@@ -10,7 +10,7 @@ class PPO:
                 kl_coeff: [float]=0.0,
                 clip_low: [float]=0.0,
                 clip_high: [float]=1.0,
-                vf_clip: [float]=None,
+                vf_clip: [float]=0,
                 tau: [float]=0.95,
                 gamma: [float]=0.99,
                 entropy_coeff: [float]=0.0,
@@ -130,8 +130,13 @@ class PPO:
                 1. ratio = exp(logprobs - old_logprobs)
                 2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
         '''
+        device = logprobs.device
+        dtype = logprobs.dtype
+
         # 1. make sure advantages are detached and convert to float32 for stability under bf16/fp16
         adv = advantages.detach().to(torch.float32)
+        mask = (mask.to(device=device) > 0.5).to(dtype=dtype)
+        denom = mask.sum().clamp(min=1.0)
 
         # 2. calculate ratio = exp(logprobs - old_logprobs)
         logratio = (logprobs - old_logprobs).to(torch.float32)
@@ -140,16 +145,19 @@ class PPO:
         # 3. compute loss: -(min(ratio * adv, clip_adv)) * mask
         unclipped = ratio * adv
         clip_adv  = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high) * adv
-        loss_pi   = -(torch.minimum(unclipped, clip_adv) * mask).sum() / mask.sum()
+        loss_pi   = -(torch.minimum(unclipped, clip_adv) * mask).sum() / denom
 
         # 4. useful metrics
         with torch.no_grad():
+            # first term too large ==> policy changed too much upward
+            # second term too small ==> policy changed too much downward
             clipped_mask = (ratio > (1.0 + self.clip_high)) | (ratio < (1.0 - self.clip_low))
-            clipfrac = (clipped_mask.to(torch.float32) * mask).sum() / mask.sum()
+            # fraction of masked tokens that ratio out of ranges
+            clipfrac = (clipped_mask.to(dtype=dtype) * mask).sum() / denom
 
             # approx KL: either E[old_logprobs - logprobs] or E[(ratio - 1) - logratio]
             approx_kl_t = (ratio - 1.0) - logratio
-            approx_kl = (approx_kl_t.to(torch.float32) * mask).sum() / mask.sum()
+            approx_kl = (approx_kl_t.to(dtype=dtype) * mask).sum() / denom
 
             # save the metrics for debugging
             metrics = {
@@ -170,12 +178,12 @@ class PPO:
                 1. if v_old:  loss = 0.5 * (max(values, v_clipped) - rets)^2
                 2. otherwise: loss = 0.5 * (values - rets)^2
         '''
-        # 1. compute unlipped value loss
+        # 1. compute unclipped value loss
         rets = returns.detach()
         v_loss = (values - rets).pow(2)
 
         # 2. compute clipped value loss
-        if  self.vf_clip is not None and v_old is not None:
+        if  self.vf_clip > 0 and v_old is not None:
             v_old = v_old.detach()
 
             # 3. compute clipped value loss
@@ -215,8 +223,30 @@ class PPO:
             return loss, {'ent_loss': loss}
 
     def compute_loss(self,
-                     replay_buffer: ReplayBuffer):
+                     logprobs: torch.Tensor,
+                     old_logprobs: torch.Tensor,
+                     advantages: torch.Tensor,
+                     mask: torch.Tensor,
+                     values: torch.Tensor,
+                     v_old: torch.Tensor,
+                     returns: torch.Tensor,
+                     entropies: torch.Tensor,
+                     ):
         '''
             Compute total ppo loss
         '''
-        pass
+        # 1. compute policy loss
+        policy_loss, policy_metrics = self.compute_policy_loss(logprobs=logprobs,
+                                                               old_logprobs=old_logprobs,
+                                                               advantages=advantages,
+                                                               mask=mask)
+        # 2. compute value loss
+        value_loss, value_metrics = self.compute_value_loss(values=values,
+                                                            v_old=v_old,
+                                                            returns=returns,
+                                                            mask=mask)
+        # 3. compute entropy loss
+        entropy_loss, entropy_metrics = self.compute_entropy_loss(entropies=entropies,
+                                                                  mask=mask)
+
+        return policy_loss, value_loss, entropy_loss, {**policy_metrics, **value_metrics, **entropy_metrics}
