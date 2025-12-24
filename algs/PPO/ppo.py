@@ -3,32 +3,35 @@ import numpy as np
 
 class PPO:
     def __init__(self,
-                model_engine:,
-                optimizer,
+                policy_engine,
+                value_engine,
+                kl_coeff: float,
+                clip_low: float,
+                clip_high: float,
+                vf_clip: float,
+                tau: float,
+                gamma: float,
+                entropy_coeff: float,
+                use_cache: bool,
                 ref_model=None,
-                use_cache: [bool]=False,
-                kl_coeff: [float]=0.0,
-                clip_low: [float]=0.0,
-                clip_high: [float]=1.0,
-                vf_clip: [float]=0,
-                tau: [float]=0.95,
-                gamma: [float]=0.99,
-                entropy_coeff: [float]=0.0,
-                alg_type: [str]="ppo",
                 ):
 
-        self.model_engine = model_engine
+        # policy and value engines 
+        self.policy_engine = policy_engine
+        self.value_engine = value_engine
         self.ref_model = ref_model
-        self.optimizer = optimizer
         self.use_cache = use_cache
+
+        # policy related parameters
         self.kl_coeff = kl_coeff
         self.clip_low = clip_low
         self.clip_high = clip_high
         self.tau = tau
         self.gamma = gamma
-        self.alg_type = alg_type.lower()
-        self.vf_clip = vf_clip
         self.ent_coeff = entropy_coeff
+
+        # value related parameters
+        self.vf_clip = vf_clip
 
     @staticmethod
     def compute_advantages(rewards: torch.Tensor,
@@ -122,6 +125,7 @@ class PPO:
                             logprobs: torch.Tensor,
                             old_logprobs: torch.Tensor,
                             advantages: torch.Tensor,
+                            entropies: torch.Tensor,
                             mask: torch.Tensor,
                             ):
         '''
@@ -132,6 +136,7 @@ class PPO:
         '''
         device = logprobs.device
         dtype = logprobs.dtype
+        loss_ent = 0.0
 
         # 1. make sure advantages are detached and convert to float32 for stability under bf16/fp16
         adv = advantages.detach().to(torch.float32)
@@ -147,7 +152,13 @@ class PPO:
         clip_adv  = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high) * adv
         loss_pi   = -(torch.minimum(unclipped, clip_adv) * mask).sum() / denom
 
-        # 4. useful metrics
+        # 4. compute entropy loss
+        if entropies is not None and self.ent_coeff > 0.0:
+            loss_ent = -(entropies * mask).sum() / denom
+
+        loss_total = loss_pi - self.ent_coeff * loss_ent
+
+        # 5. useful metrics
         with torch.no_grad():
             # first term too large ==> policy changed too much upward
             # second term too small ==> policy changed too much downward
@@ -163,9 +174,12 @@ class PPO:
             metrics = {
                 'clipfrac': clipfrac,
                 'approx_kl': approx_kl,
+                'loss_ent': loss_ent.item(),
+                'loss_pi': loss_pi.item(),
+                'loss_total': loss_total.item(),
             }
 
-        return loss_pi, metrics
+        return loss_total, metrics
 
     def compute_value_loss(self,
                            values: torch.Tensor,
@@ -222,31 +236,143 @@ class PPO:
             loss = - (entropies * mask).sum() / mask.sum()
             return loss, {'ent_loss': loss}
 
-    def compute_loss(self,
-                     logprobs: torch.Tensor,
-                     old_logprobs: torch.Tensor,
-                     advantages: torch.Tensor,
-                     mask: torch.Tensor,
-                     values: torch.Tensor,
-                     v_old: torch.Tensor,
-                     returns: torch.Tensor,
-                     entropies: torch.Tensor,
-                     ):
+    def policy_forward(self, batch):
         '''
-            Compute total ppo loss
+            batch['seq_ids/seq_attn_mask'] are [B, T]
+            batch['position_ids'] is [B, T] or None
+            Returns:
+                logits is [B, T-1, vocab_size]
+                y is [B, T-1]
         '''
-        # 1. compute policy loss
-        policy_loss, policy_metrics = self.compute_policy_loss(logprobs=logprobs,
-                                                               old_logprobs=old_logprobs,
-                                                               advantages=advantages,
-                                                               mask=mask)
-        # 2. compute value loss
-        value_loss, value_metrics = self.compute_value_loss(values=values,
-                                                            v_old=v_old,
-                                                            returns=returns,
-                                                            mask=mask)
-        # 3. compute entropy loss
-        entropy_loss, entropy_metrics = self.compute_entropy_loss(entropies=entropies,
-                                                                  mask=mask)
+        # input_ids and att_mask are [B, T]
+        input_ids = batch['seq_ids']
+        att_mask  = batch['seq_attn_mask']
 
-        return policy_loss, value_loss, entropy_loss, {**policy_metrics, **value_metrics, **entropy_metrics}
+        # if pos_ids is not provided, HF will add that automatically.
+        pos_ids   = batch.get('position_ids', None)
+        if pos_ids is not None:
+            pos_ids = pos_ids.to(self.att_mask.device)
+
+        # feed data to model
+        output = self.model_engine(input_ids=input_ids,
+                                   attention_mask=att_mask,
+                                   position_ids=pos_ids,
+                                   use_cache=self.use_cache)
+
+        # [B, T, vocab_size]
+        every_token_logits = output.logits
+
+        # label would be input_ids shifted by one (input_ids[:, 1:])
+        # so the size is [B, T-1]
+        y = input_ids[:, 1:].contiguous()
+        # it is next token prediction, so we remove last token from logits
+        logits = every_token_logits[:, :-1, :].contiguous()
+
+        return logits, y
+
+    def value_forward(self, batch):
+        '''
+            batch['seq_ids/seq_attn_mask'] are [B, T]
+            batch['position_ids'] is [B, T] or None
+            Returns:
+                logits is [B, T-1, vocab_size]
+                y is [B, T-1]
+                loss_mask is [B, T-1]
+        '''
+        # input_ids and att_mask are [B, T]
+        input_ids = batch['seq_ids']
+        att_mask  = batch['seq_attn_mask']
+
+        # if pos_ids is not provided, HF will add that automatically.
+        pos_ids   = batch.get('position_ids', None)
+        if pos_ids is not None:
+            pos_ids = pos_ids.to(self.att_mask.device)
+
+        # feed data to model
+        output = self.model_engine(input_ids=input_ids,
+                                   attention_mask=att_mask,
+                                   position_ids=pos_ids,
+                                   use_cache=self.use_cache)
+
+        # [B, T, 1]
+        every_token_values = output.logits
+
+        # label would be input_ids shifted by one (input_ids[:, 1:])
+        # so the size is [B, T-1]
+        y = input_ids[:, 1:].contiguous()
+        # it is next token prediction, so we remove last token from logits
+        values = every_token_values[:, :-1, :].contiguous()
+        last_value = every_token_values[:, -1, :].contiguous()
+
+        return values, y, last_value
+
+    def train_step(self, replay_buffer):
+        '''
+           This function implements a training step per rank/gpu for full replay buffer.
+           The batch size for each gpu/rank should be micro_batch_size_per_gpu.
+        '''
+        device = self.policy_engine.device
+
+        # 1. put model_engines in training mode
+        self.policy_engine.train()
+        self.value_engine.train()
+
+        # 2. zero grads
+        self.policy_engine.zero_grad()
+        self.value_engine.zero_grad()
+
+        # 3. create progress bar
+        len_replay_buffer = len(replay_buffer)
+        inv_num_micro = 1.0 / max(num_micro, 1)
+        progress_bar = tqdm(replay_buffer, total=num_micro)
+
+        for step, micro_batch in enumerate(progress_bar):
+            is_last = (step == (num_micro - 1))
+            ########
+            # 1. Get the data
+            ########
+
+            # curr_data contains tokenized seq(prompt + answer), attn_mask, etc.
+            curr_data   = micro_batch['data'].to(device, non_blocking=True)
+            loss_mask   = micro_batch['mask'].to(device, non_blocking=True)
+
+            ########
+            # 2. Forward pass for policy and compute policy loss
+            ########
+            old_logprobs = micro_batch['old_logprobs'].to(device, non_blocking=True)
+            advantages   = micro_batch["advantages"].to(device, non_blocking=True)
+            if entropies is not None:
+                entropies = entropies.to(device, non_blocking=True)
+
+            pi_logits, pi_y     = self.policy_forward(batch=curr_data)
+            pl_loss, pl_metrics = self.compute_policy_loss(logprobs=pi_logits,
+                                                           old_logprobs=old_logprobs,
+                                                           advantages=advantages,
+                                                           mask=loss_mask)
+
+            ########
+            # 3. forward pass for value and compute value loss
+            ########
+            values       = micro_batch["values"].to(device, non_blocking=True)
+            v_old        = micro_batch.get("v_old", None)
+            if v_old is not None:
+                v_old = v_old.to(device, non_blocking=True)
+
+            v_logits, v_y, _ = self.value_forward(batch=curr_data)
+            vl_loss, vl_metrics = self.compute_value_loss(values=values,
+                                                          v_old=v_old,
+                                                          returns=returns,
+                                                          mask=v_loss_mask)
+
+            # Mark accumulation boundary (ONLY last micro-batch updates)
+            self.policy_engine.set_gradient_accumulation_boundary(is_last)
+            self.value_engine.set_gradient_accumulation_boundary(is_last)
+
+            # backward pass
+            self.policy_engine.backward(pl_loss)
+            self.value_engine.backward(vl_loss)
+
+            # DeepSpeed expects step() each micro-batch
+            # update happens only if boundary=True
+            self.policy_engine.step()
+            self.value_engine.step()
