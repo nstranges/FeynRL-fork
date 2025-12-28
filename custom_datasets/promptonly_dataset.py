@@ -1,42 +1,29 @@
-import torch
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import os
+from torch.utils.data import Dataset
 from datasets import load_dataset
 
 class PromptOnlyDataset(Dataset):
     '''
-        This is a general dataset that works for any source data that has the following formant:
-        {
-            "prompt": [{"role": "system", "content": "this is a system prompt"},
-                       {"role": "user", "content": "this is a user prompt"}],
-        }
-        The data should be in a parquet format.
+        Returns tokenized prompt ids as a list[int] which can be a variable length.
     '''
     def __init__(self, 
                 prompt_key,
-                answer_key, 
-                max_seq_len,
                 tokenizer=None, 
+                max_seq_len=0,
                 data_path="",
                 ):
         assert prompt_key != "", "prompt_key cannot be empty"
-        assert answer_key != "", "answer_key cannot be empty"
-        assert max_seq_len > 0, "max_seq_len must be greater than 0"
+        assert max_seq_len > 0, "max_seq_len must be > 0"
         assert tokenizer is not None, "tokenizer cannot be None"
         assert isinstance(data_path, str), "data_path must be a string"
         assert os.path.exists(os.path.expanduser(data_path)), f"{data_path} does not exist"
-
-        # add this assert to make sure that tokenizer has a pad token (or if not,
-        # we already added during loading)
         assert tokenizer.pad_token_id is not None, "tokenizer must have a pad token"
         assert tokenizer.eos_token_id is not None, "tokenizer must have an eos token"
 
-        self.prompt_key = prompt_key
-        self.answer_key = answer_key
-        self.max_seq_len = max_seq_len
-        self.tokenizer = tokenizer
-        self.data_path = data_path
-        # load data into cpu memory
+        self.prompt_key  = prompt_key
+        self.max_seq_len = int(max_seq_len)
+        self.tokenizer   = tokenizer
+        self.data_path   = data_path
         self._load_data()
 
     def _load_data(self):
@@ -44,12 +31,8 @@ class PromptOnlyDataset(Dataset):
            Loads the data from a parquet file.
         '''
         try:
-            # This acts like a list but reads from disk/cache on demand.
-            # if we don't use split, it will return a DatasetDict
-            # DatasetDict({train: Dataset({...})})
-            # if we use split=train, it will return a Dataset
-            # Dataset({...})
-            # split here doesn't mean our actual splits. it is just for compatibility with huggingface datasets.
+            # Loads lazily (disk/cache). split='train' is a HF datasets arg:
+            #  without it we get a DatasetDict; with it we get a Dataset.
             self.data = load_dataset("parquet", data_files=self.data_path, split="train")
 
         except Exception as e:
@@ -61,127 +44,86 @@ class PromptOnlyDataset(Dataset):
         '''
            data is a dict with the following format:
            {
-               "messages": [{"role": "system", "content": "this is a system prompt"},
-                            {"role": "user", "content": "this is a user prompt"}],
-               "answer": "this is an answer",
-               ...
+            {
+                "prompt": [{"role": "system", "content": "..."},
+                           {"role": "user", "content": "..."}
+                           ],
+            },...
            }
            Note system prompt is optional.
         '''
-        current_sample = self.data[idx]
-        message = current_sample[self.prompt_key]
-        answer  = current_sample[self.answer_key]
+        sample = self.data[idx]
+        if self.prompt_key not in sample:
+            raise KeyError(f"Missing key '{self.prompt_key}' in sample {sample}: keys={list(sample.keys())}")
 
-        # answer cannot be empty
-        if not answer or (isinstance(answer, str) and answer.strip() == ""):
-            raise ValueError(f"Sample {current_sample}: Answer cannot be empty or whitespace-only")
+        message = sample[self.prompt_key]
 
         # message cannot be empty
         if not message or (isinstance(message, list) and len(message) == 0):
-            raise ValueError(f"Sample {idx}:{current_sample}: Prompt/message cannot be empty")
+            raise ValueError(f"Sample {idx}:{sample}: Prompt cannot be empty")
 
-        # 1. Tokenize the prompt
-        # When tokenize=True and return_tensors='pt', it returns shape [1, seq_len]
-        # [0]: [1, seq_len] -> [seq_len]
+        # 1. Tokenize the prompt and return python list[int] directly
         prompt_ids = self.tokenizer.apply_chat_template(
                                                         conversation=message,
                                                         add_generation_prompt=True,
                                                         tokenize=True,
-                                                        return_tensors='pt'
-                                                        )[0]
-        prompt_attn_mask = torch.ones_like(prompt_ids)
-        prompt_len = len(prompt_ids)
+                                                        return_tensors=None,
+                                                        )
+        if not isinstance(prompt_ids, list) or len(prompt_ids) == 0:
+            raise ValueError(f"Sample {idx}:{sample}: tokenization produced empty prompt_ids")
+
 
         # 2. Validate prompt length
-        if prompt_len >= self.max_seq_len or prompt_len == 0:
-            raise ValueError(f"Prompt in sample {idx}:{current_sample}: too long or empty: "
-                             f"prompt must be at most {self.max_seq_len} tokens (got {prompt_len})")
+        if len(prompt_ids) >= self.max_seq_len:
+            raise ValueError(f"Prompt in sample {idx}:{sample}: too long: "
+                             f"prompt must be at most {self.max_seq_len} tokens (got {len(prompt_ids)})")
 
-        # 3. Tokenize answer + add EOS
-        answer_ids_output = self.tokenizer(answer,
-                                           return_tensors='pt',
-                                           add_special_tokens=False)
-        # Append eos token id manually
-        # this is usefult to cover cases where the answer doesn't end with a space,
-        # the tokenizer might merge the last word and the EOS token into a
-        # single unknown or different token.
-        eos_tensor = torch.tensor([self.tokenizer.eos_token_id],
-                                   dtype=answer_ids_output['input_ids'].dtype)
-        answer_ids = torch.cat([answer_ids_output['input_ids'][0], eos_tensor], dim=0)
-        answer_attn_mask = torch.cat([answer_ids_output['attention_mask'][0],
-                                      torch.tensor([1], dtype=answer_ids_output['attention_mask'].dtype)], dim=0)
-        # Validate answer has at least one token besides EOS
-        if len(answer_ids) <= 1:
-            raise ValueError(
-                f"Sample {idx}:{current_sample}: Answer must tokenize to at least one token (excluding EOS). "
-                f"Got {len(answer_ids)} tokens total."
-            )
-
-        seq_ids = torch.cat((prompt_ids, answer_ids), dim=-1).to(dtype=torch.long)
-        seq_attn_mask = torch.cat((prompt_attn_mask, answer_attn_mask), dim=-1)
-        total_seq_len = len(seq_ids)
-
-        # 4. Validate minimum sequence length
-        if total_seq_len < 2:
-            raise ValueError(f"Sequence too short: prompt + answer must be at least 2 tokens (got {total_seq_len})")
-
-        # 5. length check
-        if total_seq_len > self.max_seq_len:
-            # this should be ideally handled in data-preprocessing step
-            # we might lose the EOS token here. This is acceptable in SFT training though
-            # as the model learns max length reached.
-            seq_ids = seq_ids[:self.max_seq_len]
-            seq_attn_mask = seq_attn_mask[:self.max_seq_len]
-            total_seq_len = len(seq_ids)
-
-            answer_start_idx = prompt_len
-            answer_end_idx = self.max_seq_len
-            actual_answer_tokens_in_seq = answer_end_idx - answer_start_idx
-
-            # We need at least 1 answer token to train on
-            if actual_answer_tokens_in_seq < 1:
-                raise ValueError(
-                    f"Sample {idx}:{current_sample}: After truncation, no answer tokens remain."
-                )
-
-        # 6. pad if necessary
-        elif total_seq_len < self.max_seq_len:
-            padding_len = self.max_seq_len - total_seq_len
-
-            # add padding tokens to ids
-            padding_tokens = torch.full((padding_len,), self.tokenizer.pad_token_id, dtype=seq_ids.dtype)
-            seq_ids = torch.cat((seq_ids, padding_tokens), dim=-1)
-
-            # add zeros to attention mask as padding
-            padding_attn_mask = torch.zeros(size=(padding_len,), dtype=seq_attn_mask.dtype)
-            seq_attn_mask = torch.cat((seq_attn_mask, padding_attn_mask), dim=-1)
-
-        # Loss mask:
-        # Labels are created by shifting seq_ids by one position, so they have length T-1.
-        # Therefore, the loss mask must also be of shape [T-1].
-        # Padding is already handled by seq_attn_mask if any (pads are zero),
-        # so no extra padding logic is needed.
-        loss_mask = seq_attn_mask[1:].clone()
-
-        # Mask out prompt tokens.
-        # Since labels are shifted by one position, the prompt appears in indices
-        # [:len(prompt_ids) - 1] in the label sequence (not [:len(prompt_ids)]).
-        if prompt_len > 1:
-            loss_mask[:prompt_len - 1] = 0
-
-        # After masking, we should have at least 1 unmasked answer token
-        if loss_mask.sum().item() == 0:
-            raise ValueError(f"Sample {idx}:{current_sample[self.prompt_key]}: No training tokens left after masking "
-                         f"Prompt length: {len(prompt_ids)}, Answer length: {len(answer_ids)}, "
-                         f"Total length: {total_seq_len}.")
-
-        return {
-            "input_ids": seq_ids, # T
-            "attn_mask": seq_attn_mask, # T
-            "loss_mask": loss_mask, # T-1
-        }
+        return prompt_ids  # list[int]
 
     def __len__(self):
         return self.len_data
 
+    @staticmethod
+    def collate_fn(batch):
+        '''
+            Since pytorch's default collate tries to stack sequences, we need to override it.
+            Otherwise, we will get 'all sequences must have equal size' error.
+            This function just returns the batch as is.
+            batch is List[List[int]] and this function keep it as python lists.
+        '''
+        return batch
+
 if __name__ == "__main__":
+    '''
+        This is a simple test to make sure the dataset works.
+    '''
+    from transformers import AutoTokenizer
+    from torch.utils.data import DataLoader
+    import pandas as pd
+
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
+    # add pad token if it doesn't exist, not useful here but good practice
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    random_prompts = [
+        {'prompt': [{"role": "user", "content": "Hello, how are you?"}]},
+        {'prompt': [{"role": "user", "content": "What is the meaning of life?"}]},
+        {'prompt': [{"role": "user", "content": "What is the meaning of the universe?"}]},
+        {'prompt': [{"role": "user", "content": "This is is a just rather long prompt that is going to be tokenized. This is a test to make sure the dataset works."}]},
+
+    ]
+    df = pd.DataFrame(random_prompts)
+    df.to_parquet("./promptonly.parquet", index=False)
+
+    dataset = PromptOnlyDataset(
+        prompt_key="prompt",
+        tokenizer=tokenizer,
+        max_seq_len=1024,
+        data_path="./promptonly.parquet",
+    )
+    dataloader = DataLoader(dataset,
+                            batch_size=3,
+                            collate_fn=dataset.collate_fn)
+    for d in dataloader:
+        print(d)
