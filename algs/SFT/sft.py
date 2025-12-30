@@ -71,8 +71,8 @@ class SFT:
         input_ids = batch['input_ids']
         att_mask  = batch['attn_mask']
 
-        # if pos_ids is not provided, HF will add that automatically.
-        pos_ids   = batch.get('position_ids', None)
+        # if pos_ids is not provided, hf will add it automatically.
+        pos_ids = batch.get('position_ids', None)
         if pos_ids is not None:
             pos_ids = pos_ids.to(self.att_mask.device)
 
@@ -88,7 +88,8 @@ class SFT:
         # label would be input_ids shifted by one (input_ids[:, 1:])
         # so the size is [B, T-1]
         y = input_ids[:, 1:].contiguous()
-        # it is next token prediction, so we remove last token from logits
+        # remember it is an auto-regressive model: we use token [t] to predict token [t+1],
+        # hence no need to predict last token's output (e.g., <eos>) and we remove it from logits.
         logits = every_token_logits[:, :-1, :].contiguous()
 
         # loss_mask is [B, T -1]
