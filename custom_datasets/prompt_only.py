@@ -79,7 +79,7 @@ class PromptOnlyDataset(Dataset):
                              f"prompt must be at most {self.max_seq_len} tokens (got {len(prompt_ids)})")
 
         if self.return_text == False:
-            return prompt_ids
+            return {"prompt_token_ids": prompt_ids}
 
         # Get the prompt text for debugging. it can be used for vLLM rollout too
         prompt_text = self.tokenizer.apply_chat_template(
@@ -89,7 +89,7 @@ class PromptOnlyDataset(Dataset):
                                         return_tensors=None,
                                         )
 
-        return  {"prompt_ids": prompt_ids, "prompt_text": prompt_text}
+        return  {"prompt_token_ids": prompt_ids, "text": prompt_text}
 
     def __len__(self):
         return self.len_data
@@ -105,13 +105,13 @@ class PromptOnlyDataset(Dataset):
             return batch
 
         prompt_texts = []
-        prompt_ids   = []
+        prompt_token_ids   = []
 
         for x in batch:
-            prompt_ids.append(x["prompt_ids"])
-            prompt_texts.append(x["prompt_text"])
+            prompt_token_ids.append(x["prompt_token_ids"])
+            prompt_texts.append(x["text"])
 
-        return prompt_texts, prompt_ids
+        return prompt_texts, prompt_token_ids
 
 if __name__ == "__main__":
     '''
@@ -141,7 +141,7 @@ if __name__ == "__main__":
                 tokenizer=tokenizer,
                 max_seq_len=1024,
                 data_path="./promptonly.parquet",
-                return_text=True,
+                return_text=False,
                 )
     dataloader = DataLoader(dataset,
                             batch_size=3,
