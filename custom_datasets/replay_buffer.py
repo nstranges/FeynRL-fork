@@ -50,17 +50,14 @@ class ReplayBuffer(Dataset):
         return x
 
     def add(self,
-            input_ids: torch.Tensor,
-            attn_mask: torch.Tensor,
-            old_logps: torch.Tensor,
-            token_masks: torch.Tensor,
+            generated_token_ids: torch.Tensor,
+            generation_logps: torch.Tensor,
+            prompt_token_ids: torch.Tensor,
             rewards: torch.Tensor,
             dones: torch.Tensor,
             v_old: Optional[torch.Tensor] = None,
             )-> None:
         '''
-            All inputs are [T]
-            token_masks: 1=use token, 0=ignore (prompt/pad/etc.)
             dones: 1=eos, 0=not eos
         '''
         input_ids =  self.ensure_1d(input_ids, "input_ids")
@@ -162,6 +159,7 @@ class ReplayBuffer(Dataset):
         # info for scaling later
         batch_action_tokens = int((token_masks > 0.5).sum().item())
         total_action_tokens = max(1, self.total_action_tokens)
+        # this is per rank, this is not global. Should be revised outised this class.
         action_token_weight = float(batch_action_tokens) / float(total_action_tokens)
 
         return {
