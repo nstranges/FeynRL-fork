@@ -16,10 +16,10 @@ class SFT:
         # use cross entropy loss
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
 
-    def compute_loss(self, logits, y, loss_mask):
+    def compute_loss(self, logits, target_ids, loss_mask):
         '''
          This function implements \sum_{i=1}^{N} log p(y_i|x_i)
-         y is target label [B, T -1]
+         target_ids is target label [B, T -1]
          logits is model prediction [B, T -1, vocab_size]
         '''
         # [B, T -1, vocab_size]
@@ -29,10 +29,10 @@ class SFT:
         # so logits is [B * (T -1), vocab_size]
         logits = logits.view(-1, vocab_size)
         # flatten y as well:  [B, T -1] -->  [B * (T -1)]
-        y = y.view(-1)
+        target_ids = y.view(-1)
 
         # per token loss
-        per_token_loss = self.loss_fn(logits, y)
+        per_token_loss = self.loss_fn(logits, target_ids)
 
         # We need to apply mask to loss to remove any things 
         # which should not be considered in loss (e.g., padding tokens)
@@ -87,7 +87,7 @@ class SFT:
 
         # label would be input_ids shifted by one (input_ids[:, 1:])
         # so the size is [B, T-1]
-        y = input_ids[:, 1:].contiguous()
+        target_ids = input_ids[:, 1:].contiguous()
         # remember it is an auto-regressive model: we use token [t] to predict token [t+1],
         # hence no need to predict last token's output (e.g., <eos>) and we remove it from logits.
         logits = every_token_logits[:, :-1, :].contiguous()
@@ -95,7 +95,7 @@ class SFT:
         # loss_mask is [B, T -1]
         loss_mask = batch['loss_mask'].contiguous()
 
-        return logits, y, loss_mask
+        return logits, target_ids, loss_mask
 
     def eval_step(self, micro_batch):
         '''
@@ -127,10 +127,10 @@ class SFT:
         self.model_engine.zero_grad()
 
         # 2. forward pass per gpu/rank
-        logits, y, loss_mask = self.forward(micro_batch)
+        logits, target_ids, loss_mask = self.forward(micro_batch)
 
         # 3. compute loss pass
-        loss = self.compute_loss(logits=logits, y=y, loss_mask=loss_mask)
+        loss = self.compute_loss(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
 
         # 4. backward step
         # deepspeed aggregates gradients and only updates weights when accumulation_steps is reached.
