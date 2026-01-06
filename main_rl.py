@@ -4,16 +4,18 @@ import numpy as np
 import argparse
 import deepspeed
 import torch
-from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer
 from torch.utils.data import DataLoader, DistributedSampler
 import torch.distributed as torch_dist
 from tqdm import tqdm
 import gc
+import ray
 
 # imports local methods, classes, etc.
 import config.load as cfg # all config arguments
-from custom_datasets.paired_dataset import PairedDataset # our custom pytorch dataset
+from custom_datasets.prompt_only_dataset import PromptOnlyDataset # our custom pytorch dataset
 from misc.utils import safe_string_to_torch_dtype
+from rollout_engine import VLLMRolloutEngine
 
 def set_random_seeds(seed):
     '''
@@ -26,15 +28,13 @@ def set_random_seeds(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def rank_world_size_setup():
+def rank_setup(world_size):
     '''
-        Detect rank and world size from environment variables.
-        we way to run is to use torchrun (torchrun --nnodes=2 --nproc_per_node=4 main_sl.py) where we can specify
-        nnodes=2 -> world_size
-        nproc_per_node=4 -> local_world_size/num_local_gpus
+        Detect rank from environment variables.
     '''
-    # total number of gpus (e.g, 2 nodes x 4 gpus = 8 gpus in total). world size need to be at least 1
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    # world_size is the total number of gpus (e.g, 2 nodes x 4 gpus = 8 gpus in total). 
+    # world size need to be at least 1
+    assert world_size >= 1, 'world_size need to be at least 1'
 
     # Unique id of gpu in the ENTIRE WORLD. It ranges from 0 to world_size - 1
     rank = int(os.environ.get('RANK', 0))
@@ -55,44 +55,133 @@ def rank_world_size_setup():
 
     return rank, world_size, local_rank
 
-def load_models_and_tokenizer(model_name,
-                              model_dtype,
-                              ref_model_name=None,
-                              trust_remote_code=False,
-                              attn_impl='',
-                              model_class='llm',
-                              rank=0):
+def setup_ray(ray_address):
     '''
-        Load models and tokenizer from huggingface.
-        It also loads the ref model if provided.
-        This fucntion would be resposible to make sure with use correct precision
-        and decides how to laod the model if it is a text-only model or multi-modal model.
+       Initialize ray cluster and setup master address.
     '''
-    assert model_dtype != 'auto', "dtype must not be auto to avoid any precision issues"
-    assert attn_impl=='' or attn_impl in ['eager', 'flash_attention_2'], "attn_impl must be one of 'eager', 'flash_attention_2' or empty string"
+    if ray_address:
+        ray.init(address=ray_address, ignore_reinit_error=True)
 
-    # convert string to torch dtype if it is not already
-    model_dtype = safe_string_to_torch_dtype(model_dtype)
-
-    # 1. model and its config initialization
-    model_config = AutoConfig.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name,
-                                                torch_dtype=model_dtype,
-                                                trust_remote_code=trust_remote_code,
-                                                config=model_config,
-                                                attn_implementation=None if attn_impl == '' else attn_impl)
-
-    # if ref model is provided to use it in kl for example.
-    if ref_model_name:
-        ref_model = AutoModelForCausalLM.from_pretrained(ref_model_name,
-                                                         torch_dtype=model_dtype,
-                                                         trust_remote_code=trust_remote_code,
-                                                         config=model_config,
-                                                         attn_implementation=None if attn_impl == '' else attn_impl)
     else:
-        ref_model = None
+        ray.init(ignore_reinit_error=True)
 
-    # 2. Tokenizer initialization
+    try:
+        master_addr = ray.util.get_node_ip_address()
+
+    except Exception:
+        print("Warning: Could not get master address, using localhost")
+        master_addr = "127.0.0.1"
+
+    return ray, master_addr
+
+def training_runner_setup(model_path,
+                           ref_model_path,
+                           model_dtype,
+                           trust_remote_code,
+                           attn_impl,
+                           world_size,
+                           master_addr,
+                           master_port,
+                           alg,
+                           kl_coeff,
+                           clip_low,
+                           clip_high,
+                           entropy_coeff,
+                           use_cache,
+                           micro_batch_size_per_gpu,
+                           update_after_full_replay):
+    '''
+        This function is responsible for running the training engine.
+    '''
+    ray_runners = []
+    for rank in range(world_size):
+        ray_vars = {
+                    "MASTER_ADDR": master_addr,
+                    "MASTER_PORT": str(master_port),
+                    "RANK": str(rank),
+                    "WORLD_SIZE": str(world_size),
+                    "LOCAL_RANK": "0",
+                   }
+
+        runner = alg.options(num_gpus=1,
+                            runtime_env={"env_vars": ray_vars},
+                            ).remote(
+                                     model_path=model_path,
+                                     ref_model_path=ref_model_path,
+                                     model_dtype=model_dtype,
+                                     trust_remote_code=trust_remote_code,
+                                     attn_impl=attn_impl,
+                                     kl_coeff=kl_coeff,
+                                     clip_low=clip_low,
+                                     clip_high=clip_high,
+                                     entropy_coeff=entropy_coeff,
+                                     use_cache=use_cache,
+                                     micro_batch_size_per_gpu=micro_batch_size_per_gpu,
+                                     update_after_full_replay=update_after_full_replay,
+                                     )
+        ray_runners.append(runner)
+
+    return ray_runners
+
+def inference_engine_setup(model_path,
+                           trust_remote_code,
+                           temperature,
+                           max_tokens,
+                           n_samples,
+                           top_p,
+                           top_k,
+                           seed,
+                           ignore_eos,
+                           stop,
+                           stop_token_ids,
+                           prompt_logprobs,
+                           force_strict_on_policy,
+                           reward_func,
+                           tensor_parallel_size,
+                           eos_id,
+                           reward_broadcast,
+                           eps_reward_norm,
+                           gen_gpus,
+                           ):
+    '''
+        This function is responsible for setting up distributed inference engine.
+    '''
+    tp = int(tensor_parallel_size)
+    num_rollout_engines = max(1, int(gen_gpus) // tp)
+
+    kwargs = { "model_path": model_path,
+               "trust_remote_code": trust_remote_code,
+               "temperature": temperature,
+               "max_tokens": max_tokens,
+               "n_samples": n_samples,
+               "top_p": top_p,
+               "top_k": top_k,
+               "seed": seed,
+               "ignore_eos": ignore_eos,
+               "stop": stop,
+               "stop_token_ids": stop_token_ids,
+               "prompt_logprobs": prompt_logprobs,
+               "force_strict_on_policy": force_strict_on_policy,
+               "reward_func": reward_func,
+               "tensor_parallel_size": tensor_parallel_size,
+               "eos_id": eos_id,
+               "reward_broadcast": reward_broadcast,
+               "eps_reward_norm": eps_reward_norm,
+            }
+    rollout_engines = [
+                       VLLMRolloutEngine.options(num_gpus=tp).remote(**kwargs)
+                                                                        for _ in range(num_rollout_engines)
+                      ]
+
+    return rollout_engines
+
+def load_tokenizer(model_name,
+                   trust_remote_code=False,
+                   rank=0):
+    '''
+       Load tokenizer from huggingface.
+    '''
+    # 1. Tokenizer initialization
     tokenizer = AutoTokenizer.from_pretrained(model_name,
                                               trust_remote_code=trust_remote_code)
 
@@ -110,44 +199,7 @@ def load_models_and_tokenizer(model_name,
             # fallback to eos token id
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    return model, ref_model, tokenizer  
-
-def training_engine_setup(deepspeed_config, model, ref_model=None):
-    '''
-        This function is responsible for setting up distributed training engine.
-        For now, it only supports deepspeed.
-    '''
-    # Convert pydantic model to python Dict for DeepSpeed
-    ds_config_dict = deepspeed_config.model_dump()
-
-    # check to avoid re-initializing distributed backend
-    if not torch.distributed.is_initialized():
-        # 1. Initialize distributed training engine
-        deepspeed.init_distributed()
-
-    # 2. Initialize model engine
-    model_engine, optimizer, _, _ = deepspeed.initialize(
-                                                        model=model,
-                                                        model_parameters=model.parameters(),
-                                                        config=ds_config_dict
-                                                        )
-    ref_model_engine = None
-    if ref_model is not None:
-        # ref_model is supported here in case if we want to add
-        # additional metrics, divergence, etc. Note, ref_model will not be optimized.
-        try:
-            ref_model.to(model_engine.device)
-            ref_model.eval()
-            ref_model_engine = ref_model
-
-        except:
-            # fallback: initialize with DeepSpeed
-            ref_model_engine, _, _, _ = deepspeed.initialize(
-                                                    model=ref_model,
-                                                    config=ds_config_dict
-                                                    )
-
-    return model_engine, ref_model_engine, optimizer
+    return tokenizer
 
 def data_loader_setup(dnames,
                       dataset_ratios,
@@ -169,47 +221,23 @@ def data_loader_setup(dnames,
            - Sampler is DistributedSampler; caller must call sampler.set_epoch(epoch) each epoch.
     '''
     # 1. Initialize our custom datasets
-    dataset = PairedDataset(prompt_key=prompt_key,
-                            answer_key=answer_key,
+    prompt_ds = PromptOnlyDataset(prompt_key=prompt_key,
                             max_seq_len=max_seq_len,
                             tokenizer=tokenizer,
-                            data_path=files_path)
-
-    shuffle = True if split == 'train' else False
-    drop_last = True if split == 'train' else False
-
-    # 2. Initialize distributed sampler
-    sampler = DistributedSampler(dataset,
-                                shuffle=shuffle,
-                                num_replicas=world_size,
-                                rank=rank)
-
-    # 3. Initialize data loader
-    def worker_init_fn(worker_id):
-        # each worker gets a different seed but deterministic across runs when seed fixed
-        worker_seed = seed + worker_id + (rank * 100000)
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
+                            data_path=files_path,
+                            return_text=False)
 
     dataloader = DataLoader(
-                            dataset=dataset,
-                            batch_size=batch_size,
-                            sampler=sampler,
+                            dataset=prompt_ds,
+                            batch_size=rollout_batch_size,
                             num_workers=num_workers,
+                            shuffle=True,
                             pin_memory=True,
-                            drop_last=drop_last,
-                            worker_init_fn=worker_init_fn # for reproducibility
+                            drop_last=False,
+                            collate_fn=prompt_ds.collate_fn,
                             )
 
-    return dataloader, sampler
-
-def inference_engine_setup(deepspeed_config, model):
-    '''
-        This function is responsible for setting up distributed inference engine.
-        For now, it only supports deepspeed.
-    '''
-    return None
+    return dataloader
 
 if __name__ == "__main__":
     # parse arguments
@@ -219,42 +247,83 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     ########
-    # 1. Setup Environment
+    # 1. Miscellaneous setups
     ########
-    rank, world_size, local_rank = rank_world_size_setup()
-
-    ########
-    # 2. Load config
-    ########
+    rank, local_rank = rank_setup()
+    world_size = config.run.world_size
     config = cfg.load_and_verify(input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
-                                 world_size=world_size,
                                  )
     set_random_seeds(seed=config.run.seed)
-    ########
-    # 3. Logging and saving (e.g., W&B, results dir, etc.)
-    ########
-    #TBA
 
     ########
-    # 4. load model or previous checkpoints
+    # 2. initialize ray
     ########
-    model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
-                                                            model_dtype=config.model.dtype,
-                                                            ref_model_name=config.model.ref_model,
-                                                            trust_remote_code=config.model.trust_remote_code,
-                                                            model_class=config.model.model_class,
-                                                            attn_impl=config.model.attn_implementation)
+    ray_engine, master_addr = setup_ray(ray_address=config.run.ray_address)
 
     ########
-    # 5. Setup trainiing and inference engines
+    # 3. initialize training engine
     ########
-    model_engine, ref_model_engine, optimizer = training_engine_setup(deepspeed_config=config.deepspeed,
-                                                                      model=model,
-                                                                      ref_model=ref_model)
+    if str.lower(config.train.alg_name) in {'pg', 'ppo', 'grpo', 'cispo'}:
+        if str.lower(config.train.alg_name) == 'pg':
+            import algs.PG.pg as calg
+            alg = calg.PG
+        elif str.lower(config.train.alg_name) == 'ppo':
+            import algs.PPO.ppo as calg
+            alg = calg.PPO
+        elif str.lower(config.train.alg_name) == 'grpo':
+            import algs.GRPO.grpo as calg
+            alg = calg.GRPO
+        elif str.lower(config.train.alg_name) == 'cispo':
+            import algs.CISPO.cispo as calg
+            alg = calg.CISPO
+    else:
+        raise ValueError(f"Unknown algorithm: {config.train.alg_name}")
 
-    if config.model.gradient_checkpointing:
-        model_engine.gradient_checkpointing_enable()
+    training_engine_runner = training_runner_setup(model_path=config.model.name,
+                                                  ref_model_path=config.model.ref_model,
+                                                  model_dtype=config.model.dtype,
+                                                  trust_remote_code=config.model.trust_remote_code,
+                                                  attn_impl=config.model.attn_implementation,
+                                                  world_size=world_size,
+                                                  master_addr=master_addr,
+                                                  master_port=config.run.ray_master_port,
+                                                  alg=alg,
+                                                  kl_coeff=config.train.kl_coeff,
+                                                  clip_low=config.train.clip_low,
+                                                  clip_high=config.train.clip_high,
+                                                  entropy_coeff=config.train.entropy_coeff,
+                                                  use_cache=config.model.use_cache,
+                                                  train_batch_size_per_gpu=config.train.train_batch_size_per_gpu,
+                                                  update_after_full_replay=config.train.update_after_full_replay)
+    ########
+    # 5. load tokenizer
+    ########
+    tokenizer = load_tokenizer()
+
+    ########
+    # 6. initialize inference engine
+    ########
+    rollout_engines = inference_engine_setup(model_path=config.model.name,
+                                             trust_remote_code=config.model.trust_remote_code,
+                                             temperature=config.inference_engine.temperature,
+                                             max_tokens=config.inference_engine.max_tokens,
+                                             n_samples=config.inference_engine.n_samples,
+                                             top_p=config.inference_engine.top_p,
+                                             top_k=config.inference_engine.top_k,
+                                             seed=config.run.seed,
+                                             ignore_eos=config.inference_engine.ignore_eos,
+                                             stop=config.inference_engine.stop,
+                                             stop_token_ids=config.inference_engine.stop_token_ids,
+                                             prompt_logprobs=config.inference_engine.prompt_logprobs,
+                                             force_strict_on_policy=config.inference_engine.force_strict_on_policy,
+                                             reward_func=config.inference_engine.reward_func,
+                                             tensor_parallel_size=config.inference_engine.tensor_parallel_size,
+                                             eos_id=tokenizer.eos_token_id,
+                                             reward_broadcast=config.inference_engine.reward_broadcast,
+                                             eps_reward_norm=config.inference_engine.eps_reward_norm,
+                                             gen_gpus=config.run.gen_gpus,)
+
     ########
     # 6. Build env or data loader
     ########
