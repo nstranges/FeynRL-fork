@@ -68,7 +68,10 @@ class VLLMRolloutEngine:
         if self.vllm_engine is not None and \
            self.loaded_version == version and \
            model_path == self.model_path:
+            print(f"[VLLMEngine] Model already at version {version}, skipping refresh")
             return False
+
+        print(f"[VLLMEngine] Refreshing model to version {version} from {model_path}")
 
         # Verify ckpt files exist before loading
         if not os.path.exists(model_path):
@@ -82,6 +85,7 @@ class VLLMRolloutEngine:
         self.model_path = model_path
         self.load_model()
         self.loaded_version = version
+        print(f"[VLLMEngine] Model refreshed to version {version}")
         return True
 
     def load_model(self) -> None:
@@ -246,9 +250,11 @@ class VLLMRolloutEngine:
                                      f"but loaded_version={int(self.loaded_version)}. ")
 
                 assert self.vllm_engine is not None, f"{self.model_path} not loaded."
+                print(f"[VLLMEngine] Generating {len(prompts)} prompts with n_samples={self.n_samples}")
                 generated_outputs = self.vllm_engine.generate(prompts,
                                                              sampling_params=self.sampling_params,
                                                              use_tqdm=False)
+                print(f"[VLLMEngine] Generation complete for {len(prompts)} prompts")
 
                 # generated_outputs has prompt_ids and other outputs
                 # this works even if n_samples >= 1
@@ -370,6 +376,19 @@ class VLLMRolloutEngine:
                                                 stats=group_stats,
                                                 prompt_len=prompt_len,
                                                 is_per_token=is_per_token)
+                    else:
+                        # For single sample (n_samples=1), still need to add pred_zscores
+                        # Since there's no group to normalize against, zscores = rewards (no baseline)
+                        for sample in group_samples:
+                            # Create pred-aligned zscores from token-aligned rewards
+                            pred_zscores = torch.zeros_like(sample['rewards'], dtype=torch.float)
+                            response_len = sample['response_len']
+                            if response_len > 0:
+                                pred_start = prompt_len - 1
+                                pred_end = len(sample['rewards']) - 1
+                                # Copy response rewards to pred-aligned positions
+                                pred_zscores[pred_start:pred_end] = sample['rewards'][prompt_len:]
+                            sample["pred_zscores"] = pred_zscores
 
                     rollout_samples.extend(group_samples)
 
