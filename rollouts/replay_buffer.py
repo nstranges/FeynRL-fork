@@ -53,7 +53,7 @@ class ReplayBuffer(Dataset):
 
             self.add(input_ids=sample["input_ids"],
                      rewards=sample["rewards"],
-                     zscores=sample["zscores"],
+                     zscores=sample["pred_zscores"],
                      masks=sample["pred_masks"],
                      dones=sample["pred_dones"],
                      old_logprobs=sample["pred_old_logprobs"],
@@ -73,7 +73,7 @@ class ReplayBuffer(Dataset):
             input_ids, rewards, zscores, mask, done, old_logprobs
             are all prediction aligned and [T].
         '''
-        input_ids =  ensure_1d(input_ids, "input_ids")
+        input_ids = ensure_1d(input_ids, "input_ids")
         rewards   = ensure_1d(rewards, "rewards")
         zscores   = ensure_1d(zscores, "zscores")
         masks     = ensure_1d(masks, "mask")
