@@ -9,9 +9,13 @@ class Run(BaseModel):
     '''
     model_config = ConfigDict(extra='forbid')
     experiment_id: str
-    world_size: int
     distributed_training_strategy: str
     seed: int
+    # RL-specific fields
+    training_gpus: int | None = None
+    rollout_gpus: int | None = None
+    ray_address: str | None = None
+    ray_master_port: int | None = None
 
 class Train(BaseModel):
     '''
@@ -30,6 +34,13 @@ class Train(BaseModel):
     warmup_steps_ratio: float
     clip_grad_norm: float
     lr_scheduler: str
+
+    # RL-specific policy arguments
+    kl_coeff: float | None = None
+    clip_low: float | None = None
+    clip_high: float | None = None
+    entropy_coeff: float | None = None
+    update_after_full_replay: bool | None = None
 
     ###############
     # general training  loop arguments
@@ -124,6 +135,31 @@ class InferenceEngine(BaseModel):
     model_config = ConfigDict(extra='forbid')
     name: str
 
+class Reward(BaseModel):
+    '''
+        Everything related to rewards (RL-specific).
+    '''
+    model_config = ConfigDict(extra='forbid')
+    broadcast: bool | None = None
+    eps_reward_norm: float | None = None
+    reward_func: str | None = None
+
+class Rollout(BaseModel):
+    '''
+        Everything related to rollout generation (RL-specific).
+    '''
+    model_config = ConfigDict(extra='forbid')
+    n_samples: int | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    ignore_eos: bool | None = None
+    stop: str | None = None
+    stop_token_ids: list[int] | None = None
+    prompt_logprobs: bool | None = None
+    force_strict_on_policy: bool | None = None
+    tensor_parallel_size: int | None = None
+    rollout_batch_size_per_gpu: int | None = None
+
 class Config(BaseModel):
     '''
         This is the main configuration class for the experiment where it puts all the sub-configurations
@@ -136,11 +172,14 @@ class Config(BaseModel):
     data: Data
     deepspeed: DeepSpeed
     inference_engine: InferenceEngine
+    # RL-specific sections
+    reward: Reward | None = None
+    rollout: Rollout | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-    def sync_deepspeed_config(self):
+    def sync_deepspeed_config(self, world_size: int):
             """
             Sync DeepSpeed config from train/model without duplicating YAML fields.
             """
@@ -149,7 +188,8 @@ class Config(BaseModel):
             self.deepspeed.gradient_accumulation_steps = self.train.gradient_accumulation_steps
 
             # Explicitly calculate and set train_batch_size for DeepSpeed logging/sanity check
-            self.deepspeed.train_batch_size = self.train.train_batch_size_per_gpu * self.train.gradient_accumulation_steps * self.run.world_size
+            if world_size is not None:
+                self.deepspeed.train_batch_size = self.train.train_batch_size_per_gpu * self.train.gradient_accumulation_steps * world_size
 
             # 2 — Gradient Clipping
             self.deepspeed.gradient_clipping = float(self.train.clip_grad_norm)
@@ -218,9 +258,12 @@ class Config(BaseModel):
                 if "stage3_gather_16bit_weights_on_model_save" not in self.deepspeed.zero_optimization:
                     self.deepspeed.zero_optimization["stage3_gather_16bit_weights_on_model_save"] = True
 
-def load_and_verify(input_yaml: str, experiment_id: str, world_size: int):
+def load_and_verify(method: str, input_yaml: str, experiment_id: str, world_size: int | None = None):
     '''
+        method: "sl" or "rl"
         input_yaml: path to the yaml file
+        experiment_id: experiment identifier
+        world_size: number of GPUs for SL training (optional for RL)
     '''
     try:
         with open(input_yaml, "r") as f:
@@ -230,10 +273,17 @@ def load_and_verify(input_yaml: str, experiment_id: str, world_size: int):
         config = Config(**raw_config)
         # Update Run details
         config.run.experiment_id = experiment_id
-        config.run.world_size = world_size
+        if method == "sl" and world_size is not None:
+            world_size = world_size
+
+        elif method == "rl":
+            world_size = config.run.training_gpus
+
+        else:
+            raise ValueError("world_size must be specified for SL training")
 
         # Sync AFTER updating world_size
-        config.sync_deepspeed_config()
+        config.sync_deepspeed_config(world_size)
 
         print( "\n" + 20*"=" + "Config" + 20*"=")
         print(f"Contents of {input_yaml}")
@@ -257,4 +307,5 @@ def load_and_verify(input_yaml: str, experiment_id: str, world_size: int):
 
 if __name__ == "__main__":
     # load config
-    config = load_and_verify("./configs/sl_args.yaml", experiment_id="run_1", world_size=1)
+    config = load_and_verify("sl", "./configs/sl_args.yaml", experiment_id="run_1", world_size=4)
+    config = load_and_verify("rl", "./configs/rl_args.yaml", experiment_id="run_2")
