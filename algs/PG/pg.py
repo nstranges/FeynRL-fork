@@ -2,32 +2,44 @@ import torch
 import numpy as np
 from tqdm import tqdm
 import ray
+import deepspeed
+from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 @ray.remote(resources={"training": 1})
 class PG:
     def __init__(self,
-                policy_engine,
-                kl_coeff: float,
-                clip_low: float,
-                clip_high: float,
-                entropy_coeff: float,
-                use_cache: bool,
-                micro_batch_size_per_gpu: int,
-                ref_model=None,
-                update_after_full_replay: bool,
-                ):
+                 model_path: str,
+                 model_dtype: torch.dtype,
+                 trust_remote_code: bool,
+                 attn_impl: str,
+                 kl_coeff: float,
+                 clip_low: float,
+                 clip_high: float,
+                 entropy_coeff: float,
+                 use_cache: bool,
+                 micro_batch_size_per_gpu: int,
+                 ref_model_path=None,
+                 update_after_full_replay: bool,
+                 deepspeed_config: deepspeed.DeepSpeedConfig,
+                 ):
 
         # model related parameters
-        self.policy_engine = policy_engine
-        self.ref_model = ref_model
+        self.model_path = model_path
+        self.ref_model_path = ref_model_path
         self.use_cache = use_cache
+        self.attn_impl = attn_impl
+        self.model_dtype = model_dtype
+        self.trust_remote_code = trust_remote_code
+
+        # training related parameters
+        self.deepspeed_config = deepspeed_config
         self.micro_batch_size_per_gpu = micro_batch_size_per_gpu
 
         # policy related parameters
-        self.kl_coeff = float(kl_coeff)
-        self.clip_low = float(clip_low)
-        self.clip_high = float(clip_high)
-        self.ent_coeff = float(entropy_coeff)
+        self.kl_coeff = kl_coeff
+        self.clip_low = clip_low
+        self.clip_high = clip_high
+        self.ent_coeff = entropy_coeff
 
         # use cross entropy loss for policy gradient
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
@@ -35,6 +47,74 @@ class PG:
         # if true, it means the update is done after seeing all samples in the reply buffer
         # treating the entire buffer as a single batch.
         self.update_only_after_full_replay = update_after_full_replay
+
+        # init training engine for each ray actor process
+        self.init_training_engine()
+
+    def init_training_engine(self):
+        '''
+            Since, we are using ray, each ray actor MUST create its own deepspeed engine.
+            This is because each ray actor process is a separate process as it should be 1 actor = 1 gpu = 1 ds rank.
+        '''
+        # Convert pydantic model to python Dict for DeepSpeed
+        ds_config_dict = self.deepspeed_config.model_dump()
+
+        # check to avoid re-initializing distributed backend
+        if not torch.distributed.is_initialized():
+            # 1. Initialize distributed training engine
+            deepspeed.init_distributed()
+
+        # 2. Load model
+        model, ref_model = self.load_model()
+
+        # 2. Initialize model engine
+        self.policy_engine, self.optimizer, _, _ = deepspeed.initialize(
+                                                            model=model,
+                                                            model_parameters=model.parameters(),
+                                                            config=ds_config_dict
+                                                            )
+        self.ref_model_engine = None
+        if ref_model is not None:
+            # ref_model is supported here in case if we want to add
+            # additional metrics, divergence, etc. Note, ref_model will not be optimized.
+            try:
+                ref_model.to(self.policy_engine.device)
+                ref_model.eval()
+                self.ref_model_engine = ref_model
+
+            except:
+                # fallback: initialize with DeepSpeed
+                self.ref_model_engine, _, _, _ = deepspeed.initialize(
+                                                        model=ref_model,
+                                                        config=ds_config_dict
+                                                        )
+
+    def load_model(self):
+        '''
+            Load models and tokenizer from huggingface.
+        '''
+        assert self.model_dtype != 'auto', "dtype must not be auto to avoid any precision issues"
+        assert self.attn_impl=='' or self.attn_impl in ['eager', 'flash_attention_2'], "attn_impl must be one of 'eager', 'flash_attention_2' or empty string"
+
+        # 1. model and its config initialization
+        model_config = AutoConfig.from_pretrained(self.model_path)
+        model = AutoModelForCausalLM.from_pretrained(self.model_path,
+                                                    torch_dtype=self.model_dtype,
+                                                    trust_remote_code=self.trust_remote_code,
+                                                    config=model_config,
+                                                    attn_implementation=None if self.attn_impl == '' else self.attn_impl)
+
+        # if ref model is provided to use it in kl for example.
+        if self.ref_model_path:
+            ref_model = AutoModelForCausalLM.from_pretrained(self.ref_model_path,
+                                                            torch_dtype=self.model_dtype,
+                                                            trust_remote_code=self.trust_remote_code,
+                                                            config=model_config,
+                                                            attn_implementation=None if self.attn_impl == '' else self.attn_impl)
+        else:
+            ref_model = None
+
+        return model, ref_model
 
     def policy_forward(self, input_ids, att_mask, pos_ids):
         '''
@@ -159,6 +239,8 @@ class PG:
         ga_pi_attr = getattr(self.policy_engine, 'gradient_accumulation_steps', 1)
         ga_pi = int(ga_pi_attr() if callable(ga_pi_attr) else ga_pi_attr)
 
+        # track metrics across all micro-batches
+        all_metrics = []
         for step, micro_batch in enumerate(progress_bar):
             is_last = (step == (num_micro - 1))
             is_boundary = (((step + 1) % ga_pi) == 0) or is_last
@@ -197,6 +279,9 @@ class PG:
                                                            mask=mask,
                                                            entropies=pi_entropies)
 
+            # store metrics
+            all_metrics.append(pi_metrics)
+
             if self.update_only_after_full_replay:
                 # is_boundary is true, deepspeed will only update the parameters
                 # after seeing all samples in the replay buffer.
@@ -205,3 +290,11 @@ class PG:
             # backward pass
             self.policy_engine.backward(pi_loss)
             self.policy_engine.step()
+
+        # aggregate metrics across all micro-batches
+        aggregated_metrics = {}
+        if all_metrics:
+            for key in all_metrics[0].keys():
+                aggregated_metrics[key] = np.mean([m[key] for m in all_metrics])
+
+        return aggregated_metrics
