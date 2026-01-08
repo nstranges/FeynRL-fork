@@ -153,7 +153,6 @@ def load_tokenizer(model_name, trust_remote_code=False, rank=0):
     '''
        Load tokenizer from huggingface.
     '''
-    # 1. Tokenizer initialization
     tokenizer = AutoTokenizer.from_pretrained(model_name,
                                               trust_remote_code=trust_remote_code)
 
@@ -173,7 +172,7 @@ def load_tokenizer(model_name, trust_remote_code=False, rank=0):
 
 def rollout_dataloader_setup(params, tokenizer, num_rollout_engines):
     '''
-       This dataloader is used for rollout generation which is used to train the policy.
+       This dataloader is used for rollout generation which would be used to train the policy.
     '''
     # 1. Initialize our custom datasets
     prompt_ds = PromptOnlyDataset(prompt_key=params.data.prompt_key,
@@ -195,25 +194,26 @@ def rollout_dataloader_setup(params, tokenizer, num_rollout_engines):
 
     return dataloader
 
-def run_rollout_engines(rollout_dataloader,
-                        num_rollout_engines,
-                        rollout_engines,
-                        epoch,
-                        policy_version,
-                        replay_buffer,
-                        ray_agent):
+def collect_rollouts(rollout_dataloader,
+                     num_rollout_engines,
+                     rollout_engines,
+                     epoch,
+                     policy_version,
+                     replay_buffer,
+                     ray_agent):
     '''
-        This function is used to run rollout generation.
+        This function is used to run rollout engine and generate rollouts/samples.
     '''
-    # 1) Generate rollouts
+    assert num_rollout_engines == len(rollout_engines), 'Number of rollout engines does not match with the number of rollout engines'
+
     rollout_start_time = time.time()
     total_samples_generated = 0
     total_reward_sum = 0.0
     total_response_len = 0
 
-    dataset_size = len(rollout_dataloader.dataset)
     # Note dataLoader's batch_size is already num_rollout_engines * rollout_batch_size,
-    batch_size = rollout_dataloader.batch_size
+    batch_size   = rollout_dataloader.batch_size
+    dataset_size = len(rollout_dataloader.dataset)
     num_steps_to_generate_all = (dataset_size + batch_size - 1) // batch_size
 
     print(
@@ -224,23 +224,25 @@ def run_rollout_engines(rollout_dataloader,
     )
 
     for rollout_batch in rollout_dataloader:
-        # 1.1 split data across rollout engines
+        # 1. split data across rollout engines
         # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
-        # rollout_batch is a List[Dict].
+        # and rollout_batch is a list of dictionaries.
         shard_size = (len(rollout_batch) + num_rollout_engines - 1) // num_rollout_engines
+        # it is not necessary to have equal number of samples per engine, though they can't be empty.
         rollout_shards = [rollout_batch[i * shard_size:(i + 1) * shard_size] for i in range(num_rollout_engines)]
+        rollout_shards = [shard for shard in rollout_shards if len(shard) > 0]
 
-        # 1.2 generate rollouts
+        # 2. schedule rollout generation
         rollout_samples = []
-        for eng, shard in zip(rollout_engines, rollout_shards):
-            rollout_samples.append(eng.generate.remote(prompts=shard,
-                                                        current_iter=epoch,
-                                                        policy_version=policy_version))
+        for i, shard in enumerate(rollout_shards):
+            rollout_samples.append(rollout_engines[i].generate.remote(prompts=shard,
+                                                                      current_iter=epoch,
+                                                                      policy_version=policy_version))
 
-        # 1.3 gather rollouts
+        # 3. gather rollouts
         rollout_lists = ray_agent.get(rollout_samples)
 
-        # 1.4 merge rollouts and collect stats
+        # 4. merge rollouts across all engines and collect stats
         rollout_merged = []
         for rl in rollout_lists:
             rollout_merged.extend(rl)
@@ -249,7 +251,7 @@ def run_rollout_engines(rollout_dataloader,
                 total_reward_sum += sample['rewards'].sum().item()
                 total_response_len += sample['response_len']
 
-        # 1.5 add to replay buffer
+        # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
 
     rollout_time = time.time() - rollout_start_time
@@ -263,15 +265,6 @@ def run_rollout_engines(rollout_dataloader,
             "avg_reward": avg_reward,
             "avg_response_len": avg_response_len,
             "rollout_time": rollout_time}
-
-def run_training_engines():
-    pass
-
-def save_ckpt():
-    pass
-
-def refresh_ckpt():
-    pass
 
 if __name__ == "__main__":
     # parse arguments
@@ -316,17 +309,18 @@ if __name__ == "__main__":
     # 3. initialize training engine
     ########
     logger.info(f"Setting up training algorithm: {config.train.alg_name}")
-    if str.lower(config.train.alg_name) in {'pg', 'ppo', 'grpo', 'cispo'}:
-        if str.lower(config.train.alg_name) == 'pg':
+    alg_name = str.lower(config.train.alg_name)
+    if alg_name in {'pg', 'ppo', 'grpo', 'cispo'}:
+        if alg_name == 'pg':
             import algs.PG.pg as calg
             alg = calg.PG
-        elif str.lower(config.train.alg_name) == 'ppo':
+        elif alg_name == 'ppo':
             import algs.PPO.ppo as calg
             alg = calg.PPO
-        elif str.lower(config.train.alg_name) == 'grpo':
+        elif alg_name == 'grpo':
             import algs.GRPO.grpo as calg
             alg = calg.GRPO
-        elif str.lower(config.train.alg_name) == 'cispo':
+        elif alg_name == 'cispo':
             import algs.CISPO.cispo as calg
             alg = calg.CISPO
     else:
@@ -391,11 +385,11 @@ if __name__ == "__main__":
     ########
     policy_version = 0
     number_of_epochs  = config.train.total_number_of_epochs
-    total_training_steps_per_epoch = config.train.train_steps_per_epoch
+    number_of_training_steps_per_epoch = config.train.train_steps_per_epoch
     global_step = 0
 
     logger.info("=" * 50)
-    logger.info(f"Starting training: {number_of_epochs} epochs, {total_training_steps_per_epoch} steps/epoch")
+    logger.info(f"Starting training: {number_of_epochs} epochs, {number_of_training_steps_per_epoch} steps/epoch")
     logger.info(f"Training GPUs: {training_gpus}, Rollout GPUs: {rollout_gpus}")
     logger.info("=" * 50)
 
@@ -404,15 +398,15 @@ if __name__ == "__main__":
         logger.info(f"[Epoch {epoch+1}/{number_of_epochs}] Starting rollout generation...")
 
         ################
-        # Sample generation step
+        # 1. Rollout generation and Sample collection
         ################
-        rollout_stats = run_rollout_engines(rollout_dataloader=rollout_dataloader,
-                                            num_rollout_engines=num_rollout_engines,
-                                            rollout_engines=rollout_engines,
-                                            epoch=epoch,
-                                            policy_version=policy_version,
-                                            replay_buffer=replay_buffer,
-                                            ray_agent=ray)
+        rollout_stats = collect_rollouts(rollout_dataloader=rollout_dataloader,
+                                         num_rollout_engines=num_rollout_engines,
+                                         rollout_engines=rollout_engines,
+                                         epoch=epoch,
+                                         policy_version=policy_version,
+                                         replay_buffer=replay_buffer,
+                                         ray_agent=ray)
 
         logger.info(f"[Epoch {epoch+1}] Rollout complete: {rollout_stats['total_samples_generated']} samples, "
                     f"avg_reward={rollout_stats['avg_reward']:.4f}, avg_response_len={rollout_stats['avg_response_len']:.1f}, "
@@ -422,13 +416,12 @@ if __name__ == "__main__":
             raise ValueError("Replay buffer is empty")
 
         ################
-        # Training step
+        # Data and batch preperation for training
         ################
         logger.info(f"[Epoch {epoch+1}] Starting training on {len(replay_buffer)} replay buffer samples...")
         train_start_time = time.time()
 
-        # 2. create dataloader from replay buffer and convert to list as ray needs serializable data
-        # (pytorch dataloader cannot be serialized and sent to ray workers).
+        # Create dataloader from replay buffer and convert to list as ray needs serializable data
         train_batches = list(DataLoader(dataset=replay_buffer,
                                         batch_size=config.train.train_batch_size_per_gpu,
                                         shuffle=True,
@@ -438,12 +431,9 @@ if __name__ == "__main__":
                                         ))
         logger.info(f"[Epoch {epoch+1}] Created {len(train_batches)} training batches")
 
-        # 3. update the policy based on the current replay buffer
-        # shard batches across training engines
+        # We need to ensure all ranks/gpus get EQUAL number of batches to prevent deepspeed hang so we pad the batches
+        # which are not divisible by num_train_engines
         num_train_engines = len(training_engine_runners)
-
-        # ensure all ranks get equal number of batches to prevent deepspeed hang
-        # pad train_batches to be divisible by num_train_engines
         num_batches = len(train_batches)
         batches_per_engine = (num_batches + num_train_engines - 1) // num_train_engines
         total_batches_needed = batches_per_engine * num_train_engines
@@ -456,35 +446,37 @@ if __name__ == "__main__":
         else:
             train_batches_padded = train_batches
 
+        ################
+        # Policy learning and training
+        ################
         epoch_metrics = {'loss_total': [], 'loss_pi': [], 'loss_ent': [], 'approx_kl': [], 'clipfrac': []}
+        for tidx in range(number_of_training_steps_per_epoch):
 
-        for tidx in range(total_training_steps_per_epoch):
-            # 3.1 send training task to all training engines
+            # Schedule training engines to run update step
             train_futures = []
-
-            for i, engine in enumerate(training_engine_runners):
-                # shard the train_batches which is guaranteed to be equal size
-                # example for [i::step]: num_train_engines = 2 and 6 batches: [B0, B1, B2, B3, B4, B5]
+            for eid, engine in enumerate(training_engine_runners):
+                # Send equal number of batches to each training engine
+                # [eid::step]: num_train_engines = 2 and 6 batches: [B0, B1, B2, B3, B4, B5]
                 # [0::2] -> [B0, B2, B4]
                 # [1::2] -> [B1, B3, B5]
-                shard = train_batches_padded[i::num_train_engines]
+                shard = train_batches_padded[eid::num_train_engines]
 
-                # All ranks MUST participate in training
-                assert len(shard) > 0, f"Rank {i} has empty shard - this will cause DeepSpeed hang"
-                train_futures.append(engine.train_step.remote(shard))
+                # All ranks MUST participate in training, hence no empty shards
+                assert len(shard) > 0, f"Engine {eid} has empty shard - this will cause DeepSpeed hang"
+                train_futures.append(engine.train_step.remote(engine_id=eid, micro_batches=shard))
 
-            # 3.2 gather training metrics from all engines
+            # Gather training metrics from all engines
             # train_metrics: clipfrac, approx_kl, loss_ent, loss_pi, loss_total
             train_metrics = ray.get(train_futures)
 
-            # 3.3 aggregate metrics across all training engines
-            avg_loss = np.mean([m.get('loss_total', 0.0) for m in train_metrics])
-            avg_loss_pi = np.mean([m.get('loss_pi', 0.0) for m in train_metrics])
+            # Aggregate metrics across all training engines
+            avg_loss     = np.mean([m.get('loss_total', 0.0) for m in train_metrics])
+            avg_loss_pi  = np.mean([m.get('loss_pi', 0.0) for m in train_metrics])
             avg_loss_ent = np.mean([m.get('loss_ent', 0.0) for m in train_metrics])
-            avg_kl = np.mean([m.get('approx_kl', 0.0) for m in train_metrics])
+            avg_kl       = np.mean([m.get('approx_kl', 0.0) for m in train_metrics])
             avg_clipfrac = np.mean([m.get('clipfrac', 0.0) for m in train_metrics])
 
-            # Store for epoch average
+            # Epoch average of average across all training engines
             epoch_metrics['loss_total'].append(avg_loss)
             epoch_metrics['loss_pi'].append(avg_loss_pi)
             epoch_metrics['loss_ent'].append(avg_loss_ent)
@@ -495,7 +487,7 @@ if __name__ == "__main__":
 
             # Log to console every 10 steps
             if tidx % 10 == 0:
-                logger.info(f"[Epoch {epoch+1}][Step {tidx+1}/{total_training_steps_per_epoch}] "
+                logger.info(f"[Epoch {epoch+1}][Step {tidx+1}/{number_of_training_steps_per_epoch}] "
                            f"loss={avg_loss:.4f}, pi_loss={avg_loss_pi:.4f}, ent_loss={avg_loss_ent:.4f}, "
                            f"kl={avg_kl:.6f}, clipfrac={avg_clipfrac:.4f}")
 
@@ -511,14 +503,15 @@ if __name__ == "__main__":
 
         # 4. update policy version and reset replay buffer
         policy_version += 1
-        replay_buffer.__reset__()
+        if alg_name.lower() in {"pg", "ppo", "grpo", "cispo"}:
+            replay_buffer.__reset__()
 
         # Log epoch summary
         train_time = time.time() - train_start_time
         epoch_time = time.time() - epoch_start_time
 
         epoch_avg_loss = np.mean(epoch_metrics['loss_total'])
-        epoch_avg_kl = np.mean(epoch_metrics['approx_kl'])
+        epoch_avg_kl   = np.mean(epoch_metrics['approx_kl'])
         epoch_avg_clipfrac = np.mean(epoch_metrics['clipfrac'])
 
         logger.info(f"[Epoch {epoch+1}] Training complete: time={train_time:.2f}s, "
@@ -527,21 +520,21 @@ if __name__ == "__main__":
         # Log epoch metrics to MLflow
         if rank == 0 and mlflow_run:
             mlflow.log_metrics({
-                "epoch/avg_loss": epoch_avg_loss,
-                "epoch/avg_kl": epoch_avg_kl,
-                "epoch/avg_clipfrac": epoch_avg_clipfrac,
-                "epoch/avg_reward": rollout_stats['avg_reward'],
-                "epoch/avg_response_len": rollout_stats['avg_response_len'],
-                "epoch/total_samples": rollout_stats['total_samples_generated'],
-                "epoch/rollout_time_sec": rollout_stats['rollout_time'],
-                "epoch/train_time_sec": train_time,
-                "epoch/total_time_sec": epoch_time,
-            }, step=epoch + 1)
+                    "epoch/avg_loss": epoch_avg_loss,
+                    "epoch/avg_kl": epoch_avg_kl,
+                    "epoch/avg_clipfrac": epoch_avg_clipfrac,
+                    "epoch/avg_reward": rollout_stats['avg_reward'],
+                    "epoch/avg_response_len": rollout_stats['avg_response_len'],
+                    "epoch/total_samples": rollout_stats['total_samples_generated'],
+                    "epoch/rollout_time_sec": rollout_stats['rollout_time'],
+                    "epoch/train_time_sec": train_time,
+                    "epoch/total_time_sec": epoch_time,
+                    }, step=epoch + 1)
 
         ################
         # Save current policy
         ################
-        tag = f"iter{epoch:06d}_v{policy_version:06d}"
+        tag = f"iter{epoch+1:06d}_v{policy_version:06d}"
         model_path = get_experiment_dir_name(output_dir=config.run.checkpoint_dir, tag=tag, experiment_id=config.run.experiment_id)
         logger.info(f"[Epoch {epoch+1}] Saving checkpoint to {model_path}")
 
@@ -571,6 +564,7 @@ if __name__ == "__main__":
         refresh_futures = []
         for eng in rollout_engines:
             refresh_futures.append(eng.refresh_model.remote(model_path, policy_version))
+
         ray.get(refresh_futures)
         logger.info(f"[Epoch {epoch+1}] Rollout engines refreshed")
 
