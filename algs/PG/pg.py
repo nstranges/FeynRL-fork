@@ -235,11 +235,11 @@ class PG:
 
         return loss_total, metrics
 
-    def train_step(self, local_data):
+    def train_step(self, engine_id, micro_batches):
         '''
            This function implements a training step per rank/gpu for local_batch.
            The batch size for each gpu/rank should be micro_batch_size_per_gpu.
-           local_data is part of the replay buffer which will be consumed by the current rank/gpu.
+           micro_batches is a partition of the replay buffer (list of micro-batches) for the current rank/gpu.
         '''
         assert self.policy_engine is not None, "DeepSpeed engine not initialized"
 
@@ -252,8 +252,8 @@ class PG:
         self.policy_engine.zero_grad()
 
         # 3. create progress bar
-        num_micro = len(local_data) # local_data is a dataloader of micro-batches
-        progress_bar = tqdm(local_data, total=num_micro, desc="[Alg:PG] Training Step")
+        num_micro = len(micro_batches)
+        progress_bar = tqdm(micro_batches, total=num_micro, desc="[Alg:PG] Training Step in engine {}".format(engine_id))
 
         ga_pi_attr = getattr(self.policy_engine, 'gradient_accumulation_steps', 1)
         ga_pi = int(ga_pi_attr() if callable(ga_pi_attr) else ga_pi_attr)
@@ -370,4 +370,3 @@ class PG:
                 # still need barrier even on error to prevent deadlock
                 torch.distributed.barrier()
             raise
-
