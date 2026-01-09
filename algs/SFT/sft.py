@@ -29,7 +29,7 @@ class SFT:
         # so logits is [B * (T -1), vocab_size]
         logits = logits.view(-1, vocab_size)
         # flatten y as well:  [B, T -1] -->  [B * (T -1)]
-        target_ids = y.view(-1)
+        target_ids = target_ids.view(-1)
 
         # per token loss
         per_token_loss = self.loss_fn(logits, target_ids)
@@ -74,7 +74,7 @@ class SFT:
         # if pos_ids is not provided, hf will add it automatically.
         pos_ids = batch.get('position_ids', None)
         if pos_ids is not None:
-            pos_ids = pos_ids.to(self.att_mask.device)
+            pos_ids = pos_ids.to(att_mask.device)
 
         # feed data to model
         output = self.model_engine(input_ids=input_ids,
@@ -105,10 +105,10 @@ class SFT:
         self.model_engine.eval()
         with torch.no_grad():
             # forward pass per gpu/rank
-            logits, y, loss_mask = self.forward(micro_batch)
+            logits, target_ids, loss_mask = self.forward(micro_batch)
 
             # compute loss pass
-            loss = self.compute_loss(logits=logits, y=y, loss_mask=loss_mask)
+            loss = self.compute_loss(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
             val_loss = loss.item()
 
         return {"loss": float(val_loss)}
