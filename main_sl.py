@@ -152,11 +152,12 @@ def data_loader_setup(params, tokenizer, rank, world_size, batch_size, split):
            - Sampler is DistributedSampler; caller must call sampler.set_epoch(epoch) each epoch.
     '''
     # 1. Initialize our custom datasets
+    data_path = params.data.train_files_path if split == 'train' else params.data.val_files_path
     dataset = PromptResponseDataset(prompt_key=params.data.prompt_key,
                                     answer_key=params.data.answer_key,
                                     max_seq_len=params.data.max_seq_len,
                                     tokenizer=tokenizer,
-                                    data_path=params.data.train_files_path)
+                                    data_path=data_path)
 
     shuffle = True if split == 'train' else False
     drop_last = True if split == 'train' else False
@@ -260,7 +261,6 @@ if __name__ == "__main__":
             alg = calg.SFT(
                            model_engine=model_engine,
                            optimizer=optimizer,
-                           device=model_engine.device,
                            use_cache=config.model.use_cache,
                            normalize_loss=config.train.normalize_loss)
 
@@ -286,7 +286,8 @@ if __name__ == "__main__":
     global_step = 0
     # Sync before starting
     # Ensure all nodes have loaded the model and data before anyone starts iterating
-    torch.distributed.barrier()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     for epoch in range(config.train.total_number_of_epochs):
         epoch_start_time = time.time()
@@ -301,12 +302,19 @@ if __name__ == "__main__":
             progress_bar = train_dataloader
 
         for step, micro_batch in enumerate(progress_bar):
+            # Limit to train_steps_per_epoch iterations per epoch
+            if step >= config.train.train_steps_per_epoch:
+                break
+
             # Move batch to gpu (deepspeed engine device)
             micro_batch = {k: v.to(model_engine.device) for k, v in micro_batch.items()}
 
             # Run one train step for micro-batch.
             metric = alg.train_step(micro_batch)
-            global_step += 1
+
+            # Only increment global_step when ds actually updates weights
+            if model_engine.is_gradient_accumulation_boundary():
+                global_step += 1
 
             # logging
             if rank == 0:
@@ -317,7 +325,8 @@ if __name__ == "__main__":
                     }, step=global_step)
 
         # Sync before validation to ensure consistent state
-        torch.distributed.barrier()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
         epoch_time = time.time() - epoch_start_time
         logger.info(f"Epoch {epoch+1}/{config.train.total_number_of_epochs} completed in {epoch_time:.2f} seconds")
@@ -340,9 +349,10 @@ if __name__ == "__main__":
             local_sum += float(val_metric['loss'])
             local_count += 1
 
-        # Aggregate across all ranks
-        torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM)
+        # Aggregate across all ranks. it's safe to do this even if not distributed as it skips.
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM)
 
         global_avg_loss = (local_sum / torch.clamp(local_count, min=1.0)).item()
         if rank == 0:
@@ -356,7 +366,8 @@ if __name__ == "__main__":
         # 8.3 Save checkpoint
         ########
         # Sync before saving to ensure no one is still writing
-        torch.distributed.barrier()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
         tag = f"iter{epoch+1:06d}"
         model_path = get_experiment_dir_name(output_dir=config.run.checkpoint_dir, tag=tag, experiment_id=config.run.experiment_id)
@@ -366,6 +377,7 @@ if __name__ == "__main__":
         model_engine.save_checkpoint(model_path)
 
         # Wait for saving to complete on all ranks
-        torch.distributed.barrier()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     logger.info("Training completed successfully!")
