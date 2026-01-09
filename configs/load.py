@@ -222,12 +222,10 @@ class Config(BaseModel):
             # 4 — Optimizer (Auto-Sync)
             # We map generic "optimizer_name" to DeepSpeed's expected structure
             # To use DeepSpeedCPUAdam (for offload), we simply specify "Adam" or "AdamW"
-            ds_opt_type = "AdamW"
-            if "adam" in self.train.optimizer_name.lower():
-                 ds_opt_type = "Adam"
-
-            elif "adamw" in self.train.optimizer_name.lower():
-                 ds_opt_type = "AdamW"
+            if "adamw" in self.train.optimizer_name.lower():
+                ds_opt_type = "AdamW"
+            elif "adam" in self.train.optimizer_name.lower():
+                ds_opt_type = "Adam"
             else:
                 raise ValueError(f"Unsupported optimizer: {self.train.optimizer_name}")
 
@@ -289,6 +287,7 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, world_size
 
         # now verify the config
         config = Config(**raw_config)
+        config.method = method
         # Update Run details
         config.run.experiment_id = experiment_id
         if method == "sl" and world_size is not None:
