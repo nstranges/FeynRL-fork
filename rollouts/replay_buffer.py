@@ -200,6 +200,9 @@ class ReplayBuffer(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
-    def __reset__(self) -> None:
+    def reset(self) -> None:
+        '''
+            Clear the replay buffer for the next epoch.
+        '''
         self.items = []
         self.total_action_tokens = 0
