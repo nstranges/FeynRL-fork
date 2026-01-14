@@ -2,6 +2,7 @@ import os
 import random
 import numpy as np
 import argparse
+import importlib
 import torch
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader, DistributedSampler
@@ -16,7 +17,6 @@ from custom_datasets.prompt_only import PromptOnlyDataset # our custom pytorch d
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.replay_buffer import ReplayBuffer
-import rewards as reward_fns
 from misc.logging import setup_logging, setup_mlflow
 
 def set_random_seeds(seed):
@@ -360,7 +360,8 @@ if __name__ == "__main__":
     ########
     logger.info("Setting up inference/rollout engines...")
     if config.reward.reward_func:
-        reward_fnc = getattr(reward_fns, config.reward.reward_func)
+        reward_module = importlib.import_module("rewards.compute_score")
+        reward_fnc = getattr(reward_module, config.reward.reward_func)
         logger.info(f"Using reward function: {config.reward.reward_func}")
 
     else:
