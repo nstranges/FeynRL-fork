@@ -316,16 +316,13 @@ if __name__ == "__main__":
     ########
     logger.info(f"Setting up training algorithm: {config.train.alg_name}")
     alg_name = str.lower(config.train.alg_name)
-    if alg_name in {'pg', 'ppo', 'grpo', 'cispo'}:
-        if alg_name == 'pg':
-            import algs.PG.pg as calg
-            alg = calg.PG
+    if alg_name in {'ppo', 'sgrpo', 'cispo'}:
+        if alg_name == 'sgrpo':
+            import algs.SGRPO.sgrpo as calg
+            alg = calg.SGRPO
         elif alg_name == 'ppo':
             import algs.PPO.ppo as calg
             alg = calg.PPO
-        elif alg_name == 'grpo':
-            import algs.GRPO.grpo as calg
-            alg = calg.GRPO
         elif alg_name == 'cispo':
             import algs.CISPO.cispo as calg
             alg = calg.CISPO
