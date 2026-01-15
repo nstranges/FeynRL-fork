@@ -37,4 +37,4 @@ TODO
 
 ## Acknowledgments
 
-Some components of this codebase are inspired by practices from [Verl](https://github.com/volcengine/verl) and other open source projects. We try to cite sources wherever we directly reuse ideas or code. If we missed a citation, please let us know and we will fix it.
+Some components of this codebase are inspired by practices from open source projects. We try to cite sources wherever we directly reuse exact code. If we missed a citation, please let us know and we will credit the source.
