@@ -1,7 +1,7 @@
 import torch
 from typing import List, Any
 
-def default_reward_func(prompt_ids: List[int], response_ids: List[int], finish_reason: Any):
+def dummy_reward_func(prompt_ids: List[int], response_ids: List[int], finish_reason: Any):
     '''
       input args:
         prompt_ids: List[int] - list of token ids in the prompt
