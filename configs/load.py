@@ -9,7 +9,7 @@ class Run(BaseModel):
     '''
     model_config = ConfigDict(extra='forbid')
     experiment_id: str
-    distributed_training_strategy: str
+    distributed_training_strategy: str = None
     seed: int
     project_name: str
     tracking_uri: str
@@ -88,10 +88,11 @@ class Data(BaseModel):
         Everything related to data goes here.
     '''
     model_config = ConfigDict(extra='forbid')
-    train_dnames: list[str]
-    train_ratios: dict[str, float]
-    train_files_path: str
-    val_files_path: str
+    train_dnames: list[str] = None
+    train_ratios: dict[str, float] = None
+    train_files_path: str = None
+    val_files_path: str = None
+    test_files_path: str = None
     num_workers: int
     max_seq_len: int
     prompt_key: str
@@ -104,13 +105,13 @@ class Model(BaseModel):
     model_config = ConfigDict(extra='forbid')
     name: str
     dtype: str
-    ref_model: str
+    ref_model: str = None
     ref_model_offload_to_cpu: bool = False
     trust_remote_code: bool
-    use_cache: bool
-    model_class: str
-    attn_implementation: str
-    gradient_checkpointing: bool
+    use_cache: bool = None
+    model_class: str = None
+    attn_implementation: str = None
+    gradient_checkpointing: bool = None
 
 class DeepSpeed(BaseModel):
     '''
@@ -198,12 +199,12 @@ class Config(BaseModel):
         together to form a complete configuration for the experiment.
     '''
     model_config = ConfigDict(extra='forbid')
-    run: Run
-    train: Train
-    model: Model
-    data: Data
-    deepspeed: DeepSpeed
-    inference_engine: InferenceEngine
+    run: Run | None = None
+    train: Train | None = None
+    model: Model | None = None
+    data: Data | None = None
+    deepspeed: DeepSpeed | None = None
+    inference_engine: InferenceEngine | None = None
     # RL-specific sections
     reward: Reward | None = None
     rollout: Rollout | None = None
@@ -370,8 +371,9 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
         elif method == "rl":
             world_size = config.run.training_gpus
 
-        # Sync AFTER updating world_size
-        config.sync_deepspeed_config(world_size)
+        if method != "eval":
+            # Sync AFTER updating world_size
+            config.sync_deepspeed_config(world_size)
 
         # Validate rollout engine resources
         if method == "rl" and config.rollout:
@@ -406,3 +408,4 @@ if __name__ == "__main__":
     # load config
     config = load_and_verify(method="sl", input_yaml="./configs/sl_args.yaml", experiment_id="run_1", rank=0, world_size=4)
     config = load_and_verify(method="rl", input_yaml="./configs/rl_args.yaml", experiment_id="run_2", rank=0)
+    config = load_and_verify(method="eval", input_yaml="./configs/eval_args.yaml", experiment_id="run_3", rank=0)
