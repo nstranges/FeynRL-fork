@@ -268,10 +268,11 @@ class VLLMRolloutEngine:
                 # generated_outputs has prompt_ids and other outputs
                 # this works even if n_samples >= 1
                 rollout_samples = []
-                for data in generated_outputs:
+                for prompt, data in zip(prompts, generated_outputs):
                     group_samples = []
                     group_stats   = {'rewards': [], 'lengths': []}
                     prompt_ids = list(data.prompt_token_ids or [])
+                    answer_ids = list(prompt['answer_token_ids'] or [])
                     prompt_len = len(prompt_ids)
                     if prompt_len == 0:
                         raise ValueError(f"No prompt token ids found in generated output: {data}")
@@ -299,7 +300,7 @@ class VLLMRolloutEngine:
                         rewards   = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
                         # it is important to score the response regardless of its length if it is empty
-                        rewards_resp, is_per_token = self.score_response(prompt_ids, response_ids, finish_reason)
+                        rewards_resp, is_per_token = self.score_response(prompt_ids, response_ids, finish_reason, answer_ids)
                         rewards[prompt_len:] = rewards_resp
 
                         # is_per_token is False, then rewards_resp will only have value for the last element
@@ -387,14 +388,14 @@ class VLLMRolloutEngine:
 
                 return rollout_samples
 
-    def score_response(self, prompt_ids, response_ids, finish_reason) -> torch.Tensor:
+    def score_response(self, prompt_ids, response_ids, finish_reason, answer_ids=None) -> torch.Tensor:
         '''
             Calculate the reward for each response token.
             it returns a float tensor of len(response_ids).
         '''
         with torch.no_grad():
             # per token rewards or scalar reward
-            rewards, is_per_token = self.reward_func(prompt_ids, response_ids, finish_reason)
+            rewards, is_per_token = self.reward_func(prompt_ids, response_ids, finish_reason, answer_ids)
 
         if isinstance(rewards, torch.Tensor):
             rewards = rewards.to(dtype=torch.float32, device='cpu')
