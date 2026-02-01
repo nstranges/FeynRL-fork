@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 import ray
 import time
 import mlflow
+from tqdm import tqdm
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
@@ -167,11 +168,14 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines):
        would be used to train the policy.
     '''
     # 1. Initialize our custom datasets
+    reward_function_name = params.reward.reward_func
+    return_answer = True if reward_function_name in ['gsm8k_reward_func'] else False
     prompt_ds = PromptOnlyDataset(prompt_key=params.data.prompt_key,
                                   max_seq_len=params.data.max_seq_len,
                                   tokenizer=tokenizer,
                                   data_path=params.data.train_files_path,
-                                  return_text=False)
+                                  return_text=False,
+                                  return_answer=return_answer)
 
     # since we split the data across the rollout engines
     bsz = num_rollout_engines * params.rollout.rollout_batch_size_per_gpu
@@ -211,7 +215,9 @@ def collect_rollouts(dataloader,
                 f"({num_rollout_engines} engines × {batch_size // num_rollout_engines} per engine), "
                 f"Steps to generate all samples: {num_steps_to_generate_all}")
 
-    for rollout_batch in dataloader:
+
+    tqdm_dataloader = tqdm(dataloader, desc="Rollout", leave=False)
+    for rollout_batch in tqdm_dataloader:
         # 1. split data across rollout engines
         # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
         # and rollout_batch is a list of dictionaries.
@@ -422,10 +428,11 @@ if __name__ == "__main__":
     # 6. initialize inference engine
     ########
     logger.info("Setting up inference/rollout engines...")
-    if config.reward.reward_func:
-        reward_module = importlib.import_module("rewards.compute_score")
-        reward_fnc = getattr(reward_module, config.reward.reward_func)
-        logger.info(f"Using reward function: {config.reward.reward_func}")
+    reward_func_name = config.reward.reward_func if config.reward.reward_func else None
+    if reward_func_name:
+        reward_module = importlib.import_module("rewards." + reward_func_name)
+        reward_fnc = getattr(reward_module, "compute_score")
+        logger.info(f"Using reward function: {reward_func_name}")
 
     else:
         raise ValueError("Reward function not specified")
