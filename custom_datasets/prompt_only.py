@@ -87,7 +87,7 @@ class PromptOnlyDataset(Dataset):
             answer_ids = self.tokenizer.encode(answer, add_special_tokens=False)
             outputs["answer_token_ids"] = answer_ids
 
-        if self.return_text == True:
+        if self.return_text:
             # Get the prompt text for debugging. it can be used for vLLM rollout too
             prompt_text = self.tokenizer.apply_chat_template(
                                         conversation=message,
