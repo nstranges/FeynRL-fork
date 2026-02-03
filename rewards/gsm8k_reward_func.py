@@ -11,7 +11,7 @@ def extract_solution(solution_str, clip_chars=300):
         solution_str = solution_str[-clip_chars:]
 
     # this also tests the formatting of the model
-    solutions = re.findall("#### (\\-?[0-9\\.\\,]+)", solution_str)
+    solutions = re.search("#### (\-?[0-9\.\,]+)", solution_str)
     if len(solutions) == 0:
         final_answer = None
     else:
