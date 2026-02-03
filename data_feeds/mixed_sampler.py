@@ -151,9 +151,10 @@ def create_dataset_and_sampler(data_paths,
                                seed,
                                local_batch_size,
                                dataset_cls,
+                               dynamic_ratio_every_step,
                                steps_per_epoch=None,
                                shuffle_within_batch=True,
-                               dynamic_ratio_every_step=True):
+                               ):
     '''
         This function inits data loader per dataset and returns a concat dataset.
         For validation, train_ratios is ignored and we use DistributedSampler.
@@ -201,3 +202,58 @@ def create_dataset_and_sampler(data_paths,
                                      drop_last=False)
 
     return concat_ds, sampler
+
+def create_prompt_dataset_and_sampler(data_paths,
+                                      prompt_key,
+                                      solution_key,
+                                      max_seq_len,
+                                      tokenizer,
+                                      train_ratios,
+                                      seed,
+                                      local_batch_size,
+                                      dataset_cls,
+                                      dynamic_ratio_every_step,
+                                      steps_per_epoch,
+                                      shuffle_within_batch=True,
+                                      ):
+    '''
+        Creates a concat dataset and MixedDatasetSampler for rollout generation.
+    '''
+    all_datasets = []
+    dname_list = []
+    len_datasets = {}
+    for d_path in data_paths:
+        print(f"Loading dataset from {d_path}")
+        # extract the dataset name from the file path
+        dname = d_path.split("/")[-1].split(".")[0]
+        dname_list.append(dname)
+        # load each dataset
+        dataset = dataset_cls(prompt_key=prompt_key,
+                              solution_key=solution_key,
+                              max_seq_len=max_seq_len,
+                              tokenizer=tokenizer,
+                              data_path=d_path,
+                              return_text=False)
+
+        all_datasets.append(dataset)
+        len_datasets[dname] = len(dataset)
+
+    # concat all datasets
+    concat_ds = ConcatDataset(all_datasets)
+    # since rollout dataloader runs on the orchestrator,
+    # we set rank=0 and world_size=1
+    sampler = MixedDatasetSampler(seed=seed,
+                                  dnames=dname_list,
+                                  ratios=train_ratios,
+                                  len_datasets=len_datasets,
+                                  local_batch_size=local_batch_size,
+                                  steps_per_epoch=steps_per_epoch,
+                                  rank=0,
+                                  world_size=1,
+                                  shuffle_within_batch=shuffle_within_batch,
+                                  dynamic_ratio_every_step=dynamic_ratio_every_step)
+
+    # all datasets have the same collate_fn since they are same type
+    collate_fn = all_datasets[0].collate_fn
+
+    return concat_ds, sampler, collate_fn
