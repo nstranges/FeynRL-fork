@@ -1,7 +1,7 @@
 import numpy as np
-from torch.utils.data import Sampler
+from torch.utils.data import Sampler, DistributedSampler, ConcatDataset
 
-class MixedRatioSampler(Sampler):
+class MixedDatasetSampler(Sampler):
     def __init__(self, seed: int,
                        dnames: list[str], # ['d1', 'd2', 'd3']
                        ratios: dict[str, float], # {'d1':0.3, 'd2':0.1, 'd3':0.6}
@@ -12,9 +12,17 @@ class MixedRatioSampler(Sampler):
                        dynamic_ratio_every_step: bool=True,
                        world_size :int=1,
                        rank: int=0):
-        assert len(len_datasets) == len(ratios) and len(len_datasets) == len(dnames), "len_datasets, ratios, and dnames must have the same length"
-        assert world_size >=1 and rank >=0, "world_size must be greater than or equal to 1 and rank must be greater than or equal to 0"
+        assert len(len_datasets) == len(ratios) == len(dnames), "len_datasets, ratios, and dnames must have the same length"
+        if set(dnames) != set(ratios.keys()):
+            raise ValueError(f"Dataset/ratio key mismatch: missing={set(dnames)-set(ratios.keys())}, "
+                             f"extra={set(ratios.keys())-set(dnames)}")
+        assert world_size >= 1 and rank >= 0, "world_size must be >= 1 and rank must be >= 0"
         assert rank < world_size, "rank must be less than world_size"
+
+        # Check against empty datasets
+        for name, length in len_datasets.items():
+            if length == 0:
+                raise ValueError(f"Dataset '{name}' is empty. Cannot sample from it.")
 
         ########
         # 1. Generic setup (e.g., random seed, device, world size, etc.)
@@ -130,3 +138,66 @@ class MixedRatioSampler(Sampler):
         self.epoch = epoch
         # Use SeedSequence for robust, independent streams across ranks and epochs
         self.rng = np.random.default_rng(np.random.SeedSequence((self.seed, self.epoch, self.rank)))
+
+def create_dataset_and_sampler(data_paths,
+                               prompt_key,
+                               answer_key,
+                               max_seq_len,
+                               tokenizer,
+                               train_ratios,
+                               split,
+                               rank,
+                               world_size,
+                               seed,
+                               local_batch_size,
+                               dataset_cls,
+                               steps_per_epoch=None,
+                               shuffle_within_batch=True,
+                               dynamic_ratio_every_step=True):
+    '''
+        This function inits data loader per dataset and returns a concat dataset.
+        For validation, train_ratios is ignored and we use DistributedSampler.
+    '''
+    all_datasets = []
+    dname_list = []
+    len_datasets = {}
+    for d_path in data_paths:
+        if rank == 0:
+            print(f"Loading dataset from {d_path}")
+        # extract the dataset name from the file path
+        dname = d_path.split("/")[-1].split(".")[0]
+        dname_list.append(dname)
+        # load each dataset
+        dataset = dataset_cls(prompt_key=prompt_key,
+                             answer_key=answer_key,
+                             max_seq_len=max_seq_len,
+                             tokenizer=tokenizer,
+                             data_path=d_path)
+        all_datasets.append(dataset)
+        len_datasets[dname] = len(dataset)
+
+    # now concat all datasets
+    concat_ds = ConcatDataset(all_datasets)
+
+    if split == 'train':
+        if steps_per_epoch is None:
+            raise ValueError("steps_per_epoch is required for training split")
+        sampler = MixedDatasetSampler(seed=seed,
+                                      dnames=dname_list,
+                                      ratios=train_ratios,
+                                      len_datasets=len_datasets,
+                                      local_batch_size=local_batch_size,
+                                      steps_per_epoch=steps_per_epoch,
+                                      rank=rank,
+                                      world_size=world_size,
+                                      shuffle_within_batch=shuffle_within_batch,
+                                      dynamic_ratio_every_step=dynamic_ratio_every_step)
+    else:
+        # For validation, DistributedSampler is used to ensure every sample is seen exactly once.
+        sampler = DistributedSampler(concat_ds,
+                                     shuffle=False,
+                                     num_replicas=world_size,
+                                     rank=rank,
+                                     drop_last=False)
+
+    return concat_ds, sampler
