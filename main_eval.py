@@ -1,4 +1,6 @@
 import os
+import json
+import yaml
 import random
 import numpy as np
 import argparse
@@ -194,7 +196,6 @@ def collect_rollouts(dataloader,
             for sample in rl:
                 total_samples_generated += 1
                 total_reward_sum += sample['rewards'].sum().item()
-                logger.info(f"Sample reward: {sample['rewards'].sum().item()}")
                 total_response_len += sample['response_len']
 
         # 5. now add them to replay buffer
@@ -203,6 +204,8 @@ def collect_rollouts(dataloader,
     rollout_time = time.time() - rollout_start_time
     avg_reward = total_reward_sum / max(1, total_samples_generated)
     avg_response_len = total_response_len / max(1, total_samples_generated)
+
+    logger.info(f"Average reward: {avg_reward}, Average response length: {avg_response_len}")
 
     if len(replay_buffer) <= 1:
         raise ValueError("Replay buffer is empty")
@@ -234,6 +237,8 @@ if __name__ == "__main__":
                                  rank=rank,
                                  )
     set_random_seeds(seed=config.run.seed)
+
+    checkpoint_dir = config.run.checkpoint_dir
 
     logger.info(f"Config loaded. experiment_id: {config.run.experiment_id}")
 
@@ -301,4 +306,19 @@ if __name__ == "__main__":
                 f"time={rollout_stats['rollout_time']:.2f}s")
 
     logger.info("Evaluation completed successfully!")
+
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    # save rollout stats
+    rollout_stats_path = os.path.join(checkpoint_dir, "rollout_stats.json")
+    with open(rollout_stats_path, "w") as f:
+        json.dump(rollout_stats, f)
+    logger.info(f"Rollout stats saved to {rollout_stats_path}")
+
+    # save experiment config
+    experiment_config_path = os.path.join(checkpoint_dir, "experiment_config.yaml")
+    with open(experiment_config_path, "w") as f:
+        yaml.dump(config, f)
+    logger.info(f"Experiment config saved to {experiment_config_path}")
+    
     ray.shutdown()

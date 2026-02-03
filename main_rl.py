@@ -4,7 +4,7 @@ import numpy as np
 import argparse
 import importlib
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, AutoProcessor
 from torch.utils.data import DataLoader
 import ray
 import time
@@ -257,6 +257,7 @@ def collect_rollouts(dataloader,
 
     return {"total_samples_generated": total_samples_generated,
             "avg_reward": avg_reward,
+            "total_reward": total_reward_sum,
             "avg_response_len": avg_response_len,
             "rollout_time": rollout_time}
 
@@ -313,7 +314,7 @@ def run_training_step(engines, batches):
             'kl_old': np.mean([m.get('kl_old', 0.0) for m in metrics_list]),
             'clipfrac': np.mean([m.get('clipfrac', 0.0) for m in metrics_list])}
 
-def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir, experiment_id, rank, logger):
+def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir, experiment_id, rank, logger, base_model_name=None):
     '''
        Save model checkpoint (must run on all ranks for ZeRO-3)
     '''
@@ -325,6 +326,15 @@ def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir,
     if rank == 0:
         os.makedirs(model_path, exist_ok=True)
         tokenizer.save_pretrained(model_path)
+        
+        try:    
+            processor = AutoProcessor.from_pretrained(
+                base_model_name,
+                trust_remote_code=True,
+            )
+            processor.save_pretrained(model_path)
+        except Exception as e:
+            logger.warning(f"[Epoch {epoch+1}] Failed to save processor: {e}")
 
     # save must run on *all ranks* for zero-3 correctness.
     save_futures = []
@@ -493,7 +503,8 @@ if __name__ == "__main__":
                                          logger=logger)
 
         logger.info(f"[Epoch {epoch+1}] Rollout complete: {rollout_stats['total_samples_generated']} samples, "
-                    f"avg_reward={rollout_stats['avg_reward']:.4f}, avg_response_len={rollout_stats['avg_response_len']:.1f}, "
+                    f"avg_reward={rollout_stats['avg_reward']:.4f}, total_reward={rollout_stats['total_reward']:.4f}, "
+                    f"avg_response_len={rollout_stats['avg_response_len']:.1f}, "
                     f"time={rollout_stats['rollout_time']:.2f}s")
 
         ################
@@ -559,6 +570,7 @@ if __name__ == "__main__":
                     "epoch/avg_kl_ref": epoch_avg_kl_ref,
                     "epoch/avg_clipfrac": epoch_avg_clipfrac,
                     "epoch/avg_reward": rollout_stats['avg_reward'],
+                    "epoch/total_reward": rollout_stats['total_reward'],
                     "epoch/avg_response_len": rollout_stats['avg_response_len'],
                     "epoch/total_samples": rollout_stats['total_samples_generated'],
                     "epoch/rollout_time_sec": rollout_stats['rollout_time'],
@@ -576,7 +588,8 @@ if __name__ == "__main__":
                                      checkpoint_dir=config.run.checkpoint_dir,
                                      experiment_id=config.run.experiment_id,
                                      rank=rank,
-                                     logger=logger)
+                                     logger=logger,
+                                     base_model_name=config.model.name)
         ################
         # 6. Refresh rollout policy
         ################
