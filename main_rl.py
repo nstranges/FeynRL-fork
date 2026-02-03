@@ -4,7 +4,7 @@ import numpy as np
 import argparse
 import importlib
 import torch
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, AutoProcessor
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from torch.utils.data import DataLoader
 import ray
 import time
@@ -226,7 +226,9 @@ def collect_rollouts(dataloader,
                 f"({num_rollout_engines} engines * {batch_size // num_rollout_engines} per engine), "
                 f"Samples this epoch: {samples_per_epoch}")
 
-    for rollout_batch in dataloader:
+
+    tqdm_dataloader = tqdm(dataloader, desc="Rollout", total=num_batches_per_epoch)
+    for rollout_batch in tqdm_dataloader:
         # 1. split data across rollout engines
         # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
         # and rollout_batch is a list of dictionaries.
@@ -335,15 +337,6 @@ def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir,
     if rank == 0:
         os.makedirs(model_path, exist_ok=True)
         tokenizer.save_pretrained(model_path)
-        
-        try:    
-            processor = AutoProcessor.from_pretrained(
-                base_model_name,
-                trust_remote_code=True,
-            )
-            processor.save_pretrained(model_path)
-        except Exception as e:
-            logger.warning(f"[Epoch {epoch+1}] Failed to save processor: {e}")
 
     # save must run on *all ranks* for zero-3 correctness.
     save_futures = []
