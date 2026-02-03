@@ -363,7 +363,7 @@ if __name__ == "__main__":
                     prompt_key="prompt",
                     answer_key="answer",
                     tokenizer=tokenizer,
-                    max_seq_len=50,
+                    max_seq_len=200,
                     data_path="./promptonly.parquet",
                       )
     dataloader = DataLoader(dataset, batch_size=3)
