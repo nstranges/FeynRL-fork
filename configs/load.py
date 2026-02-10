@@ -394,7 +394,16 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 raise ValueError("world_size must be specified for SL training")
 
         elif method == "rl":
+            # Validate GPU counts before using them
+            if config.run.training_gpus is None or config.run.training_gpus < 1:
+                raise ValueError(f"training_gpus must be >= 1 for RL training, got {config.run.training_gpus}")
+            if config.run.rollout_gpus is None or config.run.rollout_gpus < 1:
+                raise ValueError(f"rollout_gpus must be >= 1 for RL training, got {config.run.rollout_gpus}")
             world_size = config.run.training_gpus
+
+            # [1-clip_low, 1+clip_high] requires non-negative values
+            if config.train.clip_low < 0 or config.train.clip_high < 0:
+                raise ValueError(f"clip_low and clip_high must be >= 0, got {config.train.clip_low} and {config.train.clip_high}.")
 
         if method != "eval":
             # Sync AFTER updating world_size
