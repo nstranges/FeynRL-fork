@@ -201,10 +201,11 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
                                                 dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
                                                 )
     # MixedDatasetSampler is a batch sampler (yields batches of indices)
+    # pin_memory=False: the collate_fn returns plain Python lists/dicts (no tensors to pin)
     dataloader = DataLoader(dataset=dataset,
                             batch_sampler=sampler,
                             num_workers=params.data.num_workers,
-                            pin_memory=True,
+                            pin_memory=False,
                             collate_fn=collate_fn,
                             )
 
@@ -240,6 +241,7 @@ def collect_rollouts(dataloader,
     total_samples_generated = 0
     total_reward_sum = 0.0
     total_response_len = 0
+    total_tokens = 0
 
     # here is an example:
     # local_batch_size is the batch size per gpu
@@ -422,7 +424,7 @@ def gather_training_weights(training_engines, logger):
         return None, 0
 
     end_time = time.time() - start_time
-    logger.info(f"[WeightSync] Gathered {len(state_dict)} parameters in {end_time:.2f}s")
+    logger.info(f"[WeightSync] Gathered the parameters in {end_time:.2f}s")
 
     # Takes a local state_dict, serializes it, and stores it in
     # the ray object store which is distributed shared memory.
@@ -578,7 +580,7 @@ if __name__ == "__main__":
 
     # Weight sync settings
     weight_sync_method = config.run.weight_sync_method or "direct"
-    checkpoint_save_interval = config.run.checkpoint_save_interval or 1
+    checkpoint_save_interval = config.run.checkpoint_save_interval if config.run.checkpoint_save_interval is not None else 1
 
     # Overlap mode settings
     overlap_enabled = config.run.overlap_enabled
@@ -596,7 +598,7 @@ if __name__ == "__main__":
         logger.info(f"Overlap mode ENABLED: max_lag={overlap_max_lag}, weight_update_interval={overlap_weight_update_interval}")
 
     logger.info("=" * 50)
-
+    entire_training_start_time = time.time()
     for epoch in range(number_of_epochs):
         epoch_start_time = time.time()
         logger.info(f"[Epoch {epoch+1}/{number_of_epochs}] Starting rollout generation...")
@@ -747,4 +749,7 @@ if __name__ == "__main__":
         mlflow.end_run()
 
     logger.info("Training completed successfully!")
+    entire_training_time = time.time() - entire_training_start_time
+    logger.info(f"Total training time from start to finish: {entire_training_time:.2f}s")
     ray.shutdown()
+    logger.info("Done!")
