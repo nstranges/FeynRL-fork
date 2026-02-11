@@ -201,6 +201,13 @@ def create_dataset_and_sampler(data_paths,
                                      rank=rank,
                                      drop_last=False)
 
+    if rank == 0:
+        print(f"[DataSampler] split={split}, "
+              f"datasets={len_datasets}, "
+              f"total={len(concat_ds)}, "
+              f"bs={local_batch_size}, "
+              f"Number of samples per epoch={steps_per_epoch}, ")
+
     return concat_ds, sampler
 
 def create_prompt_dataset_and_sampler(data_paths,
@@ -251,6 +258,12 @@ def create_prompt_dataset_and_sampler(data_paths,
                                   world_size=1,
                                   shuffle_within_batch=shuffle_within_batch,
                                   dynamic_ratio_every_step=dynamic_ratio_every_step)
+
+    print(f"[PromptSampler] datasets={len_datasets}, "
+          f"total={len(concat_ds)}, "
+          f"bs={local_batch_size} (prompts/batch across all engines), "
+          f"Number of samples per epoch={steps_per_epoch}, "
+          f"actual prompts/epoch={steps_per_epoch * local_batch_size}")
 
     # all datasets have the same collate_fn since they are same type
     collate_fn = all_datasets[0].collate_fn

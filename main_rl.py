@@ -182,6 +182,7 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
     if samples_per_epoch <= 0:
         raise ValueError(f"samples_per_epoch must be > 0, got {samples_per_epoch}")
 
+    # we need to multiply by num_rollout_engines because we shard data across rollout engines
     bsz = num_rollout_engines * params.rollout.rollout_batch_size_per_gpu
     # Calculate number of batches from total samples
     num_batches = (samples_per_epoch + bsz - 1) // bsz
@@ -231,6 +232,7 @@ def collect_rollouts(dataloader,
                      epoch,
                      policy_version,
                      replay_buffer,
+                     n_samples,
                      logger):
 
     '''
@@ -243,17 +245,18 @@ def collect_rollouts(dataloader,
     total_response_len = 0
     total_tokens = 0
 
-    # here is an example:
-    # local_batch_size is the batch size per gpu
-    # 2 rollout engines * 8 local_batch_size = 16 batches
-    # samples_per_epoch= 100 -> ceil(100/16)=7 batches -> 112 actual examples
+    # batch_size = total prompts per dataloader batch (across all rollout engines)
+    # e.g. 2 engines * 2 rollout_batch_size_per_gpu = 4 prompts per batch (batch_size)
+    # rollout_samples_per_epoch = 100 -> ceil(100/4) = 25 batches -> 100 prompts
+    # Each prompt generates n_samples responses, so replay buffer ≈ 100 * 8 = 800 samples
     batch_size = dataloader.batch_sampler.local_batch_size
     num_batches_per_epoch = len(dataloader)
-    samples_per_epoch = num_batches_per_epoch * batch_size
+    total_prompts = num_batches_per_epoch * batch_size
 
-    logger.info(f"[Rollout] Batch: {batch_size} "
-                f"({num_rollout_engines} engines * {batch_size // num_rollout_engines} per engine), "
-                f"Samples this epoch: {samples_per_epoch}")
+    logger.info(f"[Rollout] {total_prompts} prompts this epoch, "
+                f"{n_samples} samples/prompt, "
+                f"{num_rollout_engines} engines, "
+                f"~{total_prompts * n_samples} expected samples in replay buffer")
 
     for rollout_batch in dataloader:
         # 1. split data across rollout engines
@@ -565,11 +568,14 @@ if __name__ == "__main__":
                                                   num_rollout_engines=num_rollout_engines,
                                                   samples_per_epoch=config.rollout.rollout_samples_per_epoch)
 
-    logger.info(f"Rollout dataloader ready. Total batches per epoch: {len(rollout_dataloader)}")
+    logger.info(f"Rollout dataloader with {len(rollout_dataloader)} batches/machine, "
+                f"n_samples={config.rollout.n_samples} per prompt")
+
+    # replay buffer size would be rollout_samples_per_epoch * n_samples per prompt
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,
                                  )
-    logger.info("Replay buffer initialized")
+    logger.info(f"Replay buffer initialized (max_seq_len={config.data.max_seq_len})")
     ########
     # 7. Training and evaluation loop
     ########
@@ -615,6 +621,7 @@ if __name__ == "__main__":
                                          epoch=epoch,
                                          policy_version=policy_version,
                                          replay_buffer=replay_buffer,
+                                         n_samples=config.rollout.n_samples,
                                          logger=logger)
 
         logger.info(f"[Epoch {epoch+1}] Rollout complete: {rollout_stats['total_samples_generated']} samples, "
@@ -625,7 +632,7 @@ if __name__ == "__main__":
         ################
         # 2. Prepare training batches
         ################
-        logger.info(f"[Epoch {epoch+1}] Starting training on {len(replay_buffer)} replay buffer samples...")
+        logger.info(f"[Epoch {epoch+1}] Replay buffer has {len(replay_buffer)} samples")
         train_start_time = time.time()
 
         # All ranks/gpus should get EQUAL number of batches
@@ -634,7 +641,13 @@ if __name__ == "__main__":
         train_batches_padded = prepare_training_batches(replay_buffer=replay_buffer,
                                                         batch_size=config.train.train_batch_size_per_gpu,
                                                         num_engines=len(training_engine))
-        logger.info(f"[Epoch {epoch+1}] Created {len(train_batches_padded)} training batches")
+        samples_per_engine = len(replay_buffer) // len(training_engine)
+        micro_per_engine = len(train_batches_padded) // len(training_engine)
+        logger.info(f"[Epoch {epoch+1}] Training: "
+                    f"{len(replay_buffer)} replay samples / {len(training_engine)} training engines "
+                    f"= {samples_per_engine} samples/engine / bs={config.train.train_batch_size_per_gpu} "
+                    f"= {micro_per_engine} micro-batches/engine, "
+                    f"{steps_per_epoch} pass(es) over replay buffer")
 
         # Pre-shard and store in Ray object store once.
         # Avoids re-serializing the same data on every step (batches are
