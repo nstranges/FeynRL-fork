@@ -14,7 +14,8 @@ class Run(BaseModel):
     experiment_id: str
     seed: int
     project_name: str
-    tracking_uri: str
+    tracking_uri: str | None = "http://localhost:880/"
+    logger_type: str | None = "mlflow" # Options: mlflow, wandb
     method: str = None
     logger_type : str = "mlflow" # mlflow or wandb
 
