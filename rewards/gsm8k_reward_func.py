@@ -7,12 +7,12 @@ def extract_solution(solution_str, clip_chars=300):
         solution_str = solution_str[-clip_chars:]
 
     # this also tests the formatting of the model
-    solutions = re.search(r"####\s*(-?[0-9.,]+)", solution_str)
-    if solutions is None:
+    solution = re.search(r"####\s*(-?[0-9.,]+)", solution_str)
+    if solution is None:
         final_answer = None
     else:
         # take the last solution
-        final_answer = solutions.group(1).replace(",", "").replace("$", "").replace("\n", "")
+        final_answer = solution.group(1).replace(",", "").replace("$", "").replace("\n", "")
 
     return final_answer
 
