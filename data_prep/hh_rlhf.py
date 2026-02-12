@@ -1,9 +1,6 @@
 import argparse
 import os
 import datasets
-import re
-import textwrap
-import pandas as pd
 
 def create_prompt(prompt_text, system_prompt=None):
     """
@@ -55,7 +52,7 @@ def make_map_fn(split, params):
     def process_fn(example, idx):
         chosen_raw = example["chosen"]
         rejected_raw = example["rejected"]
-        
+
         # Extract prompt + responses
         prompt_chosen, chosen_resp, rejected_resp = split_prompt_chosen_rejected(chosen_raw, rejected_raw)
 
@@ -82,8 +79,9 @@ if __name__ == "__main__":
     parser.add_argument("--local_dir", required=True)
     parser.add_argument("--run_id", default="123245")
     parser.add_argument("--system_prompt", default=None)
-    parser.add_argument("--num_proc", type=int, default=1)
+    parser.add_argument("--num_proc", type=int, default=4)
     parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument("--test_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=123345)
     args = parser.parse_args()
 
@@ -91,16 +89,21 @@ if __name__ == "__main__":
     # load dataset
     ########
     dataset = datasets.load_dataset(args.data_source)
-
-    # hh-rlhf only has 'train'
-    train_val_split = dataset["train"].train_test_split(
-        test_size=args.val_ratio, seed=args.seed
-    )
-    train_dataset = train_val_split["train"]
-    val_dataset = train_val_split["test"]
+    full_train = dataset["train"]
 
     ########
-    # map dataset
+    # create train/val/test split
+    ########
+    test_split = full_train.train_test_split(test_size=args.test_ratio, seed=args.seed)
+    remaining = test_split["train"]
+    test_dataset = test_split["test"]
+
+    val_split = remaining.train_test_split(test_size=args.val_ratio, seed=args.seed)
+    train_dataset = val_split["train"]
+    val_dataset = val_split["test"]
+
+    ########
+    # map dataset to DPO format
     ########
     train_dataset = train_dataset.map(
         make_map_fn("train", args),
@@ -116,17 +119,29 @@ if __name__ == "__main__":
         remove_columns=val_dataset.column_names,
     )
 
+    test_dataset = test_dataset.map(
+        make_map_fn("test", args),
+        with_indices=True,
+        num_proc=args.num_proc,
+        remove_columns=test_dataset.column_names,
+    )
+
     ########
-    # save dataset
+    # save datasets
     ########
     os.makedirs(args.local_dir, exist_ok=True)
 
     train_file = os.path.join(args.local_dir, create_file_name(args, "train"))
-    val_file = os.path.join(args.local_dir, create_file_name(args, "val"))
+    val_file   = os.path.join(args.local_dir, create_file_name(args, "val"))
+    test_file  = os.path.join(args.local_dir, create_file_name(args, "test"))
 
     train_dataset.to_parquet(train_file)
     val_dataset.to_parquet(val_file)
+    test_dataset.to_parquet(test_file)
 
+    ########
+    # print a sample
+    ########
     sample = train_dataset[0]
     print(40 * "=", "Sample", 40 * "=")
     print("Prompt:")
@@ -140,4 +155,5 @@ if __name__ == "__main__":
 
     print(f"Train file: {train_file} ({len(train_dataset)} examples)")
     print(f"Val file:   {val_file} ({len(val_dataset)} examples)")
+    print(f"Test file:  {test_file} ({len(test_dataset)} examples)")
     print("Done.")
