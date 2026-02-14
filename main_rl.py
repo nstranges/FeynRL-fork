@@ -716,7 +716,8 @@ if __name__ == "__main__":
         # 5. Refresh rollout policy via direct weight sync
         ################
         sync_success = False
-        if weight_sync_method == "direct":
+        is_last_epoch = (epoch == number_of_epochs - 1)
+        if weight_sync_method == "direct" and not is_last_epoch:
             logger.info(f"[Epoch {epoch+1}] Syncing weights directly to rollout engines (version {policy_version})...")
             sync_success = sync_weights_direct(training_engines=training_engine,
                                                rollout_engines=rollout_engines,
@@ -730,7 +731,6 @@ if __name__ == "__main__":
         ################
         # 5. save checkpoint
         ################
-        is_last_epoch = (epoch == number_of_epochs - 1)
         should_save_disk = (checkpoint_save_interval > 0 and
                            ((epoch + 1) % checkpoint_save_interval == 0 or is_last_epoch))
 
