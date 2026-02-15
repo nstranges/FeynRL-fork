@@ -122,7 +122,9 @@ class COMMON:
         # cross_entropy return -logprobs but we need logprobs
         # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
         # target_ids is [B, T-1] --> [B * (T-1)]
-        neg_logprobs = self.cross_entropy(logits.view(-1, vocab_size), target_ids.view(-1))
+        # Compute token logprobs in float32 to avoid bf16/fp16 quantization
+        # collapsing small policy-vs-ref differences to exact zero.
+        neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
         logprobs = -neg_logprobs.view(B, T_minus_1)
         # we can also do this, but it is less efficient I guess
         #   logprobs = logits.log_softmax(dim=-1)
@@ -130,7 +132,7 @@ class COMMON:
 
         entropies = None
         if self.ent_coeff > 0.0:
-            entropies = torch.distributions.Categorical(logits=logits).entropy()
+            entropies = torch.distributions.Categorical(logits=logits.to(torch.float32)).entropy()
 
         return logprobs, entropies, target_ids
 
@@ -160,7 +162,8 @@ class COMMON:
             # cross_entropy return -logprobs but we need logprobs
             # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
             # target_ids is [B, T-1] --> [B * (T-1)]
-            neg_logprobs = self.cross_entropy(logits.view(-1, vocab_size), target_ids.view(-1))
+            # Match policy path: keep logprob computation in float32 for KL stability.
+            neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
             ref_logprobs = -neg_logprobs.view(B, T_minus_1)
 
         return ref_logprobs
@@ -172,9 +175,17 @@ class COMMON:
             kl = E[log pi/pi_ref] + pi_ref/pi - 1
         '''
         # [B, T-1]
+        # Perform KL math in float32 for numerical stability under bf16/fp16.
+        logprobs = logprobs.to(torch.float32)
+        ref_logprobs = ref_logprobs.to(torch.float32)
+
         log_ratio = logprobs - ref_logprobs
         # pi_ref/pi = exp(ref_logprobs - logprobs)
-        ratio_inv = torch.exp(ref_logprobs - logprobs)
+        exponent = ref_logprobs - logprobs
+        if exponent.max().item() > 10.0:
+            print(f"[WARNING] compute_kl_distance: extreme divergence detected, max exponent={exponent.max().item():.1f}")
+
+        ratio_inv = torch.exp(exponent)
         kl_dist = log_ratio + ratio_inv - 1
         return kl_dist
 
