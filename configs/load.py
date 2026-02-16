@@ -63,6 +63,9 @@ class Train(BaseModel):
     entropy_coeff: float | None = None
     update_after_full_replay: bool | None = None
 
+    # PPO-specific arguments
+    tau: float | None = None           # GAE lambda
+    gamma: float | None = None         # discount factor
     ###############
     # general training  loop arguments
     ###############
@@ -115,6 +118,7 @@ class Model(BaseModel):
     name: str
     dtype: str
     ref_model: str = None
+    value_model: str = None  # PPO value model path if alg_name is ppo
     ref_model_offload_to_cpu: bool = False
     trust_remote_code: bool
     model_class: str = None
@@ -289,6 +293,7 @@ class Config(BaseModel):
             elif self.run.method == "rl":
                 if self.train.train_steps_per_epoch is None:
                     raise ValueError("train_steps_per_epoch must be set for RL training")
+
                 if self.rollout is None:
                     raise ValueError("rollout config is required for RL training")
 
@@ -298,6 +303,7 @@ class Config(BaseModel):
                 # optimizer steps, so we must account for this multiplier.
                 if self.train.update_after_full_replay:
                     optimizer_steps_per_epoch = self.train.train_steps_per_epoch
+
                 else:
                     estimated_replay_size = self.rollout.rollout_samples_per_epoch * self.rollout.n_samples
                     total_micro_batches = math.ceil(estimated_replay_size / self.train.train_batch_size_per_gpu)
@@ -451,6 +457,10 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             # [1-clip_low, 1+clip_high] requires non-negative values
             if config.train.clip_low < 0 or config.train.clip_high < 0:
                 raise ValueError(f"clip_low and clip_high must be >= 0, got {config.train.clip_low} and {config.train.clip_high}.")
+
+            if config.train.alg_name == "ppo":
+                if config.train.tau is None or config.train.gamma is None or not config.model.value_model:
+                    raise ValueError("tau and gamma and value_model must be specified for ppo")
 
         if method != "eval":
             # Sync AFTER updating world_size

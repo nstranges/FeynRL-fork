@@ -1,5 +1,5 @@
 import torch
-from typing import Dict, Optional, Any, List
+from typing import Dict, Any, List
 from torch.utils.data import Dataset
 
 # local imports
@@ -57,7 +57,6 @@ class ReplayBuffer(Dataset):
                      masks=sample["pred_masks"],
                      dones=sample["pred_dones"],
                      old_logprobs=sample["pred_old_logprobs"],
-                     v_olds=sample.get("v_old", None),
                      )
 
     def add(self,
@@ -67,7 +66,6 @@ class ReplayBuffer(Dataset):
             masks: torch.Tensor,
             dones: torch.Tensor,
             old_logprobs: torch.Tensor,
-            v_olds: Optional[torch.Tensor] = None,
             )-> None:
         '''
             input_ids, rewards, zscores, mask, done, old_logprobs
@@ -79,16 +77,12 @@ class ReplayBuffer(Dataset):
         masks     = ensure_1d(masks, "mask")
         dones     = ensure_1d(dones, "dones") # 1=eos, otherwise zero
         old_logps = ensure_1d(old_logprobs, "old_logprobs")
-        if v_olds is not None:
-            v_olds = ensure_1d(v_olds, "v_olds")
 
         # now create attn_masks
         attn_masks = torch.ones_like(input_ids)
 
         # all these should have the same length
         tensors = [input_ids, attn_masks, old_logps, masks, rewards, dones, zscores]
-        if v_olds is not None:
-            tensors.append(v_olds)
 
         all_len = {t.numel() for t in tensors}
         if len(all_len) != 1:
@@ -103,8 +97,6 @@ class ReplayBuffer(Dataset):
         rewards     = rewards[:keep]
         dones       = dones[:keep]
         zscores     = zscores[:keep]
-        if v_olds is not None:
-            v_olds = v_olds[:keep]
 
         # Keep on CPU; dataLoader can pin_memory for faster H2D.
         self.items.append({
@@ -115,7 +107,6 @@ class ReplayBuffer(Dataset):
             "rewards": rewards.detach().cpu(),
             "dones": dones.detach().cpu(),
             "zscores": zscores.detach().cpu(),
-            "v_olds": v_olds.detach().cpu() if v_olds is not None else None,
                         })
 
         # Count only tokens we will ever train on
@@ -136,8 +127,6 @@ class ReplayBuffer(Dataset):
         # pad to batch_max_seq
         input_ids, attn_masks, old_logps = [], [], []
         masks, rewards, dones, zscores = [], [], [], []
-        v_old_list = []
-        empty_v_count = 0
 
         for x in batch:
             # pad everything to zero except for input_ids which should
@@ -150,13 +139,6 @@ class ReplayBuffer(Dataset):
             dones.append(pad_1d_to_length(x=x["dones"], pad_value=0, target_len=target_len))
             zscores.append(pad_1d_to_length(x=x["zscores"], pad_value=0.0, target_len=target_len))
 
-            # if it is None, v_old_list will append None too
-            if x["v_olds"] is not None:
-                v_old_list.append(pad_1d_to_length(x["v_olds"], pad_value=0.0, target_len=target_len))
-
-            else:
-                empty_v_count += 1
-
         # convert from list of [T] to [B, T]
         input_ids   = torch.stack(input_ids, dim=0)
         attn_masks  = torch.stack(attn_masks, dim=0)
@@ -165,15 +147,6 @@ class ReplayBuffer(Dataset):
         rewards     = torch.stack(rewards, dim=0)
         dones       = torch.stack(dones, dim=0)
         zscores     = torch.stack(zscores, dim=0)
-
-        if empty_v_count == len(batch):
-            v_olds = None
-
-        elif empty_v_count== 0:
-            v_olds = torch.stack(v_old_list, dim=0)
-
-        else:
-            raise ValueError("Mixed None/non-None v_old inside the same batch")
 
         # info for scaling later
         batch_action_tokens = int((masks > 0.5).sum().item())
@@ -189,7 +162,6 @@ class ReplayBuffer(Dataset):
                 "rewards": rewards, # [B, T]
                 "done": dones, # [B, T]
                 "zscore": zscores, # [B, T]
-                "v_olds": v_olds, # [B, T] or None
                 "batch_action_tokens": batch_action_tokens, # scalar int
                 "action_token_weight": action_token_weight, # scalar float
                 }
