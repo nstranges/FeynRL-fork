@@ -46,6 +46,38 @@ def parse_hh_conversation(text):
 
 
 # ============================================================
+# Turn Alternation Enforcement
+# ============================================================
+
+def enforce_strict_alternation(turns):
+    """
+    Ensure turns strictly alternate between user and assistant.
+    If consecutive turns have the same role, merge their content.
+
+    Example:
+        user, user, assistant  ->  user(merged), assistant
+    """
+
+    if not turns:
+        return turns
+
+    merged = []
+    prev_role, prev_content = turns[0]
+
+    for role, content in turns[1:]:
+        if role == prev_role:
+            # Merge consecutive same-role turns
+            prev_content = prev_content.rstrip() + "\n\n" + content.lstrip()
+        else:
+            merged.append((prev_role, prev_content))
+            prev_role, prev_content = role, content
+
+    merged.append((prev_role, prev_content))
+
+    return merged
+
+
+# ============================================================
 # First-Divergence Splitting
 # ============================================================
 
@@ -135,6 +167,10 @@ def make_map_fn(split, args):
 
         if not chosen_turns or not rejected_turns:
             return None
+
+        # Enforce strict alternation
+        chosen_turns = enforce_strict_alternation(chosen_turns)
+        rejected_turns = enforce_strict_alternation(rejected_turns)
 
         prompt_turns, chosen_cont, rejected_cont = split_at_first_divergence(
             chosen_turns,
@@ -253,7 +289,6 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("Sample Example")
     print("=" * 80)
-    print("\nPrompt:\n")
     for m in sample["prompt"]:
         print(f"{m['role']}: {m['content']}\n")
 
