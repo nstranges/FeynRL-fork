@@ -107,6 +107,9 @@ class Train(BaseModel):
 
     normalize_loss: bool
 
+    # DPO specific arguments
+    cl_beta: float | None = None
+
 class Data(BaseModel):
     '''
         Everything related to data goes here.
@@ -299,7 +302,7 @@ class Config(BaseModel):
         if self.train.lr_scheduler == "WarmupCosineLR":
             # SL uses micro_batches_per_epoch (convert to optimizer steps)
             # RL uses train_steps_per_epoch (already optimizer steps)
-            if self.run.method == "sl":
+            if self.run.method == "sl" or self.run.method == "cl":
                 if self.train.micro_batches_per_epoch is None:
                     raise ValueError("micro_batches_per_epoch must be set for SL training")
                 optimizer_steps_per_epoch = self.train.micro_batches_per_epoch // self.train.gradient_accumulation_steps
@@ -463,8 +466,8 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
         experiment_id: experiment identifier
         world_size: number of GPUs for SL training (optional for RL)
     '''
-    if method not in ("sl", "rl", "eval"):
-        raise ValueError(f"Unsupported method: '{method}'. Must be 'sl', 'rl', or 'eval'.")
+    if method not in ("sl", "rl", "eval", "cl"):
+        raise ValueError(f"Unsupported method: '{method}'. Must be 'sl', 'rl', 'cl', or 'eval'.")
 
     try:
         with open(input_yaml, "r") as f:
@@ -480,6 +483,15 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
         if method == "sl":
             if world_size is None:
                 raise ValueError("world_size must be specified for SL training")
+
+        elif method == "cl":
+            if world_size is None:
+                raise ValueError("world_size must be specified for CL training")
+            if config.train.alg_name == "dpo":
+                if config.train.cl_beta is None:
+                    raise ValueError("cl_beta must be specified for dpo")
+                if config.train.cl_beta < 0:
+                    raise ValueError("cl_beta must be >= 0 for dpo")
 
         elif method == "rl":
             # Validate GPU counts before using them
@@ -535,3 +547,4 @@ if __name__ == "__main__":
     config = load_and_verify(method="sl", input_yaml="./configs/sl_args.yaml", experiment_id="run_1", rank=0, world_size=4)
     config = load_and_verify(method="rl", input_yaml="./configs/rl_args.yaml", experiment_id="run_2", rank=0)
     config = load_and_verify(method="eval", input_yaml="./configs/eval_args.yaml", experiment_id="run_3", rank=0)
+    config = load_and_verify(method="cl", input_yaml="./configs/cl_args.yaml", experiment_id="run_4", rank=0, world_size=4)
