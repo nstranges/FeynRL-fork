@@ -130,7 +130,6 @@ class COMMON:
         # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
         # target_ids is [B, T-1] --> [B * (T-1)]
         # Compute token logprobs in float32 to avoid bf16/fp16 quantization
-        # collapsing small policy-vs-ref differences to exact zero.
         neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
         logprobs = -neg_logprobs.view(B, T_minus_1)
         # we can also do this, but it is less efficient I guess
