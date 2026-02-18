@@ -2,76 +2,85 @@ import torch
 import numpy as np
 
 class DPO:
-    def __init__(self, model_engine, optimizer, bete, normalize_loss=False):
+    def __init__(self, model_engine,
+                 ref_model_engine,
+                 optimizer,
+                 beta,
+                 normalize_loss=False):
 
         self.model_engine = model_engine
+        self.ref_model_engine = ref_model_engine
+        # ref model would not be updated, so we put it in eval mode
+        self.ref_model_engine.eval()
         self.optimizer = optimizer
         self.normalize_loss = normalize_loss
         self.beta = beta
 
         # use cross entropy loss
-        self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+        self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
 
-    def compute_loss(self, logits, target_ids, loss_mask):
+    def compute_loss(self, logprobs, ref_logprobs, loss_mask):
         '''
-         This implements \sum_{i=1}^{N} log p(y_i|x_i)
-         target_ids is target label [B, T -1]
-         logits is model prediction [B, T -1, vocab_size]
+         This implements length-normalized dpo loss
+         logprobs and ref_logprobs are [2B, T -1]
+         loss_mask is [2B, T -1]
         '''
-        # [B, T -1, vocab_size]
-        _, _, vocab_size = logits.shape
+        # [2B, T -1]
+        # B here is actually 2 * B_micro
+        B, T = logprobs.shape
 
-        # flatten logits across batch and seq_len before computing loss
-        # so logits is [B * (T -1), vocab_size]
-        logits = logits.view(-1, vocab_size)
-        # flatten y as well:  [B, T -1] -->  [B * (T -1)]
-        target_ids = target_ids.view(-1)
+        # logprobs: [2B, T -1]
+        # chosen: logprobs[:B] so [B, T -1]
+        # rejected: logprobs[B:] so [B, T -1]
+        chosen_logprobs   = logprobs[:B]
+        rejected_logprobs = logprobs[B:]
+        # reference model logprobs
+        ref_chosen_logprobs   = ref_logprobs[:B]
+        ref_rejected_logprobs = ref_logprobs[B:]
 
-        # per token loss
-        per_token_loss = self.loss_fn(logits, target_ids)
+        # [2B, T -1] --> [B, T -1]
+        chosen_loss_mask    = loss_mask[:B]
+        rejected_loss_mask  = loss_mask[B:]
 
-        # We need to apply mask to loss to remove any things
-        # which should not be considered in loss (e.g., padding tokens)
-        loss_mask = loss_mask.view(-1).to(dtype=per_token_loss.dtype)  # [B * (T - 1)]
-        masked_per_token_loss = per_token_loss * loss_mask
+        # compute length-normalized dpo loss
+        # loss = -E[log_sigmoid[(beta/len(c)) * log(p_c/pr_c) - (beta/len(r)) * log(p_r/pr_r)]
+        len_chosen = chosen_loss_mask.sum(dim=1, keepdim=True)
+        len_rejected = rejected_loss_mask.sum(dim=1, keepdim=True)
+        chosen_logratios   = chosen_loss_mask * (chosen_logprobs - ref_chosen_logprobs).to(torch.float32) / len_chosen
+        rejected_logratios = rejected_loss_mask * (rejected_logprobs - ref_rejected_logprobs).to(torch.float32) / len_rejected
 
-        # To avoid gradient accumulation error caused by loss.mean(),
-        # we use sum of loss instead but play with learning rate to account for this.
-        loss_sum = masked_per_token_loss.sum()
+        per_token_loss = -F.logsigmoid(self.beta * (chosen_logratios - rejected_logratios))
+        denom = (chosen_loss_mask + rejected_loss_mask).sum().clamp(min=1.0)
+        loss = per_token_loss.sum() / denom
 
-        # Loss_accumulated \neq Loss_full_batch when sequence lengths vary.
-        # to address that, we normalize by total sequence length (constant)
-        # which is fixed across gpus, not valid tokens (variable) which is loss_mask.sum().
-        # This solves the gradient accumulation bug. https://unsloth.ai/blog/gradient
-        if self.normalize_loss:
-            total_possible_tokens = logits.shape[0]
-            if total_possible_tokens == 0:
-                # This shouldn't happen
-                raise ValueError("Cannot compute loss: total_possible_tokens is 0")
-
-            loss = loss_sum / total_possible_tokens
-        else:
-            loss = loss_sum
-
-        return loss, loss_sum.item(), loss_mask.sum().item()
+        metrics = {"chosen_rewards":float(chosen_logratios.mean().item()),
+                   "rejected_rewards":float(rejected_logratios.mean().item()),
+                   "reward_accuracies":float((chosen_logratios > rejected_logratios).float().mean().item())
+                  }
+        return loss, metrics
 
     def forward(self, batch):
         '''
-            batch['input_ids/attn_mask'] are [B, T]
-            batch['position_ids'] is [B, T] or None
+            batch[input_ids/attn_mask] are [B, 2, T]
+            batch['position_ids'] is [B, 2, T] or None
             Returns:
-                logits is [B, T-1, vocab_size]
-                y is [B, T-1]
-                loss_mask is [B, T-1]
+                logits is [2B, T-1, vocab_size]
+                y is [2B, T-1]
+                loss_mask is [2B, T-1]
         '''
-        # input_ids and att_mask are [B, T]
-        input_ids = batch['input_ids']
-        att_mask  = batch['attn_mask']
+        # inputs are [B, 2, T] as chosen and rejected
+        B, _, T = batch['input_ids'].shape
+        # [B, 2, T] --> [2B, T]
+        input_ids = batch['input_ids'].view(-1, T)
+        att_mask  = batch['attn_mask'].view(-1, T)
+        # loss_mask is [2B, T -1]
+        loss_mask = batch['loss_mask'].contiguous()
 
         # if pos_ids is not provided, hf will add it automatically.
         pos_ids = batch.get('position_ids', None)
         if pos_ids is not None:
-            pos_ids = pos_ids.to(att_mask.device)
+            # [B, 2, T] --> [2B, T]
+            pos_ids = pos_ids.view(-1, T).to(att_mask.device)
 
         # feed data to model
         output = self.model_engine(input_ids=input_ids,
@@ -79,20 +88,41 @@ class DPO:
                                    position_ids=pos_ids,
                                    use_cache=False)
 
-        # [B, T, vocab_size]
-        every_token_logits = output.logits
+        # feed data to ref model without gradient
+        with torch.no_grad():
+            ref_output = self.ref_model_engine(input_ids=input_ids,
+                                               attention_mask=att_mask,
+                                               position_ids=pos_ids,
+                                               use_cache=False)
 
-        # label would be input_ids shifted by one (input_ids[:, 1:])
-        # so the size is [B, T-1]
-        target_ids = input_ids[:, 1:].contiguous()
+        # [2B, T, vocab_size]
+        every_logits     = output.logits
+        ref_every_logits = ref_output.logits
+
         # remember we use token t to predict token t+1, hence no need to predict last
         # token's output (e.g., <eos>) and we remove it from logits.
-        logits = every_token_logits[:, :-1, :].contiguous()
+        # [2B, T, vocab_size] -> [2B, T-1, vocab_size]
+        logits     = every_logits[:, :-1, :].contiguous()
+        ref_logits = ref_every_logits[:, :-1, :].contiguous()
+        _, T, vocab_size = logits.shape
 
-        # loss_mask is [B, T -1]
-        loss_mask = batch['loss_mask'].contiguous()
+        # label would be input_ids shifted by one
+        # so the size is [2B, T-1] --> [2B * (T-1)]
+        target_ids = input_ids[:, 1:].contiguous().view(-1)
 
-        return logits, target_ids, loss_mask
+        # cross_entropy return -logprobs but we need logprobs
+        # logits is [2B, T-1, vocab_size] --> [2B * (T-1), vocab_size]
+        # target_ids is [B * (T-1)]
+        # Compute token logprobs in float32 to avoid bf16/fp16 quantization
+        neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids)
+        # [2B * (T-1)] -> [2B, T-1]
+        logprobs = -neg_logprobs.view(B, T_minus_1)
+
+        neg_logprobs_ref = self.cross_entropy(ref_logits.to(torch.float32).view(-1, vocab_size), target_ids)
+        # [2B * (T-1)] -> [2B, T-1]
+        ref_logprobs = -neg_logprobs_ref.view(B, T_minus_1)
+
+        return logprobs, ref_logprobs, loss_mask
 
     def eval_step(self, micro_batch):
         '''
@@ -101,13 +131,12 @@ class DPO:
         # we need to split data into micro batches
         self.model_engine.eval()
         with torch.no_grad():
-            # forward pass per gpu/rank
-            logits, target_ids, loss_mask = self.forward(micro_batch)
+            logprobs, ref_logprobs, loss_mask = self.forward(micro_batch)
 
-            # compute loss pass
-            _, loss_sum, num_tokens = self.compute_loss(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
+            # 3. compute loss pass
+            loss, metrics = self.compute_loss(logprobs=logprobs, ref_logprobs=ref_logprobs, loss_mask=loss_mask)
 
-        return {"loss_sum": float(loss_sum), "num_tokens": float(num_tokens)}
+        return {"loss": float(loss.item()), **metrics}
 
     def train_step(self, micro_batch):
         '''
@@ -120,10 +149,11 @@ class DPO:
         # Don't need to zero_grad() here as ds handles gradient zeroing
         # internally after step() when gradient_accumulation_steps boundary is reached.
         # 1. forward pass per gpu/rank
-        logits, target_ids, loss_mask = self.forward(micro_batch)
+        # chosen and rejected data are stacked as[B, 2, T]
+        logprobs, ref_logprobs, loss_mask = self.forward(micro_batch)
 
         # 3. compute loss pass
-        loss, _, _ = self.compute_loss(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
+        loss, metrics = self.compute_loss(logprobs=logprobs, ref_logprobs=ref_logprobs, loss_mask=loss_mask)
 
         # 4. backward step
         # deepspeed aggregates gradients and only updates weights when accumulation_steps is reached.
@@ -134,4 +164,5 @@ class DPO:
 
         # return loss
         train_loss = loss.item()
-        return {"loss": float(train_loss)}
+
+        return {"loss": float(train_loss), **metrics}
