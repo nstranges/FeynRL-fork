@@ -14,8 +14,8 @@ class SFT:
     def compute_loss(self, logits, target_ids, loss_mask):
         '''
          This implements \sum_{i=1}^{N} log p(y_i|x_i)
-         target_ids is target label [B, T -1]
-         logits is model prediction [B, T -1, vocab_size]
+         target_ids is [B, T -1]
+         logits is [B, T -1, vocab_size]
         '''
         # [B, T -1, vocab_size]
         _, _, vocab_size = logits.shape
@@ -66,6 +66,8 @@ class SFT:
         # input_ids and att_mask are [B, T]
         input_ids = batch['input_ids']
         att_mask  = batch['attn_mask']
+        # loss_mask is [B, T - 1]
+        loss_mask = batch['loss_mask']
 
         # if pos_ids is not provided, hf will add it automatically.
         pos_ids = batch.get('position_ids', None)
@@ -80,16 +82,13 @@ class SFT:
 
         # [B, T, vocab_size]
         every_token_logits = output.logits
-
-        # label would be input_ids shifted by one (input_ids[:, 1:])
-        # so the size is [B, T-1]
-        target_ids = input_ids[:, 1:].contiguous()
         # remember we use token t to predict token t+1, hence no need to predict last
         # token's output (e.g., <eos>) and we remove it from logits.
         logits = every_token_logits[:, :-1, :].contiguous()
 
-        # loss_mask is [B, T -1]
-        loss_mask = batch['loss_mask'].contiguous()
+        # target_ids would be input_ids shifted by one
+        # so the size is [B, T-1]
+        target_ids = input_ids[:, 1:].contiguous()
 
         return logits, target_ids, loss_mask
 
