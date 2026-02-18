@@ -147,8 +147,8 @@ def make_map_fn(split, args):
 
         data = {
             "prompt": build_prompt_messages(prompt_turns, args.system_prompt),
-            "chosen": render_continuation_text(chosen_cont),
-            "rejected": render_continuation_text(rejected_cont),
+            "answer": render_continuation_text(chosen_cont),
+            "rejected_answer": render_continuation_text(rejected_cont),
             "split": split,
             "index": idx,
         }
@@ -259,10 +259,10 @@ if __name__ == "__main__":
 
     print("=" * 80)
     print("Chosen Continuation:\n")
-    print(sample["chosen"])
+    print(sample["answer"])
     print("=" * 80)
     print("Rejected Continuation:\n")
-    print(sample["rejected"])
+    print(sample["rejected_answer"])
     print("=" * 80)
 
     print(f"\nTrain: {len(train_dataset)}")
