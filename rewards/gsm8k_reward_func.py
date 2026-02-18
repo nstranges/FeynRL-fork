@@ -16,7 +16,7 @@ def extract_solution(solution_str, clip_chars=300):
 
     return final_answer
 
-def compute_score(prompt_data: Dict[str, Any], response_data: Dict[str, Any], format_score=0.0, score=1.0):
+def compute_score(prompt_data: Dict[str, Any], response_data: Dict[str, Any]):
     '''
       input args:
         prompt_data: Dict[str, Any] - dictionary containing prompt data
@@ -25,6 +25,10 @@ def compute_score(prompt_data: Dict[str, Any], response_data: Dict[str, Any], fo
         r: torch.Tensor - reward tensor
         is_per_token: bool - whether the reward is per token
     '''
+
+    format_score = 0.0
+    score = 1.0
+
     solution_str = response_data.text
     ground_truth = prompt_data["solution"]
 
