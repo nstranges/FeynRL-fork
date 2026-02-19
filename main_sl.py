@@ -348,11 +348,14 @@ if __name__ == "__main__":
         local_loss_sum   = torch.tensor(0.0, device=model_engine.device)
         local_token_count = torch.tensor(0.0, device=model_engine.device)
 
-        for data in val_dataloader:
-            val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
-            val_metric = alg.eval_step(val_batch)
-            local_loss_sum += float(val_metric['loss_sum'])
-            local_token_count += float(val_metric['num_tokens'])
+        val_iter = tqdm(val_dataloader, desc="Validation", disable=(rank != 0))
+        model_engine.eval()
+        with torch.no_grad():
+            for data in val_iter:
+                val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
+                val_metric = alg.eval_step(val_batch)
+                local_loss_sum += float(val_metric['loss_sum'])
+                local_token_count += float(val_metric['num_tokens'])
 
         # Aggregate across all ranks.
         if torch.distributed.is_initialized():

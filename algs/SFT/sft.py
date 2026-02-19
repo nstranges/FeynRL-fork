@@ -95,15 +95,12 @@ class SFT:
     def eval_step(self, micro_batch):
         '''
            This implements a single validation step per rank/gpu.
+           Setting model to eval mode and torch.no_grad() context are done in main.
         '''
-        # we need to split data into micro batches
-        self.model_engine.eval()
-        with torch.no_grad():
-            # forward pass per gpu/rank
-            logits, target_ids, loss_mask = self.forward(micro_batch)
-
-            # compute loss pass
-            _, loss_sum, num_tokens = self.compute_loss(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
+        # forward pass per gpu/rank
+        logits, target_ids, loss_mask = self.forward(micro_batch)
+        # compute loss pass
+        _, loss_sum, num_tokens = self.compute_loss(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
 
         return {"loss_sum": float(loss_sum), "num_tokens": float(num_tokens)}
 
