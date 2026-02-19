@@ -490,8 +490,8 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if config.train.alg_name == "dpo":
                 if config.train.cl_beta is None:
                     raise ValueError("cl_beta must be specified for dpo")
-                if config.train.cl_beta < 0:
-                    raise ValueError("cl_beta must be >= 0 for dpo")
+                if config.train.cl_beta <= 0:
+                    raise ValueError("cl_beta must be > 0 for dpo")
 
         elif method == "rl":
             # Validate GPU counts before using them
