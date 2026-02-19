@@ -220,7 +220,7 @@ def collect_rollouts(dataloader,
         # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
 
-    if len(replay_buffer) <= 1:
+    if len(replay_buffer) == 0:
         raise ValueError("Replay buffer is empty")
 
     rollout_time = time.time() - rollout_start_time
@@ -329,7 +329,7 @@ if __name__ == "__main__":
                                      logger=logger)
 
 
-    logger.info(f"[Epoch {epoch+1}] Rollout complete: {rollout_stats['total_samples_generated']} samples, "
+    logger.info(f"Rollout complete: {rollout_stats['total_samples_generated']} samples, "
                 f"avg_reward={rollout_stats['avg_reward']:.4f}, total_reward={rollout_stats['total_reward']:.4f}, "
                 f"avg_response_len={rollout_stats['avg_response_len']:.1f}, "
                 f"time={rollout_stats['rollout_time']:.2f}s, tps={rollout_stats['tokens_per_sec']:.2f}")
@@ -347,7 +347,7 @@ if __name__ == "__main__":
     # save experiment config
     experiment_config_path = os.path.join(checkpoint_dir, "experiment_config.yaml")
     with open(experiment_config_path, "w") as f:
-        yaml.dump(config, f)
+        yaml.dump(config.model_dump(), f)
     logger.info(f"Experiment config saved to {experiment_config_path}")
     
     ray.shutdown()
