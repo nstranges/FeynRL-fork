@@ -41,8 +41,11 @@ class MLFlowTracker(ExperimentTracker):
         if grad_acc is not None:
             params["gradient_accumulation_steps"] = grad_acc
 
-        if config.run.method == "sl":
+        if config.run.method in ["sl", "cl"]:
             params["micro_batches_per_epoch"] = getattr(config.train, "micro_batches_per_epoch", None)
+            if config.run.method == "cl":
+                params["beta"] = getattr(config.train, "cl_beta", None)
+
         elif config.run.method == "rl":
             params.update({
                 "train_steps_per_epoch": getattr(config.train, "train_steps_per_epoch", None),
