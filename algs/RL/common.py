@@ -298,6 +298,7 @@ class COMMON:
                     all_value_params = list(self.value_engine.module.parameters())
                     with deepspeed.zero.GatheredParameters(all_value_params, modifier_rank=0):
                         if rank == 0:
+                            os.makedirs(value_output_dir, exist_ok=True)
                             raw_sd = {name: param.data.cpu().clone()
                                       for name, param in self.value_engine.module.named_parameters()}
                             merged_sd = self._merge_peft_state_dict(raw_sd)

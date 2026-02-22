@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from types import SimpleNamespace
+from peft import PeftModel
 
 class ValueNetwork(nn.Module):
     '''
@@ -10,6 +11,12 @@ class ValueNetwork(nn.Module):
     '''
     def __init__(self, base_model):
         super().__init__()
+
+        # If base_model is a PeftModel, we need to unwrap it to get the basemodel.
+        # lora layers remain physically injected in the module tree so gradients still flow.
+        if isinstance(base_model, PeftModel):
+            base_model = base_model.get_base_model()
+
         self.config = base_model.config
 
         # Extract the transformer backbone without LM head.
