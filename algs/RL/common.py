@@ -261,7 +261,6 @@ class COMMON:
                         raw_sd = {name: param.data.cpu().clone()
                                   for name, param in self.policy_engine.module.named_parameters()}
                         merged_sd = self._merge_peft_state_dict(raw_sd)
-                        os.makedirs(output_dir, exist_ok=True)
                         save_file(merged_sd, os.path.join(output_dir, "model.safetensors"))
                         print(f"[Alg:{self.alg_name}][Rank {rank}] Saved merged PEFT policy model")
 
@@ -293,10 +292,16 @@ class COMMON:
                     value_output_dir = output_dir.rstrip('/') + "_value"
                 
                 if self.peft_config.use_peft:
-                    peft_value_params = [p for p in self.value_engine.module.parameters() if p.requires_grad]
-                    with deepspeed.zero.GatheredParameters(peft_value_params, modifier_rank=0):
+                    # Gather ALL params (base + adapter) since ZeRO-3 partitions everything.
+                    # Then merge lora into base and save as a standalone model for vllm.
+                    all_value_params = list(self.value_engine.module.parameters())
+                    with deepspeed.zero.GatheredParameters(all_value_params, modifier_rank=0):
                         if rank == 0:
-                            self.value_engine.module.save_pretrained(value_output_dir)
+                            raw_sd = {name: param.data.cpu().clone()
+                                      for name, param in self.value_engine.module.named_parameters()}
+                            merged_sd = self._merge_peft_state_dict(raw_sd)
+                            save_file(merged_sd, os.path.join(value_output_dir, "model.safetensors"))
+                            print(f"[Alg:{self.alg_name}][Rank {rank}] Saved merged PEFT value model")
                 else:
                     self.value_engine.save_16bit_model(value_output_dir)
 
@@ -320,11 +325,10 @@ class COMMON:
             print(f"[Alg:{self.alg_name}][Rank {rank}] Checkpoint save completed!")
 
         except Exception as e:
-            # log error but don't crash allows other ranks to continue
+            # The normal path has multiple barriers and we cannot know which one failed,
+            # so adding one here would cause a barrier count mismatch and deadlock.
+            # Instead, we let the error propagate and ray.get catches it and kills other actors.
             print(f"[Alg:{self.alg_name}][Rank {rank}] Error saving checkpoint: {e}")
-            if torch.distributed.is_initialized():
-                # still need barrier even on error to prevent deadlock
-                torch.distributed.barrier()
             raise
 
     def _merge_peft_state_dict(self, raw_state_dict):
