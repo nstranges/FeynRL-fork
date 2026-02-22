@@ -368,6 +368,9 @@ class PPO(COMMON):
         '''
         assert self.policy_engine is not None, "DeepSpeed policy_engine not initialized"
         assert self.value_engine  is not None, "DeepSpeed value_engine not initialized"
+        assert isinstance(micro_batches, list) and len(micro_batches) > 0, \
+            "micro_batches must be a non-empty list which should be equal across "
+            "ranks via prepare_training_batches padding"
 
         # 1. Pre-compute values and GAE before any updates.
         precomputed_gae = self.precompute_gae(micro_batches)
@@ -382,14 +385,17 @@ class PPO(COMMON):
         self.policy_engine.zero_grad()
         self.value_engine.zero_grad()
 
-        # 4. create progress bar
+        # 4. Zip micro_batches with precomputed_gae so they stay aligned
+        # like same iteration order, same length.
         num_micro = len(micro_batches)
+        paired = list(zip(micro_batches, precomputed_gae))
+
         # torch.distributed.get_rank() would be the same thing as engine_id
         if engine_id == 0:
-            progress_bar = tqdm(micro_batches, total=num_micro, desc="[Alg:{}] Training Step in rank {}".format(self.alg_name, engine_id))
+            progress_bar = tqdm(paired, total=num_micro, desc="[Alg:{}] Training Step in rank {}".format(self.alg_name, engine_id))
 
         else:
-            progress_bar = micro_batches # No tqdm for other ranks
+            progress_bar = paired # No tqdm for other ranks
 
         # Both engines share the same DS config, so GA steps are identical.
         ga_attr = getattr(self.policy_engine, 'gradient_accumulation_steps', 1)
@@ -398,7 +404,7 @@ class PPO(COMMON):
         # track metrics across all micro-batches
         all_metrics_policy = []
         all_metrics_value = []
-        for step, micro_batch in enumerate(progress_bar):
+        for step, (micro_batch, (returns, advs)) in enumerate(progress_bar):
             is_last = (step == (num_micro - 1))
             # If update_only_after_full_replay is True, we only update at the very end
             # of the shard. Otherwise, we respect ga_pi.
@@ -418,7 +424,6 @@ class PPO(COMMON):
             pos_ids   = micro_batch.get('position_ids', None)
 
             # Pre-computed returns and advantages based on frozen value_net
-            returns, advs = precomputed_gae[step]
             returns = returns.to(device, non_blocking=True)
             advs    = advs.to(device, non_blocking=True)
 
