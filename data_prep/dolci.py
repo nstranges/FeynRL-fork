@@ -3,8 +3,6 @@ import os
 import re
 import datasets
 
-# adopted based on data_prep/gsm8k.py 
-
 def create_prompt(question, system_prompt):
     '''
        This creates general message with or without system prompt.
@@ -123,7 +121,14 @@ if __name__ == "__main__":
     val_dataset.to_parquet(val_file_name)
     test_dataset.to_parquet(test_file_name)
 
-    print("\n")
+    # print samples:
+    print(train_dataset[0]["prompt"])
+    print(80 * "=")
+    print(train_dataset[0]["answer"])
+    print(80 * "=")
+    print(train_dataset[0]["solution"])
+
+
     print(f"Train file: {train_file_name} with {len(train_dataset)} examples.")
     print(f"Val file: {val_file_name} with {len(val_dataset)} examples.")
     print(f"Test file: {test_file_name} with {len(test_dataset)} examples.")
