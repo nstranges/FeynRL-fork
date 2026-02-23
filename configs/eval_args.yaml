@@ -1,0 +1,46 @@
+run:
+  experiment_id: "dummyrun_rl_1"
+  project_name: "rasool-exp"
+  tracking_uri: "" # e.g. "http://mymlflow.com:1234/"
+  checkpoint_dir: "./ckps"
+  rollout_gpus: 2
+  seed: 42
+
+
+reward:
+  # reward in duriong evaluation is fucntion that scores the model's answer
+  broadcast: False
+  eps_reward_norm: 1e-8
+  reward_func: dummy_reward_func
+
+rollout:
+  temperature: 1.0
+  max_tokens: 512
+  n_samples: 8
+  top_p: 1.0
+  top_k: -1
+  ignore_eos: False
+  stop: ""
+  gpu_memory_utilization: 0.5
+  stop_token_ids: []
+  prompt_logprobs: False
+  # we don't use strict on policy for evaluation
+  force_strict_on_policy: False
+  # if model fits on one GPU, set it to 1, otherwise increase it until fits.
+  tensor_parallel_size: 1
+  # Batch size for the prompt dataloader during rollout generation.
+  rollout_batch_size_per_gpu: 2
+
+model:
+  name: "google/gemma-3-1b-it"
+  dtype: "bfloat16"
+  trust_remote_code: False
+
+data:
+  test_files_path: "./dummy_test.parquet"
+  num_workers: 4
+  max_seq_len: 512
+  prompt_key: "prompt"
+  answer_key: "answer"
+  solution_key: "solution"
+ 
