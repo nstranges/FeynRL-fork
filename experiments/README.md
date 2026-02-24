@@ -107,7 +107,7 @@ Assume:
 On **Node A**:
 
 ```bash
-ray start --head --port=26789
+CUDA_VISIBLE_DEVICES=3,5,2,4 ray start --head --port=26789
 ```
 
 Ray will print the **IP address** of the head node (example: `100.9.128.5`) and connection instructions.
@@ -117,7 +117,7 @@ Ray will print the **IP address** of the head node (example: `100.9.128.5`) and 
 On **Node B**:
 
 ```bash
-ray start --address=100.9.128.5:26789
+CUDA_VISIBLE_DEVICES=0,1,5,7 ray start --address=100.9.128.5:26789
 ```
 
 If successful, Ray will report that the node joined the cluster.
