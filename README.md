@@ -15,7 +15,7 @@ FeynRL is built around three core principles:
 
 ## How to Use FeynRL
 
-🛠️ **[Installation & Setup](INSTALL.md)**
+🛠️ **[Installation & Setup](docs/INSTALL.md)**
 Read the guide to configure your environment and dependencies.
 
 🚀 **[Usage & Examples](experiments/README.md)**
@@ -27,7 +27,7 @@ Contributions are welcome. Please keep changes easy to understand, test, and deb
 
 ## FAQ
 
-Check out the [FAQ](FAQ.md) for common questions and answers.
+Check out the [FAQ](docs/FAQ.md) for common questions and answers.
 
 ## Acknowledgments
 
