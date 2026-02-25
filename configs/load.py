@@ -504,26 +504,94 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
         # Update Run details
         config.run.experiment_id = experiment_id
 
-        # Determine world_size based on method
+        # Common pre-training checks
+        if method != "eval":
+            # Model checks
+            allowed_dtypes = {"float16", "fp16", "bfloat16", "bf16", "float32", "fp32"}
+            if config.model.dtype.lower() not in allowed_dtypes:
+                raise ValueError(
+                    f"model.dtype must be one of {sorted(allowed_dtypes)}, got '{config.model.dtype}'. "
+                    f"'auto' is not allowed to avoid precision ambiguity."
+                )
+
+            if config.model.attn_implementation is not None and config.model.attn_implementation not in ("", "eager", "flash_attention_2"):
+                raise ValueError(f"model.attn_implementation must be '', 'eager', or 'flash_attention_2', got '{config.model.attn_implementation}'")
+
+            # Training loop checks
+            if config.train.total_number_of_epochs < 1:
+                raise ValueError(f"total_number_of_epochs must be >= 1, got {config.train.total_number_of_epochs}")
+
+            if config.train.train_batch_size_per_gpu < 1:
+                raise ValueError(f"train_batch_size_per_gpu must be >= 1, got {config.train.train_batch_size_per_gpu}")
+
+            if config.train.gradient_accumulation_steps < 1:
+                raise ValueError(f"gradient_accumulation_steps must be >= 1, got {config.train.gradient_accumulation_steps}")
+
+            if config.train.val_batch_size_per_gpu < 1:
+                raise ValueError(f"val_batch_size_per_gpu must be >= 1, got {config.train.val_batch_size_per_gpu}")
+
+            if not (0.0 <= config.train.warmup_steps_ratio <= 1.0):
+                raise ValueError(f"warmup_steps_ratio must be in [0.0, 1.0], got {config.train.warmup_steps_ratio}")
+
+            # Data checks
+            if not config.data.train_files_path:
+                raise ValueError("data.train_files_path must be a non-empty list")
+
+            if config.data.max_seq_len < 1:
+                raise ValueError(f"data.max_seq_len must be >= 1, got {config.data.max_seq_len}")
+
+            if config.data.num_workers < 0:
+                raise ValueError(f"data.num_workers must be >= 0, got {config.data.num_workers}")
+
+            # Checkpoint directory
+            if not config.run.checkpoint_dir or config.run.checkpoint_dir.strip() == "":
+                raise ValueError("run.checkpoint_dir must be specified for training")
+
+            # PEFT
+            if config.peft.use_peft:
+                if config.peft.lora_rank is None or config.peft.lora_rank < 1:
+                    raise ValueError(f"lora_rank must be >= 1 when use_peft=True, got {config.peft.lora_rank}")
+                if config.peft.lora_alpha is None or config.peft.lora_alpha < 1:
+                    raise ValueError(f"lora_alpha must be >= 1 when use_peft=True, got {config.peft.lora_alpha}")
+
+        # Method-specific checks
         if method == "sl":
             if world_size is None:
                 raise ValueError("world_size must be specified for SL training")
 
+            if config.train.micro_batches_per_epoch is None or config.train.micro_batches_per_epoch < 1:
+                raise ValueError(f"micro_batches_per_epoch must be >= 1 for SL, got {config.train.micro_batches_per_epoch}")
+
+            if config.train.micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
+                raise ValueError(f"micro_batches_per_epoch ({config.train.micro_batches_per_epoch}) must be divisible by gradient_accumulation_steps ({config.train.gradient_accumulation_steps})")
+
         elif method == "cl":
             if world_size is None:
                 raise ValueError("world_size must be specified for CL training")
+
+            if not config.model.ref_model:
+                raise ValueError("model.ref_model must be specified for CL/DPO training")
+
+            if config.train.micro_batches_per_epoch is None or config.train.micro_batches_per_epoch < 1:
+                raise ValueError(f"micro_batches_per_epoch must be >= 1 for CL, got {config.train.micro_batches_per_epoch}")
+
+            if config.train.micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
+                raise ValueError(f"micro_batches_per_epoch ({config.train.micro_batches_per_epoch}) must be divisible by gradient_accumulation_steps ({config.train.gradient_accumulation_steps})")
+
             if config.train.alg_name == "dpo":
                 if config.train.cl_beta is None:
                     raise ValueError("cl_beta must be specified for dpo")
+
                 if config.train.cl_beta <= 0:
                     raise ValueError("cl_beta must be > 0 for dpo")
 
         elif method == "rl":
-            # Validate GPU counts before using them
             if config.run.training_gpus is None or config.run.training_gpus < 1:
                 raise ValueError(f"training_gpus must be >= 1 for RL training, got {config.run.training_gpus}")
+
             if config.run.rollout_gpus is None or config.run.rollout_gpus < 1:
                 raise ValueError(f"rollout_gpus must be >= 1 for RL training, got {config.run.rollout_gpus}")
+
             world_size = config.run.training_gpus
 
             # [1-clip_low, 1+clip_high] requires non-negative values
@@ -537,8 +605,52 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             weight_sync_method = config.run.weight_sync_method
             if weight_sync_method is None:
                 raise ValueError("weight_sync_method must be specified for rl training")
+
             if weight_sync_method not in ["direct", "disk"]:
                 raise ValueError("weight_sync_method must be 'direct' or 'disk'")
+
+            max_tokens = config.rollout.max_tokens
+            max_seq_len = config.data.max_seq_len
+            if max_tokens is None or max_seq_len is None:
+                raise ValueError("max_tokens and max_seq_len must be specified for rl training")
+
+            if max_tokens > max_seq_len:
+                raise ValueError("max_tokens must be < max_seq_len as max_seq_len equals to len(prompt + generation) and max_tokens equals to len(generation)")
+
+            # Training step count
+            if config.train.train_steps_per_epoch is None or config.train.train_steps_per_epoch < 1:
+                raise ValueError(f"train_steps_per_epoch must be >= 1 for RL, got {config.train.train_steps_per_epoch}")
+
+            # Rollout parameters
+            if config.rollout.n_samples is None or config.rollout.n_samples < 1:
+                raise ValueError(f"rollout.n_samples must be >= 1, got {config.rollout.n_samples}")
+
+            if config.rollout.rollout_samples_per_epoch is None or config.rollout.rollout_samples_per_epoch < 1:
+                raise ValueError(f"rollout.rollout_samples_per_epoch must be >= 1, got {config.rollout.rollout_samples_per_epoch}")
+
+            if config.rollout.rollout_batch_size_per_gpu is None or config.rollout.rollout_batch_size_per_gpu < 1:
+                raise ValueError(f"rollout.rollout_batch_size_per_gpu must be >= 1, got {config.rollout.rollout_batch_size_per_gpu}")
+
+            if config.rollout.gpu_memory_utilization is not None and not (0.0 < config.rollout.gpu_memory_utilization <= 1.0):
+                raise ValueError(f"rollout.gpu_memory_utilization must be in (0.0, 1.0], got {config.rollout.gpu_memory_utilization}")
+
+            if config.rollout.temperature is not None and config.rollout.temperature < 0:
+                raise ValueError(f"rollout.temperature must be >= 0, got {config.rollout.temperature}")
+
+            # Reward function
+            if not config.reward or not config.reward.reward_func:
+                raise ValueError("reward.reward_func must be specified for RL training")
+
+            # TP must evenly divide rollout GPUs
+            tp = config.rollout.tensor_parallel_size
+            rg = config.run.rollout_gpus
+            if tp and rg and rg % tp != 0:
+                raise ValueError(f"rollout_gpus ({rg}) must be divisible by tensor_parallel_size ({tp}). "
+                                 f"Currently {rg} % {tp} = {rg % tp}.")
+
+            # Ray port
+            if config.run.ray_master_port is None:
+                raise ValueError("run.ray_master_port must be specified for RL training")
 
         if method != "eval":
             # Sync AFTER updating world_size
@@ -575,8 +687,6 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
     except yaml.YAMLError as e:
         print(f"Error parsing YAML file: {e}")
         sys.exit(1)
-
-
 
     return config
 
