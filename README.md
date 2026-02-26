@@ -54,6 +54,9 @@ Read the guide to configure your environment and dependencies.
 🚀 **[Usage & Examples](experiments/README.md)**
 Learn how to launch jobs and run experiments.
 
+⚙️ **[Configuration Reference](configs/README.md)**
+Full parameter guide for RL, SFT, DPO, and evaluation configs.
+
 ## Contributing
 
 Contributions are welcome. Please keep changes easy to understand, test, and debug, and follow the existing style.
