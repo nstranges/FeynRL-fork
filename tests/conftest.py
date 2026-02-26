@@ -37,6 +37,13 @@ transformers.generation.GenerationMixin = MagicMock()
 transformers.AutoConfig = MagicMock()
 transformers.AutoModelForCausalLM = MagicMock()
 
+# Ensure PeftModel is a class for isinstance checks
+import peft
+class PeftModel: pass
+peft.PeftModel = PeftModel
+peft.get_peft_model = MagicMock()
+peft.LoraConfig = MagicMock()
+
 import torch
 import torch.nn as nn
 import pytest

@@ -2,6 +2,7 @@ import torch
 import pytest
 import numpy as np
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from algs.PPO.ppo import PPO
 
 def test_ppo_loss_clipped_objective():
@@ -97,3 +98,30 @@ def test_ppo_loss_gradient_flow():
     assert logprobs.grad is not None
     assert not torch.isnan(logprobs.grad)
     assert logprobs.grad.item() != 0.0
+
+def test_ppo_loss_kl_ref():
+    ppo_logic = PPO
+    # Mock self with kl_coeff > 0
+    dummy_self = SimpleNamespace(
+        clip_low=0.2, 
+        clip_high=0.2, 
+        ent_coeff=0.0, 
+        kl_coeff=0.5,
+        alg_name="Mock"
+    )
+    # mock compute_kl_distance on dummy_self
+    dummy_self.compute_kl_distance = MagicMock(return_value=torch.tensor([[0.2, 0.4]]))
+    
+    logprobs = torch.tensor([[-0.1, -0.2]])
+    old_logprobs = torch.tensor([[-0.1, -0.2]])
+    advantages = torch.tensor([[0.0, 0.0]])
+    mask = torch.tensor([[1.0, 1.0]])
+    ref_logprobs = torch.tensor([[-0.1, -0.2]]) # Values don't matter as kl_dist is mocked
+    
+    loss, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, ref_logprobs)
+    
+    # kl_ref = (0.2 + 0.4) / 2 = 0.3
+    # Loss = 0 (pi) + 0.5 * 0.3 (kl) = 0.15
+    assert np.isclose(metrics['kl_ref'], 0.3)
+    assert np.isclose(loss.item(), 0.15)
+    dummy_self.compute_kl_distance.assert_called_once()
