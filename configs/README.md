@@ -21,10 +21,10 @@ These parameters are consistent across all experiment types and are used for exp
 | Parameter                | Section | Description                                          | Type / Constraint                                   | Examples                       |
 | :----------------------- | :------ | :--------------------------------------------------- | :-------------------------------------------------- | :----------------------------- |
 | `experiment_id`          | `run`   | Unique string identifier for the experiment run      | String                                              | `"rl_exp_01"`, `"sft_v2"`      |
-| `seed`                   | `run`   | Random seed for reproducibility                      | Integer ≥ 0                                         | `42`, `1337`                   |
+| `seed`                   | `run`   | Random seed                                          | Integer ≥ 0                                         | `42`, `1337`                   |
 | `project_name`           | `run`   | Name of the project in the experiment tracker        | String                                              | `"LeanRL"`, `"Research-Alpha"` |
 | `logger_type`            | `run`   | Type of experiment tracker to use                    | Allowed values: `"mlflow"`, `"wandb"`               | `"mlflow"`                     |
-| `tracking_uri`           | `run`   | URI/URL for the tracking server                      | String (valid URL)                                  | `"http://mlflow-server:5000/"` |
+| `tracking_uri`           | `run`   | URI/URL for the tracking server                      | String (valid URL)                                  | `"http://mlflow-server:8080/"` |
 | `checkpoint_dir`         | `run`   | Local directory for saving model checkpoints         | Absolute path                                       | `"/path/to/ckps"`              |
 | `optimizer_name`         | `train` | Base optimizer architecture                          | Allowed values: `"adamw"`, `"adam"`                 | `"adamw"`                      |
 | `lr`                     | `train` | Learning rate for the main model                     | Float > 0                                           | `1e-5`, `5e-7`                 |
@@ -40,8 +40,8 @@ These parameters are consistent across all experiment types and are used for exp
 ### 2. RL-Specific Parameters
 | Parameter                | Section   | Description                                      | Type / Constraint                             | Examples                 |
 | :----------------------- | :-------- | :----------------------------------------------- | :-------------------------------------------- | :----------------------- |
-| `training_gpus`          | `run`     | Number of GPUs for model optimization            | Integer ≥ 1                                   | `1`, `2`, `4`, `8`       |
-| `rollout_gpus`           | `run`     | Number of GPUs for sampling/rollout generation   | Integer ≥ 1                                   | `1`, `2`, `4`, `8`       |
+| `training_gpus`          | `run`     | Number of GPUs for model optimization            | Integer ≥ 1                                   | `1`, `2`, `3`            |
+| `rollout_gpus`           | `run`     | Number of GPUs for sampling/rollout generation   | Integer ≥ 1                                   | `1`, `2`, `3`, `4`,'7'   |
 | `weight_sync_method`     | `run`     | Method to sync weights between train and rollout | Allowed values: `"direct"`, `"disk"`          | `"direct"`               |
 | `alg_name`               | `train`   | Reinforcement learning algorithm                 | Allowed values: `"sgrpo"`, `"cispo"`, `"ppo"` | `"ppo"`                  |
 | `train_steps_per_epoch`  | `train`   | Optimizer steps to perform per epoch             | Integer ≥ 1                                   | `5`                      |
