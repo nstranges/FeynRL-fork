@@ -169,9 +169,8 @@ class VLLMRolloutEngine:
             self.log(f"Model already at version {version}, skipping weight update")
             return True
 
-        # Why /dev/shm?
         # vllm collective_rpc serializes args with msgspec, which cannot encode
-        # strings (or bytes) larger than 4GB (2**32-1). For large models the pickled
+        # strings (or bytes) larger than 4GB (2^32-1). For large models the pickled
         # state_dict easily exceeds that. Instead of sending weight data through
         # msgspec, we pickle to /dev/shm, a ram-backed tmpfs which has no real disk I/O,
         # just a memcpy into kernel page cache, and pass only the ~50-byte file
@@ -365,15 +364,15 @@ class VLLMRolloutEngine:
                         rewards       = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
                         pred_rewards  = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
-                        # it is important to score the response regardless of its length if it is empty
+                        # Score every response (including empty) so reward_func can see them,
+                        # but only responses > 0 contribute to group stats and normalization.
                         rewards_resp, is_per_token = self.score_response(prompt_data, response)
                         rewards[prompt_len:] = rewards_resp
 
-                        # is_per_token is False, then rewards_resp will only have value for the last element
-                        group_stats['rewards'].append(rewards_resp.sum().item())
-                        group_stats['lengths'].append(len(response_ids))
-
                         if response_len > 0:
+                            # is_per_token is False, then rewards_resp will only have value for the last element
+                            group_stats['rewards'].append(rewards_resp.sum().item())
+                            group_stats['lengths'].append(len(response_ids))
                             if response.logprobs is None:
                                 raise ValueError("response.logprobs is None. Check if SamplingParams(logprobs=1) is set.")
 
@@ -413,40 +412,34 @@ class VLLMRolloutEngine:
                             eos_in_tokens = (response_ids[-1] == self.eos_id)
                             ended_on_eos  = (finish_reason == "stop" and stop_reason is None and eos_in_tokens)
 
-                        else:
-                            ended_on_eos = False
+                            group_samples.append({ "iter": int(current_iter),
+                                                "policy_version": int(policy_version),
+                                                "loaded_version": int(self.loaded_version),
 
-                        # rollout sample in group if n_samples >= 1
-                        # I didn't drop response_len == 0 here as it can be useful for logging, or even reward normalization as
-                        # reward function should be designed in such way that it assigns negative rewards for example to empty responses.
-                        group_samples.append({ "iter": int(current_iter),
-                                               "policy_version": int(policy_version),
-                                               "loaded_version": int(self.loaded_version),
+                                                # token-aligned
+                                                "input_ids": input_ids, #[T]
+                                                "token_rewards": rewards, #[T]
+                                                "token_zscores": rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
+                                                "token_masks": token_masks, #[T] 1 on response/valid tokens
+                                                "token_dones": token_dones, #[T] 1 on last token if terminal
+                                                "token_old_logprobs": token_old_logprobs, #[T] 0 on prompt since we don't backprop on it.
 
-                                               # token-aligned
-                                               "input_ids": input_ids, #[T]
-                                               "token_rewards": rewards, #[T]
-                                               "token_zscores": rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
-                                               "token_masks": token_masks, #[T] 1 on response/valid tokens
-                                               "token_dones": token_dones, #[T] 1 on last token if terminal
-                                               "token_old_logprobs": token_old_logprobs, #[T] 0 on prompt since we don't backprop on it.
+                                                # pred-aligned
+                                                "pred_rewards": pred_rewards, #[T]
+                                                "pred_masks": pred_masks, #[T]
+                                                "pred_dones": pred_dones, #[T]
+                                                "pred_old_logprobs": pred_old_logprobs, #[T]
+                                                "pred_zscores": pred_rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
 
-                                               # pred-aligned
-                                               "pred_rewards": pred_rewards, #[T]
-                                               "pred_masks": pred_masks, #[T]
-                                               "pred_dones": pred_dones, #[T]
-                                               "pred_old_logprobs": pred_old_logprobs, #[T]
-                                               "pred_zscores": pred_rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
+                                                "finish_reason": finish_reason,
+                                                "stop_reason": stop_reason,
+                                                "ended_on_eos": ended_on_eos,
 
-                                               "finish_reason": finish_reason,
-                                               "stop_reason": stop_reason,
-                                               "ended_on_eos": ended_on_eos,
-
-                                               "response_ids": response_ids, # list[int]
-                                               "prompt_ids": prompt_ids, # list[int]
-                                               "response_text": getattr(response, "text", ""),
-                                               "response_len": response_len,
-                                                })
+                                                "response_ids": response_ids, # list[int]
+                                                "prompt_ids": prompt_ids, # list[int]
+                                                "response_text": getattr(response, "text", ""),
+                                                "response_len": response_len,
+                                                    })
                     self.normalize_rewards(samples=group_samples,
                                            stats=group_stats,
                                            prompt_len=prompt_len,
