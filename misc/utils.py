@@ -1,6 +1,8 @@
 import torch
 import os
 import importlib
+import ray
+from ray.exceptions import GetTimeoutError, RayActorError
 
 def safe_string_to_torch_dtype(dtype_in):
     '''
@@ -107,3 +109,25 @@ def load_algorithm(alg_name: str, registry: dict):
     module_path, class_name = registry[alg_name]
     module = importlib.import_module(module_path)
     return getattr(module, class_name)
+
+def ray_get_with_timeout(refs, timeout, description, logger):
+    '''
+        Wrapper around ray.get() that adds a timeout and clear error reporting.
+        This helps to convert silent infinite hangs into actionable errors.
+
+        Args:
+            refs: ObjectRef or list of ObjectRefs to wait on.
+            timeout: seconds before raising (None disables timeout).
+            description: human-readable label for log/error messages.
+            logger: logger instance.
+    '''
+    try:
+        return ray.get(refs, timeout=timeout)
+
+    except GetTimeoutError:
+        logger.error(f"[Timeout] {description} did not complete within {timeout}s")
+        raise RuntimeError(f"{description} timed out after {timeout}s. Check actor logs for OOM, GPU faults, or NCCL hangs.")
+
+    except RayActorError as e:
+        logger.error(f"[ActorDied] {description} failed: actor died: {e}")
+        raise RuntimeError(f"{description} failed because a Ray actor died: {e}")

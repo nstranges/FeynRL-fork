@@ -41,8 +41,23 @@ class Run(BaseModel):
     checkpoint_save_interval: int | None = 1
 
     # NCCL configuration for multi-node clusters
-    nccl_socket_ifname: str | None = None  # e.g., "eth0", "ens3", "bond0"
-    nccl_ib_hca: str | None = None         # e.g., "mlx5_0" for InfiniBand HCA selection
+    # e.g., "eth0", "ens3", "bond0"
+    nccl_socket_ifname: str | None = None
+    # e.g., "mlx5_0" for InfiniBand HCA selection
+    nccl_ib_hca: str | None = None
+
+    # Timeout (seconds) for ray.get() calls to prevent indefinite hangs.
+    # None means use the default for each category.
+    # training engine init (default: 1800s)
+    init_timeout: int | None = None
+    # rollout generation per batch (default: 3600s)
+    rollout_timeout: int | None = None
+    # single training step (default: 1800s)
+    train_step_timeout: int | None = None
+    # checkpoint save (default: 1800s)
+    save_timeout: int | None = None
+    # weight sync operations (default: 900s)
+    sync_timeout: int | None = None
 
 class Train(BaseModel):
     '''
@@ -651,6 +666,23 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             # Ray port
             if config.run.ray_master_port is None:
                 raise ValueError("run.ray_master_port must be specified for RL training")
+
+
+            # Timeout settings
+            if config.run.init_timeout is None:
+                raise ValueError("run.init_timeout must be specified for RL training")
+
+            if config.run.rollout_timeout is None:
+                raise ValueError("run.rollout_timeout must be specified for RL training")
+
+            if config.run.train_step_timeout is None:
+                raise ValueError("run.train_step_timeout must be specified for RL training")
+
+            if config.run.save_timeout is None:
+                raise ValueError("run.save_timeout must be specified for RL training")
+
+            if config.run.sync_timeout is None:
+                raise ValueError("run.sync_timeout must be specified for RL training")
 
         if method != "eval":
             # Sync AFTER updating world_size

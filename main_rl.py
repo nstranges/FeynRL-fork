@@ -10,11 +10,12 @@ from torch.utils.data import DataLoader
 import ray
 import time
 
+
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
 from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
 from data_feeds.mixed_sampler import create_prompt_dataset_and_sampler
-from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm
+from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, ray_get_with_timeout
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.replay_buffer import ReplayBuffer
 from misc.logging import setup_logging, setup_tracker
@@ -245,7 +246,8 @@ def collect_rollouts(dataloader,
                      policy_version,
                      replay_buffer,
                      n_samples,
-                     logger):
+                     logger,
+                     rollout_timeout):
 
     '''
         This function is used to run rollout engine and generate rollouts/samples.
@@ -288,7 +290,10 @@ def collect_rollouts(dataloader,
 
         # 3. gather rollouts. This is a blocking call means all engines must
         # finish generating rollouts before we can proceed.
-        rollout_lists = ray.get(rollout_samples)
+        rollout_lists = ray_get_with_timeout(refs=rollout_samples,
+                                             timeout=rollout_timeout,
+                                             description=f"rollout generation (epoch {epoch+1})",
+                                             logger=logger)
 
         # 4. merge rollouts across all engines and collect stats
         rollout_merged = []
@@ -311,6 +316,7 @@ def collect_rollouts(dataloader,
         logger.warning("No samples generated during rollout phase!")
         avg_reward = 0.0
         avg_response_len = 0.0
+
     else:
         avg_reward = total_reward_sum / total_samples_generated
         avg_response_len = total_response_len / total_samples_generated
@@ -366,7 +372,7 @@ def shard_and_put(batches, num_engines):
 
     return shard_refs
 
-def run_training_step(engines, shard_refs):
+def run_training_step(engines, shard_refs, logger, train_step_timeout):
     '''
        Execute one training step across all engines.
        shard_refs: list of Ray ObjectRefs (one per engine), created by shard_and_put().
@@ -377,7 +383,10 @@ def run_training_step(engines, shard_refs):
         futures.append(engine.train_step.remote(engine_id=eid, micro_batches=shard_refs[eid]))
 
     # Gather training metrics from all engines
-    metrics_list = ray.get(futures)
+    metrics_list = ray_get_with_timeout(refs=futures,
+                                        timeout=train_step_timeout,
+                                        description="training step",
+                                        logger=logger)
 
     # Dynamically aggregate all metric keys across engines.
     # This works for both sgrpo (policy-only) and ppo (policy + value metrics).
@@ -391,7 +400,7 @@ def run_training_step(engines, shard_refs):
 
     return {k: np.mean([m.get(k, 0.0) for m in metrics_list]) for k in all_keys}
 
-def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir, experiment_id, rank, logger):
+def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir, experiment_id, rank, logger, save_timeout):
     '''
        Save model checkpoint (must run on all ranks for ZeRO-3)
     '''
@@ -410,7 +419,10 @@ def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir,
         save_futures.append(engine.save_checkpoint.remote(output_dir=model_path, tag=tag))
 
     # Wait for all saves to complete
-    ray.get(save_futures)
+    ray_get_with_timeout(refs=save_futures,
+                         timeout=save_timeout,
+                         description=f"checkpoint save (epoch {epoch+1})",
+                         logger=logger)
 
     # Flush filesystem buffers to ensure checkpoint is fully written
     if rank == 0:
@@ -419,18 +431,18 @@ def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir,
     logger.info(f"[Epoch {epoch+1}] Checkpoint saved: {model_path}")
     return model_path
 
-def sync_weights_direct(training_engines, rollout_engines, version, logger):
+def sync_weights_direct(training_engines, rollout_engines, version, logger, sync_timeout):
     '''
         Transfer weights directly from deepspeed training engines to vllm rollout
         engines via ray object store. No disk I/O.
     '''
-    state_dict_ref, _ = gather_training_weights(training_engines, logger)
+    state_dict_ref, _ = gather_training_weights(training_engines, logger, sync_timeout=sync_timeout)
     if state_dict_ref is None:
         return False
 
-    return push_weights_to_rollout(rollout_engines, state_dict_ref, version, logger)
+    return push_weights_to_rollout(rollout_engines, state_dict_ref, version, logger, sync_timeout=sync_timeout)
 
-def gather_training_weights(training_engines, logger):
+def gather_training_weights(training_engines, logger, sync_timeout):
     '''
         Gather state_dict from training engines and store in ray object store.
     '''
@@ -439,7 +451,10 @@ def gather_training_weights(training_engines, logger):
 
     # All training engines must participate in gather_state_dict(). see common.py.
     gather_futures = [engine.gather_state_dict.remote() for engine in training_engines]
-    gather_results = ray.get(gather_futures)
+    gather_results = ray_get_with_timeout(refs=gather_futures,
+                                          timeout=sync_timeout,
+                                          description="gather_state_dict from training engines",
+                                          logger=logger)
 
     state_dict = gather_results[0]
     if not state_dict:
@@ -457,14 +472,17 @@ def gather_training_weights(training_engines, logger):
 
     return state_dict_ref, end_time
 
-def push_weights_to_rollout(rollout_engines, state_dict_ref, version, logger):
+def push_weights_to_rollout(rollout_engines, state_dict_ref, version, logger, sync_timeout):
     '''
         Push pre-gathered weights to rollout engines. Blocks until all engines updated.
         Returns True if all engines updated successfully.
     '''
     start_time = time.time()
     update_futures = [eng.update_weights_direct.remote(state_dict_ref, version) for eng in rollout_engines]
-    results = ray.get(update_futures)
+    results = ray_get_with_timeout(refs=update_futures,
+                                   timeout=sync_timeout,
+                                   description=f"push weights v{version} to rollout engines",
+                                   logger=logger)
 
     end_time = time.time() - start_time
     success = all(results)
@@ -477,7 +495,7 @@ def push_weights_to_rollout(rollout_engines, state_dict_ref, version, logger):
 
     return success
 
-def refresh_rollout_engine(rollout_engines, updated_policy_path, version):
+def refresh_rollout_engine(rollout_engines, updated_policy_path, version, logger, sync_timeout):
     '''
         Refresh rollout engine with the latest policy using disk-based fallback.
     '''
@@ -485,7 +503,10 @@ def refresh_rollout_engine(rollout_engines, updated_policy_path, version):
     for eng in rollout_engines:
         refresh_futures.append(eng.refresh_model.remote(updated_policy_path, version))
 
-    ray.get(refresh_futures)
+    ray_get_with_timeout(refs=refresh_futures,
+                         timeout=sync_timeout,
+                         description=f"refresh rollout engines from disk (v{version})",
+                         logger=logger)
 
 if __name__ == "__main__":
     # parse arguments
@@ -560,8 +581,12 @@ if __name__ == "__main__":
     # wait for all training actors to finish initialization before proceeding
     logger.info("Waiting for all training engines to initialize...")
 
+    init_timeout = config.run.init_timeout
     ready_checks = [engine.is_ready.remote() for engine in training_engine]
-    ready = ray.get(ready_checks)
+    ready = ray_get_with_timeout(refs=ready_checks,
+                                 timeout=init_timeout,
+                                 description="training engine initialization",
+                                 logger=logger)
     logger.info("All training engines ready!")
 
     ########
@@ -621,6 +646,12 @@ if __name__ == "__main__":
     weight_sync_method = config.run.weight_sync_method or "direct"
     checkpoint_save_interval = config.run.checkpoint_save_interval if config.run.checkpoint_save_interval is not None else 1
 
+    # Timeout settings (seconds) for ray.get() calls
+    rollout_timeout = config.run.rollout_timeout
+    train_step_timeout = config.run.train_step_timeout
+    save_timeout = config.run.save_timeout
+    sync_timeout = config.run.sync_timeout
+
     # Overlap mode settings
     overlap_enabled = config.run.overlap_enabled
     # Max training steps ahead of rollout policy version
@@ -655,7 +686,8 @@ if __name__ == "__main__":
                                          policy_version=policy_version,
                                          replay_buffer=replay_buffer,
                                          n_samples=config.rollout.n_samples,
-                                         logger=logger)
+                                         logger=logger,
+                                         rollout_timeout=rollout_timeout)
 
         logger.info(f"[Epoch {epoch+1}] Rollout complete: {rollout_stats['total_samples_generated']} samples, "
                     f"avg_reward={rollout_stats['avg_reward']:.4f}, total_reward={rollout_stats['total_reward']:.4f}, "
@@ -703,7 +735,9 @@ if __name__ == "__main__":
         ################
         epoch_metrics = {}
         for step in range(steps_per_epoch):
-            train_metrics = run_training_step(training_engine, shard_refs)
+            train_metrics = run_training_step(training_engine, shard_refs,
+                                                logger=logger,
+                                                train_step_timeout=train_step_timeout)
 
             # Epoch average of average across all training engines (dynamic keys)
             for k, v in train_metrics.items():
@@ -753,7 +787,8 @@ if __name__ == "__main__":
             sync_success = sync_weights_direct(training_engines=training_engine,
                                                rollout_engines=rollout_engines,
                                                version=policy_version,
-                                               logger=logger)
+                                               logger=logger,
+                                               sync_timeout=sync_timeout)
             if sync_success:
                 logger.info(f"[Epoch {epoch+1}] Direct sync successful")
 
@@ -778,7 +813,8 @@ if __name__ == "__main__":
                                          checkpoint_dir=config.run.checkpoint_dir,
                                          experiment_id=config.run.experiment_id,
                                          rank=rank,
-                                         logger=logger)
+                                         logger=logger,
+                                         save_timeout=save_timeout)
             logger.info(f"[Epoch {epoch+1}] Saved disk checkpoint at {model_path}")
         ################
         # 6. Refresh rollout policy via disk-based fallback
@@ -787,7 +823,9 @@ if __name__ == "__main__":
             logger.info(f"[Epoch {epoch+1}] Refreshing rollout engines with new policy (version {policy_version})...")
             refresh_rollout_engine(rollout_engines=rollout_engines,
                                    updated_policy_path=model_path,
-                                   version=policy_version)
+                                   version=policy_version,
+                                   logger=logger,
+                                   sync_timeout=sync_timeout)
             logger.info(f"[Epoch {epoch+1}] Rollout engines refreshed")
 
         logger.info(f"[Epoch {epoch+1}] Complete! Total epoch time: {epoch_time:.2f}s")
