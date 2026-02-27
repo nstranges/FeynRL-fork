@@ -25,7 +25,11 @@ This is the first public release, so expect rough edges. As we add features and 
 
 ## 🧭 Overview
 
-FeynRL is designed for training models with billions of parameters, using DeepSpeed for distributed training, vLLM for fast inference, and Ray for orchestration at scale.
+FeynRL is built around three core principles:
+
+- ⚡ **Efficiency**: Designed for training models with billions of parameters, using DeepSpeed for distributed training, vLLM for fast inference, and Ray for orchestration at scale.
+- 🧩 **Modularity**: Clear separation between training engines, rollout generation, and data handling, so it’s easy to swap components and experiment safely.
+- 🧠 **Algorithm-first**: Designed to accelerate research with a simple, hackable codebase that keeps the focus on the algorithms.
 
 ### 🏗️ Architecture
 
@@ -42,6 +46,8 @@ For a more detailed breakdown, see the **[Architecture Overview](docs/ARCHITECTU
 - 🧷 **Parameter-efficient fine-tuning**: LoRA support via PEFT
 - 📈 **Experiment tracking**: MLflow and Weights & Biases support
 - 🏅 **Evaluation**: Standalone eval pipeline with vLLM engines
+
+FeynRL supports multiple post-training paradigms, including RL methods such as PPO, SGRPO, and CISPO; preference-based learning such as DPO; and supervised fine-tuning (SFT). It runs at scale with multi-GPU and multi-node training via DeepSpeed (ZeRO Stage 1/2/3), and uses vLLM-powered rollout engines for fast inference and evaluation. Ray orchestrates training and rollout workers across nodes, with periodic weight synchronization from training to rollout workers via in-memory transfer when supported (and a disk-based fallback). To improve overall throughput, FeynRL can run in synchronous mode (generate rollouts, then train) or asynchronous mode (overlap generation and training), trading off utilization against how off-policy the collected samples may be. It also supports LoRA fine-tuning, pluggable experiment tracking (MLflow or Weights & Biases), configurable mixed-dataset sampling, and a standalone evaluation pipeline.
 
 ## How to Use FeynRL
 
