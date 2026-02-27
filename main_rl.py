@@ -735,10 +735,9 @@ if __name__ == "__main__":
 
     # Overlap mode settings
     overlap_enabled = config.run.overlap_enabled
-    # Max training steps ahead of rollout policy version
+    # Max training steps ahead of rollout policy version. With overlap_max_lag=N, weights sync every N epochs
+    # since policy_version increments by 1 each epoch, lag reaches N every N epochs.
     overlap_max_lag = config.run.overlap_max_lag
-    # Update rollout weights every N training steps
-    overlap_weight_update_interval = config.run.overlap_weight_update_interval
 
     logger.info("=" * 50)
     logger.info(f"Starting training: {number_of_epochs} epochs, {steps_per_epoch} steps/epoch")
@@ -746,7 +745,7 @@ if __name__ == "__main__":
     logger.info(f"Weight sync: {weight_sync_method}, Checkpoint save interval: {checkpoint_save_interval}")
 
     if overlap_enabled:
-        logger.info(f"Overlap mode ENABLED: max_lag={overlap_max_lag}, weight_update_interval={overlap_weight_update_interval}")
+        logger.info(f"Overlap mode ENABLED: max_lag={overlap_max_lag}")
 
     logger.info("=" * 50)
     entire_training_start_time = time.time()
