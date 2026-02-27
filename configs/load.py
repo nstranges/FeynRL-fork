@@ -579,6 +579,9 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if config.train.micro_batches_per_epoch is None or config.train.micro_batches_per_epoch < 1:
                 raise ValueError(f"micro_batches_per_epoch must be >= 1 for SL, got {config.train.micro_batches_per_epoch}")
 
+            if not config.data.val_files_path:
+                raise ValueError("data.val_files_path must be a non-empty list for SL training")
+
             if config.train.micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
                 raise ValueError(f"micro_batches_per_epoch ({config.train.micro_batches_per_epoch}) must be divisible by gradient_accumulation_steps ({config.train.gradient_accumulation_steps})")
 
@@ -591,6 +594,9 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
 
             if config.train.micro_batches_per_epoch is None or config.train.micro_batches_per_epoch < 1:
                 raise ValueError(f"micro_batches_per_epoch must be >= 1 for CL, got {config.train.micro_batches_per_epoch}")
+
+            if not config.data.val_files_path:
+                raise ValueError("data.val_files_path must be a non-empty list for CL training")
 
             if config.train.micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
                 raise ValueError(f"micro_batches_per_epoch ({config.train.micro_batches_per_epoch}) must be divisible by gradient_accumulation_steps ({config.train.gradient_accumulation_steps})")
