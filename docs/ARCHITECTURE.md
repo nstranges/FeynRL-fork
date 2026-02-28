@@ -6,20 +6,23 @@ FeynRL is designed with a **separation of concerns** between algorithmic logic a
 
 ```text
 FeynRL/
-├── algs/               # Implementation of RL/SL algorithms (PPO, SGRPO, DPO, SFT, etc.)
+├── algs/               # Implementation of RL/SL algorithms (PPO, SGRPO, CISPO, DPO, SFT)
 ├── configs/            # YAML configuration files and Pydantic schema validation
-├── data_feeds/         # Data loading, sampling, and replay buffer handling
+├── data_feeds/         # Data loading, mixed-dataset sampling, and dataset construction
 ├── data_prep/          # Scripts for processing raw datasets (GSM8K, HH-RLHF)
-├── docs/               # Documentation files (Installation, FAQ, Architecture)
+├── docs/               # Documentation files (Installation, FAQ, Architecture, Troubleshooting)
+├── experiments/        # Experiment configurations and documentation
+├── misc/               # Utility modules (logging, trackers, helpers)
 ├── rewards/            # Reward functions for RL training
 ├── rollouts/           # vLLM-powered rollout engine and weight synchronization
-├── tests/              # Unit and integration tests
-├── scripts/            # Helper scripts for local and cluster (Slurm) execution
 ├── main_rl.py          # Entry point for Reinforcement Learning training
 ├── main_sl.py          # Entry point for Supervised Fine-Tuning (SFT)
 ├── main_cl.py          # Entry point for Contrastive Learning (e.g., DPO)
 ├── main_eval.py        # Entry point for standalone model evaluation
 ├── requirements.txt    # Project dependencies
+├── CONTRIBUTING.md     # Contribution guidelines
+├── LICENSE             # Project license
+├── .gitignore          # Git ignore rules
 └── README.md           # Main project landing page
 ```
 
@@ -45,11 +48,11 @@ Trajectory generation is powered by **vLLM**, which provides:
 
 ### Weight Synchronization
 FeynRL supports two methods for syncing weights from the training engine to the rollout workers:
-1. **Direct Sync**: Weights are pushed directly via GPU/system memory, minimizing disk I/O and latency.
-2. **Disk Sync**: Weights are saved to a checkpoint on disk, and rollout workers reload them. This is more robust in certain multi-node environments.
+1. **Direct Sync**: Weights are gathered from training engines and pushed to rollout workers via Ray's shared-memory object store, avoiding disk I/O entirely.
+2. **Disk Sync**: Weights are saved as a checkpoint to disk, and rollout workers reload from the saved path. This also serves as an automatic fallback if direct sync fails.
 
 ## Modularity & Extensibility
 
-- **Algorithm Agnostic**: The system is designed to support various algorithms (PPO, GRPO, DPO, SFT) by providing a common interface for data handling and model updates.
-- **Pluggable Rewards**: Custom reward functions can be easily integrated by adding them to the `rewards/` module and referencing them in the configuration.
+- **Algorithm Agnostic**: The system is designed to support various algorithms by providing a common interface for data handling and model updates.
+- **Pluggable Rewards**: Custom reward functions can be easily integrated in the configuration.
 - **Flexible Data Processing**: The data pipeline supports mixed-dataset sampling with configurable ratios, allowing for complex training recipes.
