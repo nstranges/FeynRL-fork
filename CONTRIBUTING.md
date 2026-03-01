@@ -32,13 +32,6 @@ Thank you for your interest in contributing to FeynRL! We welcome contributions 
    ```
 7. **Submit a Pull Request**: Once your changes are ready and tests pass, submit a PR to the `main` branch. Provide a clear description of your changes and link to any relevant issues.
 
-## Code Style
-
-- We use **Black** for code formatting and **Ruff** for linting.
-- Follow PEP 8 guidelines.
-- Use clear and descriptive variable and function names.
-- Add docstrings to classes and complex functions.
-
 ## Adding New Algorithms
 
 If you're adding a new RL or post-training algorithm:
