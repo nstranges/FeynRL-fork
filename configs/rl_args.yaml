@@ -15,8 +15,6 @@ run:
   overlap_enabled: False
   # Max training steps ahead of rollout policy version
   overlap_max_lag: 2
-  # Update rollout weights every N training steps
-  overlap_weight_update_interval: 1
 
   # Weight sync: "direct" pushes weights via GPU memory (no disk I/O),
   # "disk" uses save-to-disk + vllm reload.

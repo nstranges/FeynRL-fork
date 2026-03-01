@@ -30,8 +30,6 @@ class Run(BaseModel):
     overlap_enabled: bool | None = None
     # Max training steps ahead of rollout policy version
     overlap_max_lag: int | None = None
-    # Update rollout weights every N training steps
-    overlap_weight_update_interval: int | None = None
 
     # Weight sync: "direct" pushes weights via gpu memory (no disk I/O),
     # "disk" uses save-to-disk + vllm reload.
