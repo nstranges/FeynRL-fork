@@ -6,10 +6,10 @@ FeynRL is designed with a **separation of concerns** between algorithmic logic a
 
 ```text
 FeynRL/
-├── algs/               # Implementation of RL/SL algorithms (PPO, SGRPO, CISPO, DPO, SFT)
+├── algs/               # Implementation of various algorithms such as PPO, SGRPO, CISPO, DPO, SFT
 ├── configs/            # YAML configuration files and Pydantic schema validation
 ├── data_feeds/         # Data loading, mixed-dataset sampling, and dataset construction
-├── data_prep/          # Scripts for processing raw datasets (GSM8K, HH-RLHF)
+├── data_prep/          # Scripts for processing raw datasets
 ├── docs/               # Documentation files (Installation, FAQ, Architecture, Troubleshooting)
 ├── experiments/        # Experiment configurations and documentation
 ├── misc/               # Utility modules (logging, trackers, helpers)
