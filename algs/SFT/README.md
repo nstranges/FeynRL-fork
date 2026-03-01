@@ -5,7 +5,7 @@ The algorithm box summarizes what happens inside `train_step` during Supervised 
 #### Implementation details
 
 - **Loss normalization** (`normalize_loss` config flag):
-  - When `normalize_loss=True`, the loss is `sum(masked_per_token_loss) / total_possible_tokens` where `total_possible_tokens = B * (T-1)` — the total sequence length including padding. This is a constant across GPUs, which avoids the [gradient accumulation bug](https://unsloth.ai/blog/gradient) that arises when sequence lengths vary across micro-batches (normalizing by `loss_mask.sum()` would give different effective learning rates to different micro-batches).
+  - When `normalize_loss=True`, the loss is `sum(masked_per_token_loss) / total_possible_tokens` where `total_possible_tokens = B * (T-1)` which is the total sequence length including padding. This is a constant across GPUs, which avoids the [gradient accumulation bug](https://unsloth.ai/blog/gradient) that arises when sequence lengths vary across micro-batches (normalizing by `loss_mask.sum()` would give different effective learning rates to different micro-batches).
   - When `normalize_loss=False`, the loss is the raw sum of masked per-token losses.
 
 **Input:** initial parameters $\theta_0$, dataset $\mathcal{D}$, batch size $B$, steps $T$
