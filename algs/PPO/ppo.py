@@ -217,6 +217,12 @@ class PPO(COMMON):
         # convert to float32 for stability under bf16/fp16
         adv = advantages.detach().to(torch.float32)
         mask_bool = (mask.to(device=device) > 0.5)
+
+        # normalize advs to have mean=0 and var=1
+        if mask_bool.any():
+            valid_adv = adv[mask_bool]
+            adv = (adv - valid_adv.mean()) / (valid_adv.std() + 1e-8)
+
         mask = mask_bool.to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)
 
