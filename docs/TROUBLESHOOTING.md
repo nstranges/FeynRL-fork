@@ -48,7 +48,7 @@ vLLM is memory-intensive. If you encounter OOM:
 - **Sync Failure**: Weight sync (`direct` or `disk`) failed silently in a previous epoch, so rollout engines still hold stale weights.
 - **Strict Mode**: `force_strict_on_policy: True` in the config makes the engine reject any version mismatch.
 
-**How to fix:**
+**How to diagnose:**
 1. Search the logs for earlier `[WeightSync]` warnings; these indicate a failed sync attempt.
 2. If the problem persists, switch to `weight_sync_method: disk` in `rl_args.yaml` as a fallback (slower but more robust).
 
