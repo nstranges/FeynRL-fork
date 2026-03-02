@@ -170,7 +170,7 @@ class VLLMRolloutEngine:
             return True
 
         # vllm collective_rpc serializes args with msgspec, which cannot encode
-        # strings (or bytes) larger than 4GB (2^32-1). For large models the pickled
+        # strings or bytes larger than 4GB. For large models the pickled
         # state_dict easily exceeds that. Instead of sending weight data through
         # msgspec, we pickle to /dev/shm, a ram-backed tmpfs which has no real disk I/O,
         # just a memcpy into kernel page cache, and pass only the ~50-byte file
