@@ -57,6 +57,7 @@ Of course. Please submit a PR, or if you prefer to discuss it first, you can [em
 ## I have a few research ideas and want guidance. Can you help?
 
 We can try. If you are comfortable sharing your idea publicly, open a GitHub issue and include enough context for others to follow along. If you prefer to discuss privately, you can [email Rasool](https://rasoolfa.github.io/).
+
 ## I think there are issues in the code and I have ideas to help improve it. What should I do?
 
 We're happy to hear that—this is exactly why we open-sourced the project. Please submit a GitHub issue describing what you found and any suggestions you have. Pull requests are also very welcome.
@@ -65,11 +66,6 @@ We're happy to hear that—this is exactly why we open-sourced the project. Plea
 
 Please open a GitHub issue with your question.
 
-## How can I add a custom reward function?
-
-1. Create a new reward function in a Python file under the `rewards/` directory.
-2. The function should take the relevant inputs (usually the prompt and response) and return a scalar or a batch of rewards.
-3. Update your `rl_args.yaml` config to set `reward.reward_func` to the name of your new function.
 ## I'm having issues with my training run. Where can I find help?
 
 Please refer to our [Troubleshooting Guide](./TROUBLESHOOTING.md) for solutions to common issues related to multi-node scaling, memory management, and training stability.
