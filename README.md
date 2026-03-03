@@ -74,7 +74,6 @@ Learn how to launch jobs and run experiments.
 ⚙️ **[Configuration Reference](configs/README.md)**
 Full parameter guide for RL, SFT, DPO, and evaluation configs.
 
-
 ## Contributing
 
 Contributions are welcome! Please see our **[Contributing Guidelines](CONTRIBUTING.md)** for details on how to get involved.

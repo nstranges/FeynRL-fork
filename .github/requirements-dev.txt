@@ -1,0 +1,11 @@
+pytest
+pytest-cov
+pytest-mock
+hypothesis
+ruff
+pre-commit
+pip-audit
+numpy
+pyyaml
+pydantic
+tqdm

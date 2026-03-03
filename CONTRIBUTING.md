@@ -26,10 +26,11 @@ Thank you for your interest in contributing to FeynRL! We welcome contributions 
    ```
 4. **Implement your Changes**: Keep your changes focused and follow the existing code style.
 5. **Add Tests**: If you're adding a new feature or fixing a bug, please include relevant tests.
-6. **Run Tests**:
-   ```bash
-   pytest tests/
-   ```
+6. **Run Tests**: [Testing](unit_tests/README.md)
+Run unit and integration tests using `pytest`.
+```bash
+PYTHONPATH=. pytest
+```
 7. **Submit a Pull Request**: Once your changes are ready and tests pass, submit a PR to the `main` branch. Provide a clear description of your changes and link to any relevant issues.
 
 ### PR Structure
