@@ -15,15 +15,15 @@ Our goal is to make it possible to do both. You should be able to run realistic 
 
 That's a fair point that not overlapping rollout and training can leave some GPU capacity unused. The reason this framework doesn't default to "always-on" rollout is mainly about data off-policyness and algorithmic bottlenecks, not just throughput.
 
-1. **On-policy methods are sensitive to data freshness.** Most practical RL post-training recipes for large models are effectively on-policy (or close to it) and rely on mechanisms like PPO-style clipping to stay stable when the policy changes. If a rollout engine keeps generating while the policy is being updated, a growing fraction of those samples can become off-policy. Once the divergence is large enough, clipping tends to reduce the update signal, and many samples may contribute less useful gradient. This doesn't mean continuous generation is always wrong — it's a trade-off, and the right choice depends on the setting.
+1. **On-policy methods are sensitive to data freshness.** Most practical RL post-training recipes for large models are effectively on-policy (or close to it) and rely on mechanisms like PPO-style clipping to stay stable when the policy changes. If a rollout engine keeps generating while the policy is being updated, a growing fraction of those samples can become off-policy. Once the divergence is large enough, clipping tends to reduce the update signal, and many samples may contribute less useful gradient. This doesn't mean continuous generation is always wrong, it's a trade-off, and the right choice depends on the setting.
 
 2. **The limiting factor is usually algorithm reliability, not raw rollout speed.** In practice, the hard part of RL for large models isn’t only that generation is expensive, it’s the underlying algorithmic limitations. If the underlying method isn’t reliably improving the policy when it should, increasing rollout throughput often just increases complexity (queues, buffering, off-policy correction, synchronization) without improving outcomes.
 
-This does not imply that system throughput is unimportant or can be ignored. It emphasizes that RL itself has many fundamental challenges, and system optimization pays off most once the algorithm is in a healthy place. That said, we actively follow improvements from other projects and plan to adopt proven patterns as they mature, as long as they align with the design goals of this repo.
+This does not imply that system throughput is unimportant or can be ignored. It emphasizes that RL itself has many fundamental challenges, and system optimization pays off most once the algorithm is in a healthy place. That said, we actively develop ways to improve system throughput and plan to adopt proven patterns from other works as they mature, as long as they align with the design goals of this repo.
 
-## Other frameworks include many rollout-engine system improvements. Why don't you include them?
+## Other frameworks include many system improvements. Why don't you include them?
 
-We'll try to include recent improvements as much as possible, especially with regard to the rollout engine—and this is one of the reasons we open-sourced the repo.
+We'll try to include recent improvements as much as possible, especially with regard to the rollout engine, and this is one of the reasons we open-sourced the repo.
 
 That said, some improvements may have a modest impact on end-to-end performance while adding notable complexity to the pipeline. In cases like that, we tend to hold off until the trade-off is clearer. We are always open to PRs that improve system throughput, and we evaluate each on its merits.
 
