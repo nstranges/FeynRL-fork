@@ -15,6 +15,15 @@
 
 **FeynRL** (pronounced “FineRL”) is a lightweight, modular framework for **post-training and fine-tuning** large models (supervised fine-tuning and RL). It is designed for researchers and engineers who need a **robust, scalable distributed training stack** without sacrificing readability, hackability, or reproducibility.
 
+## Why should you use this?
+
+Most open-source options force a trade-off: either they are highly optimized but hard to modify, or easy to tweak but too limited for realistic large-model experiments. FeynRL is built to close that gap. You get production-scale components (DeepSpeed + vLLM + Ray), while keeping the codebase modular and algorithm-first so new ideas are fast to implement, debug, and reproduce.
+
+- Run real workloads, not toy setups: multi-node, multi-GPU training with scalable rollout generation and evaluation.
+- Move faster on research: clear separation between systems code and algorithm code, so changing methods does not require rewriting infrastructure.
+- Train across paradigms in one repo: SFT, DPO, PPO, SGRPO, and CISPO share a consistent stack and configuration model.
+- Improve reliability: explicit interfaces, reproducible configs, and stability-focused implementation details that reduce fragile RL failure modes.
+
 ### 🎯 Why We Built This
 
 There are several excellent open-source frameworks for training and post-training large models (supervised fine-tuning and RL), but many are hard to work with in practice. They’ve grown complex, have steep learning curves, and often require understanding tightly coupled components before you can safely change anything. Adapting them to a new research idea or a new setup can be slow, error-prone, and frustrating. That complexity also hurts reproducibility: when a framework has many moving parts and evolves quickly, experiments become harder to track, debug, and reliably reproduce.
