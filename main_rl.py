@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 import ray
 import time
-import mlflow
+
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
@@ -311,7 +311,7 @@ def collect_rollouts(dataloader,
         # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
 
-    if len(replay_buffer) <= 1:
+    if len(replay_buffer) == 0:
         raise ValueError("Replay buffer is empty")
 
     rollout_time = time.time() - rollout_start_time
@@ -923,21 +923,10 @@ if __name__ == "__main__":
                     f"avg_kl_ref={epoch_avg.get('kl_ref', 0.0):.4f}, "
                     f"avg_kl_old={epoch_avg.get('kl_old', 0.0):.6f}")
 
-        # Log epoch metrics to MLflow
-        if rank == 0 and mlflow_run:
-            mlflow.log_metrics({
-                    "epoch/avg_loss": epoch_avg_loss,
-                    "epoch/avg_kl_old": epoch_avg_kl_old,
-                    "epoch/avg_kl_ref": epoch_avg_kl_ref,
-                    "epoch/avg_clipfrac": epoch_avg_clipfrac,
-                    "epoch/avg_reward": rollout_stats['avg_reward'],
-                    "epoch/total_reward": rollout_stats['total_reward'],
-                    "epoch/avg_response_len": rollout_stats['avg_response_len'],
-                    "epoch/total_samples": rollout_stats['total_samples_generated'],
-                    "epoch/rollout_time_sec": rollout_stats['rollout_time'],
-                    "epoch/tokens_per_sec": rollout_stats['tokens_per_sec'],
-                    "epoch/train_time_sec": train_time,
-                    }, step=epoch + 1)
+        if tracker:
+            tracker.log_metrics({
+                "train/epoch_time_sec": train_time,
+            }, step=global_step)
 
         ################
         # 6. Sync weights to rollout engines
