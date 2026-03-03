@@ -4,6 +4,7 @@ import numpy as np
 from tqdm import tqdm
 from typing import Any
 import ray
+import random
 
 # Since the following functions are the same for all algorithms
 # we load them from common.py:
@@ -29,11 +30,13 @@ class PPO(COMMON):
                  gradient_checkpointing: bool,
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
+                 peft_config: Any = None,
                  # ppo specific
                  value_model_path: str = None,
                  tau: float = None,
                  gamma: float = None,
                  deepspeed_value_config: Any = None,
+
                  ):
         assert tau is not None and gamma is not None, 'tau and gamma must be provided for PPO'
         assert value_model_path is not None, 'value_model_path must be provided for PPO'
@@ -86,17 +89,17 @@ class PPO(COMMON):
             Value model has a scalar value head.
         '''
         # Load policy model
-        policy_model = self._load_single_model(self.model_path, self.model_dtype)
+        policy_model = self._load_single_model(model_path=self.model_path, dtype=self.model_dtype, model_name="policy")
 
         # Load reference model if provided
         if self.ref_model_path and self.kl_coeff > 0.0:
-            ref_model = self._load_single_model(self.ref_model_path, self.model_dtype)
+            ref_model = self._load_single_model(model_path=self.ref_model_path, dtype=self.model_dtype, model_name="ref")
         else:
             ref_model = None
 
         # Load value model
         # we assume the value model has the same dtype as the policy model
-        base_value_model = self._load_single_model(self.value_model_path, self.model_dtype)
+        base_value_model = self._load_single_model(model_path=self.value_model_path, dtype=self.model_dtype, model_name="value")
         value_model = ValueNetwork(base_value_model)
 
         return {"policy_model": policy_model, "ref_model": ref_model, "value_model": value_model}
@@ -215,6 +218,12 @@ class PPO(COMMON):
         # convert to float32 for stability under bf16/fp16
         adv = advantages.detach().to(torch.float32)
         mask_bool = (mask.to(device=device) > 0.5)
+
+        # normalize advs to have mean=0 and var=1
+        if mask_bool.any():
+            valid_adv = adv[mask_bool]
+            adv = (adv - valid_adv.mean()) / (valid_adv.std() + 1e-8)
+
         mask = mask_bool.to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)
 
@@ -373,9 +382,6 @@ class PPO(COMMON):
         # 1. Pre-compute values and GAE before any updates.
         precomputed_gae = self.precompute_gae(micro_batches)
 
-        # 1. Pre-compute values and GAE before any updates.
-        precomputed_gae = self.precompute_gae(micro_batches)
-
         device = self.policy_engine.device
 
         # 2. Models to train mode
@@ -386,7 +392,8 @@ class PPO(COMMON):
         self.policy_engine.zero_grad()
         self.value_engine.zero_grad()
 
-        # 4. create progress bar
+        # 4. Zip micro_batches with precomputed_gae so they stay aligned
+        # like same iteration order, same length.
         num_micro = len(micro_batches)
         paired = list(zip(micro_batches, precomputed_gae))
 
@@ -404,6 +411,11 @@ class PPO(COMMON):
         # Both engines share the same DS config, so GA steps are identical.
         ga_attr = getattr(self.policy_engine, 'gradient_accumulation_steps', 1)
         ga_steps = int(ga_attr() if callable(ga_attr) else ga_attr)
+
+        # If num_micro is not divisible by ga_steps, the last GA bucket has fewer
+        # micro-batches. DeepSpeed still divides by ga_steps, so we must scale
+        # those losses up by ga_steps/remainder to get the correct mean gradient.
+        ga_remainder = num_micro % ga_steps
 
         # track metrics across all micro-batches
         all_metrics_policy = []
@@ -428,7 +440,6 @@ class PPO(COMMON):
             pos_ids   = micro_batch.get('position_ids', None)
 
             # Pre-computed returns and advantages based on frozen value_net
-            returns, advs = precomputed_gae[step]
             returns = returns.to(device, non_blocking=True)
             advs    = advs.to(device, non_blocking=True)
 
@@ -465,6 +476,10 @@ class PPO(COMMON):
             if self.update_only_after_full_replay:
                 pi_loss = pi_loss * (ga_steps / num_micro)
 
+            else:
+                if ga_remainder != 0 and step >= (num_micro - ga_remainder):
+                    pi_loss = pi_loss * (ga_steps / ga_remainder)
+
             self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
 
             # backward pass
@@ -494,6 +509,10 @@ class PPO(COMMON):
             # Same loss scaling for value function
             if self.update_only_after_full_replay:
                 v_loss = v_loss * (ga_steps / num_micro)
+
+            else:
+                if ga_remainder != 0 and step >= (num_micro - ga_remainder):
+                    v_loss = v_loss * (ga_steps / ga_remainder)
 
             self.value_engine.set_gradient_accumulation_boundary(is_boundary)
 
