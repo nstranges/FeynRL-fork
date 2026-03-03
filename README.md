@@ -58,12 +58,6 @@ Learn how to launch jobs and run experiments.
 ⚙️ **[Configuration Reference](configs/README.md)**
 Full parameter guide for RL, SFT, DPO, and evaluation configs.
 
-✅ **[Testing](unit_tests/README.md)**
-Run unit and integration tests using `pytest`.
-```bash
-PYTHONPATH=. pytest
-```
-
 ## Contributing
 
 Contributions are welcome! Please see our **[Contributing Guidelines](CONTRIBUTING.md)** for details on how to get involved.
