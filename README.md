@@ -13,10 +13,6 @@
 
 ---
 
-## 📢 News
-
-- **[2025-03-03]** 🎉  We're excited to publicly release FeynRL as a preview! Some features and documentation are still evolving. We welcome feedback, bug reports, and contributions as we continue to build this together.
-
 **FeynRL** (pronounced “FineRL”) is a lightweight, modular framework for **post-training and fine-tuning** large models, including supervised fine-tuning (SFT), preference learning (e.g., DPO), and reinforcement learning (e.g., PPO, GRPO). It’s built for researchers and engineers who want a **clean, robust and scalable** distributed training stack without sacrificing readability and hackability.
 
 ### 💡 Why use FeynRL?
@@ -62,6 +58,10 @@ For a more detailed breakdown, see the **[Architecture Overview](docs/ARCHITECTU
 - 🏅 **Evaluation**: Standalone eval pipeline with vLLM engines
 
 FeynRL runs at scale with multi-GPU and multi-node training, and uses vLLM-powered rollout engines for fast inference and evaluation. Ray orchestrates training and rollout workers across nodes, with periodic weight synchronization from training to rollout workers via in-memory transfer when supported (and a disk-based fallback). To improve overall throughput, FeynRL can run in synchronous mode (generate rollouts, then train) or asynchronous mode (overlap generation and training), trading off utilization against how off-policy the collected samples may be. It also supports LoRA fine-tuning, pluggable experiment tracking, configurable mixed-dataset sampling, and a standalone evaluation pipeline.
+
+## 📢 News
+
+- **[2025-03-03]** 🎉  We're excited to publicly release FeynRL as a preview! Some features and documentation are still evolving. We welcome feedback, bug reports, and contributions as we continue to build this together.
 
 ## How to Use FeynRL
 
