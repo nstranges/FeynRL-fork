@@ -1,6 +1,6 @@
 # FeynRL Architecture Overview
 
-FeynRL is designed with a **separation of concerns** between algorithmic logic and system-level orchestration. This modularity allows researchers to focus on developing new methods while leveraging a scalable, high-performance training stack.
+FeynRL is designed with a **separation of concerns** between algorithmic logic and system-level orchestration. This modularity allows researchers and engineers to focus on developing new methods while leveraging a scalable, high-performance training stack.
 
 ## 📂 Repository Structure
 
@@ -17,7 +17,7 @@ FeynRL/
 ├── rollouts/           # vLLM-powered rollout engine and weight synchronization
 ├── main_rl.py          # Entry point for Reinforcement Learning training
 ├── main_sl.py          # Entry point for Supervised Fine-Tuning (SFT)
-├── main_cl.py          # Entry point for Contrastive Learning (e.g., DPO)
+├── main_cl.py          # Entry point for Preference Learning (e.g., DPO)
 ├── main_eval.py        # Entry point for standalone model evaluation
 ├── requirements.txt    # Project dependencies
 ├── CONTRIBUTING.md     # Contribution guidelines
@@ -31,7 +31,7 @@ FeynRL/
 
 ### 🛰️ Orchestration (Ray)
 Ray serves as the central orchestrator, managing the lifecycle of distributed workers across a cluster. It schedules:
-- **Training Workers**: Handle model optimization using DeepSpeed.
+- **Training Workers**: Handle distributed training using DeepSpeed.
 - **Rollout Workers**: Generate trajectories using vLLM rollout engines.
 
 ### 🖥️ Training Engine (DeepSpeed)
@@ -44,12 +44,18 @@ The training engine utilizes **DeepSpeed** for distributed training, supporting:
 Trajectory generation is powered by **vLLM**, which provides:
 - **High Throughput Generation**: Optimized kernels and PagedAttention for fast inference.
 - **Tensor Parallelism**: Capability to shard large models across multiple GPUs for rollout.
-- **Dynamic Loading**: Support for updating policy weights during training.
+- **Dynamic Loading**: Support for directly updating policy weights during training.
 
 ### Weight Synchronization
 FeynRL supports two methods for syncing weights from the training engine to the rollout workers:
 1. **Direct Sync**: Weights are gathered from training engines and pushed to rollout workers via Ray's shared-memory object store, avoiding disk I/O entirely.
 2. **Disk Sync**: Weights are saved as a checkpoint to disk, and rollout workers reload from the saved path. This also serves as an automatic fallback if direct sync fails.
+
+### 🔁 Training↔Rollout Scheduling
+FeynRL supports two execution modes that control how rollout generation and training are scheduled:
+
+1. **Synchronous**: Each epoch generates rollouts, trains on them, syncs weights, and repeats. Simple, fully "on-policy", and easy to debug. Training and rollout workers are scheduled sequentially on separate GPUs.
+2. **Overlap (async prefetch)**: When enabled, the next epoch's rollouts are scheduled *during* the current training step, running concurrently on separate GPUs. A configurable maximum lag controls how many policy versions the rollout engine can fall behind before a weight sync is forced. This improves GPU utilization by reducing idle time, at the cost of slightly staler rollout data.
 
 ## Modularity & Extensibility
 
