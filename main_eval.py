@@ -10,14 +10,13 @@ from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 import ray
 import time
-import mlflow
 from tqdm import tqdm
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
-from data_feeds.prompts import PromptsFeed
+from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
 from rollouts.vllm_engine import VLLMRolloutEngine
-from misc.logging import setup_logging
+from misc.logging import setup_logging, setup_tracker
 from rollouts.replay_buffer import ReplayBuffer
 
 def set_random_seeds(seed):
@@ -43,7 +42,8 @@ def setup_ray(ray_address):
         master_addr = ray.util.get_node_ip_address()
 
     except Exception:
-        print("Warning: Could not get master address, using localhost")
+        # Fallback to localhost if we cannot get the IP (e.g. single node without network)
+        print("Warning: Could not get master address, using localhost. This is fine for single-node but will fail for multi-node.")
         master_addr = "127.0.0.1"
 
     return master_addr
@@ -127,7 +127,6 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
               "eps_reward_norm":params.reward.eps_reward_norm,
-
             }
 
     # if model doesn't fit in one gpu, tp can be > 1
@@ -135,15 +134,33 @@ def create_rollout_engines(params, reward_fnc, eos_id):
     engines = []
     for i in range(num_engines):
         kwargs['engine_id'] = i
-        engines.append(VLLMRolloutEngine.options(num_gpus=tp).remote(**kwargs))
+        engines.append(VLLMRolloutEngine.options(num_gpus=tp,
+                                                 runtime_env={"env_vars": {"PYTHONPATH": os.getcwd()}}
+                                                ).remote(**kwargs))
 
     return engines
+
+def shard_batch_for_engines(rollout_batch, num_rollout_engines):
+    '''
+        Shard a batch of prompts across rollout engines.
+    '''
+    if not rollout_batch:
+        return []
+
+    # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
+    # and rollout_batch is a list of dictionaries.
+    # it is not necessary to have equal number of samples per engine, though they can't be empty.
+    shard_size = (len(rollout_batch) + num_rollout_engines - 1) // num_rollout_engines
+    rollout_shards = [rollout_batch[i * shard_size:(i + 1) * shard_size] for i in range(num_rollout_engines)]
+    rollout_shards = [shard for shard in rollout_shards if len(shard) > 0]
+    return rollout_shards
 
 def collect_rollouts(dataloader,
                      rollout_engines,
                      epoch,
                      policy_version,
                      replay_buffer,
+                     n_samples,
                      logger):
 
     '''
@@ -154,29 +171,32 @@ def collect_rollouts(dataloader,
     total_samples_generated = 0
     total_reward_sum = 0.0
     total_response_len = 0
-    total_prompts = 0
+    total_tokens = 0
+    total_prompts = 0.0
     total_pass_at_k = 0.0
-    total_prompt_mean_rewards = []
-    prompt_response_texts = []
+    total_reward_per_prompt_sum = 0.0
 
-    # Note dataLoader's batch_size is already num_rollout_engines * rollout_batch_size,
-    batch_size   = dataloader.batch_size
-    dataset_size = len(dataloader.dataset)
-    num_steps_to_generate_all = (dataset_size + batch_size - 1) // batch_size
+    # example: rollout_gpus=2, rollout_batch_size_per_gpu=12, n_samples=3, rollout_samples_per_epoch = 25
+    # local_batch_size = num_rollout_engines * rollout_batch_size_per_gpu = 2 * 12 = 24
+    # Batches needed = ceil(25 / 24) = 2 batches
+    # Total Prompts = 2 * 24 = 48 prompts
+    # Total Samples in Buffer = 48 prompts * n_samples (e.g., 3) = 144 samples
 
-    logger.info(f"[Rollout] Dataset: {dataset_size}, Batch: {batch_size} "
-                f"({num_rollout_engines} engines × {batch_size // num_rollout_engines} per engine), "
-                f"Steps to generate all samples: {num_steps_to_generate_all}")
+    batch_size = dataloader.batch_size
+    num_batches_per_epoch = len(dataloader)
+    total_prompts = num_batches_per_epoch * batch_size
+    prompts_per_engine = batch_size // num_rollout_engines
 
-    tqdm_dataloader = tqdm(dataloader, total=num_steps_to_generate_all)
-    for rollout_batch in tqdm_dataloader:
+    logger.info(f"[Rollout] {total_prompts} prompts ({num_batches_per_epoch} batches x {batch_size} prompts/batch), "
+                f"{num_rollout_engines} engines ({prompts_per_engine} prompts/engine/batch), "
+                f"{n_samples} samples/prompt, "
+                f"~{total_prompts * n_samples} expected samples in replay buffer")
+
+    for batch_idx, rollout_batch in enumerate(dataloader, start=1):
         # 1. split data across rollout engines
-        # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
-        # and rollout_batch is a list of dictionaries.
-        shard_size = (len(rollout_batch) + num_rollout_engines - 1) // num_rollout_engines
-        # it is not necessary to have equal number of samples per engine, though they can't be empty.
-        rollout_shards = [rollout_batch[i * shard_size:(i + 1) * shard_size] for i in range(num_rollout_engines)]
-        rollout_shards = [shard for shard in rollout_shards if len(shard) > 0]
+        rollout_shards = shard_batch_for_engines(rollout_batch, num_rollout_engines)
+        if not rollout_shards:
+            continue
 
         # 2. schedule rollout generation
         rollout_samples = []
@@ -185,71 +205,77 @@ def collect_rollouts(dataloader,
                                                                       current_iter=epoch,
                                                                       policy_version=policy_version))
 
-        # 3. gather rollouts
+        # 3. gather rollouts. This is a blocking call means all engines must
+        # finish generating rollouts before we can proceed.
         rollout_lists = ray.get(rollout_samples)
 
         # 4. merge rollouts across all engines and collect stats
         rollout_merged = []
+        batch_samples_generated = 0
+        batch_reward_sum = 0.0
+        batch_response_len = 0
+        batch_prompts = 0.0
+        batch_pass_at_k_sum = 0.0
+        batch_reward_per_prompt_sum = 0.0
         for rl in rollout_lists:
             rollout_merged.extend(rl)
-            
-            # group samples by prompt
-            prompts_seen = set()
-            prompt_rewards_acc = []
-            
             for sample in rl:
                 total_samples_generated += 1
-                total_reward_sum += sample['rewards'].sum().item()
+                total_reward_sum += sample['pred_rewards'].sum().item()
                 total_response_len += sample['response_len']
+                total_tokens += len(sample['prompt_ids']) + len(sample['response_ids'])
+                batch_samples_generated += 1
+                batch_reward_sum += sample['pred_rewards'].sum().item()
+                batch_response_len += sample['response_len']
 
-                prompt_response_texts.append(sample['response_text'])
-
-                prompt_id = tuple(sample['prompt_ids'])  # unique key per prompt
-                if prompt_id not in prompts_seen:
-                    prompts_seen.add(prompt_id)
-                    
-                    # pass@k
-                    if "pass_at_k" in sample:
-                        total_prompts += 1
-                        total_pass_at_k += sample["pass_at_k"]
-
-                    # mean reward per prompt (group_mean_reward was added in generate)
-                    if "group_mean_reward" in sample:
-                        prompt_rewards_acc.append(sample["group_mean_reward"])
-            
-            total_prompt_mean_rewards.extend(prompt_rewards_acc)
-
+                k = sample.get("k", 0)
+                if k > 0:
+                    prompt_weight = 1.0 / k
+                    total_prompts += prompt_weight
+                    total_pass_at_k += sample.get("pass_at_k", 0.0) * prompt_weight
+                    total_reward_per_prompt_sum += sample.get("group_mean_reward", 0.0) * prompt_weight
+                    batch_prompts += prompt_weight
+                    batch_pass_at_k_sum += sample.get("pass_at_k", 0.0) * prompt_weight
+                    batch_reward_per_prompt_sum += sample.get("group_mean_reward", 0.0) * prompt_weight
 
         # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
 
-    rollout_time = time.time() - rollout_start_time
-    avg_reward = total_reward_sum / max(1, total_samples_generated)
-    avg_response_len = total_response_len / max(1, total_samples_generated)
-    
-    avg_pass_at_k = total_pass_at_k / max(1, total_prompts)
+        if batch_samples_generated > 0:
+            logger.info(
+                f"[Rollout][Batch {batch_idx}/{num_batches_per_epoch}] "
+                f"avg_reward={batch_reward_sum / batch_samples_generated:.4f}, "
+                f"avg_response_len={batch_response_len / batch_samples_generated:.1f}, "
+                f"avg_reward_per_prompt={batch_reward_per_prompt_sum / max(batch_prompts, 1e-9):.4f}, "
+                f"pass@k={batch_pass_at_k_sum / max(batch_prompts, 1e-9):.4f}"
+            )
 
-    avg_reward_per_prompt = float(
-        sum(total_prompt_mean_rewards) / max(1, len(total_prompt_mean_rewards))
-    )
-
-    logger.info(f"Average reward: {avg_reward}, Average response length: {avg_response_len}")
-
-    if len(replay_buffer) <= 1:
+    if len(replay_buffer) == 0:
         raise ValueError("Replay buffer is empty")
 
-    return {
-            "stats": {
-                "total_samples_generated": total_samples_generated,
-                "avg_reward": avg_reward,
-                "avg_reward_per_prompt": avg_reward_per_prompt,
-                "total_reward": total_reward_sum,
-                "avg_response_len": avg_response_len,
-                "rollout_time": rollout_time,
-                "avg_pass_at_k": avg_pass_at_k
-            },
-            "responses": prompt_response_texts,
-        }
+    rollout_time = time.time() - rollout_start_time
+    if total_samples_generated == 0:
+        logger.warning("No samples generated during rollout phase!")
+        avg_reward = 0.0
+        avg_response_len = 0.0
+        avg_reward_per_prompt = 0.0
+        avg_pass_at_k = 0.0
+    else:
+        avg_reward = total_reward_sum / total_samples_generated
+        avg_response_len = total_response_len / total_samples_generated
+        avg_reward_per_prompt = total_reward_per_prompt_sum / max(total_prompts, 1e-9)
+        avg_pass_at_k = total_pass_at_k / max(total_prompts, 1e-9)
+
+    tps = total_tokens / max(1e-6, rollout_time)
+
+    return {"total_samples_generated": total_samples_generated,
+            "avg_reward": avg_reward,
+            "avg_reward_per_prompt": avg_reward_per_prompt,
+            "avg_pass_at_k": avg_pass_at_k,
+            "total_reward": total_reward_sum,
+            "avg_response_len": avg_response_len,
+            "rollout_time": rollout_time,
+            "tokens_per_sec": tps}
 
 if __name__ == "__main__":
     # parse arguments
@@ -276,6 +302,8 @@ if __name__ == "__main__":
 
     checkpoint_dir = config.run.checkpoint_dir
 
+    # setup remote experiment tracker
+    tracker = setup_tracker(config=config, rank=rank)
     logger.info(f"Config loaded. experiment_id: {config.run.experiment_id}")
 
     # number of gpus for rollout generation which is used by vllm
@@ -331,34 +359,54 @@ if __name__ == "__main__":
     logger.info("Replay buffer initialized")
 
     rollout_stats = collect_rollouts(dataloader=rollout_dataloader,
-                                         rollout_engines=rollout_engines,
-                                         epoch=0,
-                                         policy_version=0,
-                                         replay_buffer=replay_buffer,
-                                         logger=logger)
+                                     rollout_engines=rollout_engines,
+                                     epoch=0,
+                                     policy_version=0,
+                                     replay_buffer=replay_buffer,
+                                     n_samples=config.rollout.n_samples,
+                                     logger=logger)
 
-    logger.info(f"Rollout complete: {rollout_stats["stats"]['total_samples_generated']} samples, "
-                f"avg_reward={rollout_stats["stats"]['avg_reward']:.4f}, avg_response_len={rollout_stats["stats"]['avg_response_len']:.1f}, "
-                f"time={rollout_stats["stats"]['rollout_time']:.2f}s")
+
+    logger.info(f"Rollout complete: {rollout_stats['total_samples_generated']} samples, "
+                f"avg_reward={rollout_stats['avg_reward']:.4f}, total_reward={rollout_stats['total_reward']:.4f}, "
+                f"avg_reward_per_prompt={rollout_stats['avg_reward_per_prompt']:.4f}, pass@k={rollout_stats['avg_pass_at_k']:.4f}, "
+                f"avg_response_len={rollout_stats['avg_response_len']:.1f}, "
+                f"time={rollout_stats['rollout_time']:.2f}s, tps={rollout_stats['tokens_per_sec']:.2f}")
+
+    # Log eval metrics to experiment tracker
+    if tracker:
+        tracker.log_metrics({
+            "eval/avg_reward": rollout_stats['avg_reward'],
+            "eval/avg_reward_per_prompt": rollout_stats['avg_reward_per_prompt'],
+            "eval/pass_at_k": rollout_stats['avg_pass_at_k'],
+            "eval/total_reward": rollout_stats['total_reward'],
+            "eval/avg_response_len": rollout_stats['avg_response_len'],
+            "eval/total_samples": rollout_stats['total_samples_generated'],
+            "eval/rollout_time_sec": rollout_stats['rollout_time'],
+            "eval/tokens_per_sec": rollout_stats['tokens_per_sec'],
+        }, step=0)
 
     logger.info("Evaluation completed successfully!")
-
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     # save rollout stats
     rollout_stats_path = os.path.join(checkpoint_dir, "rollout_stats.json")
     with open(rollout_stats_path, "w") as f:
-        json.dump(rollout_stats["stats"], f, indent=2)
-
-    # responses
-    responses_path = os.path.join(checkpoint_dir, "rollout_responses.json")
-    with open(responses_path, "w") as f:
-        json.dump(rollout_stats["responses"], f, indent=2)
+        json.dump(rollout_stats, f)
+    logger.info(f"Rollout stats saved to {rollout_stats_path}")
 
     # save experiment config
     experiment_config_path = os.path.join(checkpoint_dir, "experiment_config.yaml")
     with open(experiment_config_path, "w") as f:
-        yaml.dump(config, f)
+        yaml.dump(config.model_dump(), f)
     logger.info(f"Experiment config saved to {experiment_config_path}")
-    
+
+    # End experiment tracker run
+    if tracker:
+        tracker.finish()
+
+    # Kill rollout actors to free gpu memory from vllm before ray.shutdown()
+    for engine in rollout_engines:
+        ray.kill(engine)
+
     ray.shutdown()
