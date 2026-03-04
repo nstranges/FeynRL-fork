@@ -2,31 +2,6 @@
 
 FeynRL is designed with a **separation of concerns** between algorithmic logic and system-level orchestration. This modularity allows researchers and engineers to focus on developing new methods while leveraging a scalable, high-performance training stack.
 
-## 📂 Repository Structure
-
-```text
-FeynRL/
-├── algs/               # Implementation of various algorithms such as PPO, SGRPO, CISPO, DPO, SFT
-├── configs/            # YAML configuration files and Pydantic schema validation
-├── data_feeds/         # Data loading, mixed-dataset sampling, and dataset construction
-├── data_prep/          # Scripts for processing raw datasets
-├── docs/               # Documentation files (Installation, FAQ, Architecture, Troubleshooting)
-├── experiments/        # Experiment configurations and documentation
-├── misc/               # Utility modules (logging, trackers, helpers)
-├── rewards/            # Reward functions for RL training
-├── rollouts/           # vLLM-powered rollout engine and weight synchronization
-├── main_rl.py          # Entry point for Reinforcement Learning training
-├── main_sl.py          # Entry point for Supervised Fine-Tuning (SFT)
-├── main_cl.py          # Entry point for Preference Learning (e.g., DPO)
-├── main_eval.py        # Entry point for standalone model evaluation
-├── requirements.txt    # Project dependencies
-├── CONTRIBUTING.md     # Contribution guidelines
-├── LICENSE             # Project license
-├── .gitignore          # Git ignore rules
-└── README.md           # Main project landing page
-```
-
-
 ## System Components
 
 ### 🛰️ Orchestration (Ray)
@@ -62,3 +37,27 @@ FeynRL supports two execution modes that control how rollout generation and trai
 - **Algorithm Agnostic**: The system is designed to support various algorithms by providing a common interface for data handling and model updates.
 - **Pluggable Rewards**: Custom reward functions can be easily integrated in the configuration.
 - **Flexible Data Processing**: The data pipeline supports mixed-dataset sampling with configurable ratios, allowing for complex training recipes.
+
+## 📂 Repository Structure
+
+```text
+FeynRL/
+├── algs/               # Implementation of various algorithms such as PPO, SGRPO, CISPO, DPO, SFT
+├── configs/            # YAML configuration files and Pydantic schema validation
+├── data_feeds/         # Data loading, mixed-dataset sampling, and dataset construction
+├── data_prep/          # Scripts for processing raw datasets
+├── docs/               # Documentation files (Installation, FAQ, Architecture, Troubleshooting)
+├── experiments/        # Experiment configurations and documentation
+├── misc/               # Utility modules (logging, trackers, helpers)
+├── rewards/            # Reward functions for RL training
+├── rollouts/           # vLLM-powered rollout engine and weight synchronization
+├── main_rl.py          # Entry point for Reinforcement Learning training
+├── main_sl.py          # Entry point for Supervised Fine-Tuning (SFT)
+├── main_cl.py          # Entry point for Preference Learning (e.g., DPO)
+├── main_eval.py        # Entry point for standalone model evaluation
+├── requirements.txt    # Project dependencies
+├── CONTRIBUTING.md     # Contribution guidelines
+├── LICENSE             # Project license
+├── .gitignore          # Git ignore rules
+└── README.md           # Main project landing page
+```
