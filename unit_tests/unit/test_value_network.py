@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import pytest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from algs.PPO.value_net import ValueNetwork
 
 class MockBackbone(nn.Module):
@@ -76,5 +77,3 @@ def test_value_network_delegation():
     
     vn.enable_input_require_grads()
     backbone.enable_input_require_grads.assert_called_once()
-
-from unittest.mock import MagicMock

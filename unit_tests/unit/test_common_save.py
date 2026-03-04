@@ -1,6 +1,7 @@
 import torch
 import pytest
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from algs.RL.common import COMMON
 
@@ -52,5 +53,3 @@ def test_save_checkpoint_peft(tmp_path):
         
         mock_save.assert_called_once()
         dummy_self.merge_peft_state_dict.assert_called_once()
-
-from types import SimpleNamespace

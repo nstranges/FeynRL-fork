@@ -1,6 +1,7 @@
 import torch
 import pytest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from algs.RL.common import COMMON
 
 def test_merge_peft_state_dict_logic():
@@ -70,5 +71,3 @@ def test_policy_forward_logic():
     assert entropies.shape == (B, T-1)
     assert target_ids.shape == (B, T-1)
     assert torch.equal(target_ids, input_ids[:, 1:])
-
-from unittest.mock import MagicMock

@@ -1,6 +1,16 @@
+import os
+import logging
 import torch
 import pytest
-from misc.utils import safe_string_to_torch_dtype, ensure_1d, pad_1d_to_length
+from unittest.mock import MagicMock, patch
+from misc.utils import (
+    safe_string_to_torch_dtype,
+    ensure_1d,
+    pad_1d_to_length,
+    get_experiment_dir_name,
+    load_algorithm,
+    ray_get_with_timeout,
+)
 
 def test_safe_string_to_torch_dtype():
     assert safe_string_to_torch_dtype("fp16") == torch.float16
@@ -32,3 +42,78 @@ def test_pad_1d_to_length():
     # Same
     same = pad_1d_to_length(x, pad_value=0.0, target_len=2)
     assert torch.equal(same, x)
+
+def test_get_experiment_dir_name():
+    result = get_experiment_dir_name("/checkpoints", "epoch_3", "exp_001")
+    assert result == os.path.join("/checkpoints", "exp_001", "epoch_3")
+
+def test_get_experiment_dir_name_nested():
+    result = get_experiment_dir_name("/a/b/c", "tag", "id")
+    assert result == os.path.join("/a/b/c", "id", "tag")
+
+def test_load_algorithm_success():
+    registry = {
+        "sft": ("algs.SFT.sft", "SFT"),
+    }
+    cls = load_algorithm("sft", registry)
+    from algs.SFT.sft import SFT
+    assert cls is SFT
+
+def test_load_algorithm_case_insensitive():
+    registry = {
+        "sft": ("algs.SFT.sft", "SFT"),
+    }
+    cls = load_algorithm("SFT", registry)
+    from algs.SFT.sft import SFT
+    assert cls is SFT
+
+def test_load_algorithm_unknown():
+    registry = {"sft": ("algs.SFT.sft", "SFT")}
+    with pytest.raises(ValueError, match="Unknown algorithm"):
+        load_algorithm("nonexistent", registry)
+
+def test_ray_get_with_timeout_success():
+    import ray
+    ray.get = MagicMock(return_value="result")
+    logger = logging.getLogger("test")
+
+    result = ray_get_with_timeout(refs="ref", timeout=10, description="test_op", logger=logger)
+    assert result == "result"
+    ray.get.assert_called_once_with("ref", timeout=10)
+
+# The global ray mock in conftest makes ray.exceptions.* into MagicMocks,
+# not real BaseException subclasses. We need real exception classes so that
+# the except clauses in ray_get_with_timeout can actually catch them.
+
+class _TimeoutError(Exception):
+    pass
+
+class _ActorError(Exception):
+    pass
+
+class _TaskError(Exception):
+    pass
+
+def _patch_ray_exceptions():
+    """Patch all ray exception names in misc.utils with real BaseException subclasses."""
+    return (
+        patch('misc.utils.GetTimeoutError', _TimeoutError),
+        patch('misc.utils.RayActorError', _ActorError),
+        patch('misc.utils.RayTaskError', _TaskError),
+    )
+
+def test_ray_get_with_timeout_timeout_error():
+    logger = MagicMock()
+    p1, p2, p3 = _patch_ray_exceptions()
+    with patch('misc.utils.ray') as mock_ray, p1, p2, p3:
+        mock_ray.get.side_effect = _TimeoutError("timeout")
+        with pytest.raises(RuntimeError, match="timed out"):
+            ray_get_with_timeout(refs="ref", timeout=5, description="slow_op", logger=logger)
+
+def test_ray_get_with_timeout_actor_error():
+    logger = MagicMock()
+    p1, p2, p3 = _patch_ray_exceptions()
+    with patch('misc.utils.ray') as mock_ray, p1, p2, p3:
+        mock_ray.get.side_effect = _ActorError()
+        with pytest.raises(RuntimeError, match="actor died"):
+            ray_get_with_timeout(refs="ref", timeout=5, description="dead_op", logger=logger)

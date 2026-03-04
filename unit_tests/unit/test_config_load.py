@@ -2,7 +2,7 @@ import os
 import yaml
 import pytest
 from pydantic import ValidationError
-from configs.load import load_and_verify, Config
+from configs.load import load_and_verify, Config, Run, Train, Model, DeepSpeed, Rollout
 
 def test_config_load_sl_success(tmp_path):
     config_dict = {
@@ -10,7 +10,7 @@ def test_config_load_sl_success(tmp_path):
             "experiment_id": "test",
             "seed": 42,
             "project_name": "test_proj",
-            "tracking_uri": "http://localhost:5000",
+            "tracking_uri": "http://localhost:8181",
             "checkpoint_dir": str(tmp_path / "checkpoints")
         },
         "train": {
@@ -69,38 +69,6 @@ def test_config_load_validation_error(tmp_path):
     # load_and_verify calls sys.exit(1) on ValidationError, so we test Config initialization directly
     with pytest.raises(ValidationError):
         Config(**config_dict)
-
-def test_sync_deepspeed_config_rl():
-    from configs.load import Config
-    # Minimal config to trigger sync_deepspeed_config
-    c = Config()
-    c.run = MagicMock(method="rl")
-    c.train = MagicMock(
-        train_batch_size_per_gpu=4,
-        gradient_accumulation_steps=2,
-        clip_grad_norm=1.0,
-        optimizer_name="adam",
-        lr=1e-4,
-        betas=[0.9, 0.999],
-        weight_decay=0.01,
-        adam_epsilon=1e-8,
-        lr_scheduler="WarmupCosineLR",
-        total_number_of_epochs=1,
-        train_steps_per_epoch=10,
-        warmup_steps_ratio=0.1,
-        update_after_full_replay=True
-    )
-    c.model = MagicMock(dtype="bf16", ref_model=None)
-    c.deepspeed = MagicMock(zero_optimization={})
-    c.rollout = MagicMock()
-    
-    # We use the real Config.sync_deepspeed_config but with mock sub-objects 
-    # Actually it's better to use real objects for sub-configs to avoid attribute errors in sync_deepspeed_config
-    pass
-
-from unittest.mock import MagicMock
-# Re-implementing with real Pydantic objects for deep sync test
-from configs.load import Run, Train, Model, Data, DeepSpeed, Rollout
 
 def test_sync_deepspeed_config_logic():
     run = Run(experiment_id="id", seed=1, project_name="p", tracking_uri="u", method="rl", 

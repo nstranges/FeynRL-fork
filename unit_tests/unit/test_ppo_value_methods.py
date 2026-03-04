@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -93,5 +94,3 @@ def test_precompute_gae():
     
     dummy_self.value_forward.assert_called_once()
     dummy_self.compute_advantages.assert_called_once()
-
-import numpy as np

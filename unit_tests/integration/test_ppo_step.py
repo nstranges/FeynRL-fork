@@ -5,10 +5,10 @@ import pytest
 from unit_tests.models import TinyModel, TinyValueModel
 
 def test_ppo_integration_step():
-    """
-    Minimal integration test for a single PPO update step. 
-    Verifies that gradients are computed, parameters are updated, and loss is finite.
-    """
+    '''
+        Minimal integration test for a single PPO update step.
+        Verifies that gradients are computed, parameters are updated, and loss is finite.
+    '''
     torch.manual_seed(42)
     
     # 1. Models and optimizer
