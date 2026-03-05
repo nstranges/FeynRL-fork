@@ -1,8 +1,38 @@
 import torch
 import os
+import random
 import importlib
+import numpy as np
 import ray
 from ray.exceptions import GetTimeoutError, RayActorError, RayTaskError
+
+def set_random_seeds(seed, rank=0):
+    '''
+        Set random seeds and other flags to make runs more reproducible (still not guaranteed).
+        With distributed training, floating-point math, rollout engines, non-deterministic ops (e.g., torch.Tensor.index_add_), etc.,
+        can still cause differences, seeding just reduces the variance a bit.
+    '''
+    # Set PYTHONHASHSEED for deterministic string hashing (e.g., dict keys, sets).
+    # Note: it only affects processes that read it at startup.  For the
+    # current (already-running) process this has no effect, but it IS inherited by
+    # any child processes spawned later (e.g., DataLoader workers).  For Ray actors
+    # and torchrun workers, we need to set it via runtime_env / launch command.
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    # :16:8 forces cuBLAS to use a fixed workspace allocation and the format is :num_results:bytes_per_result.
+    # Specifically 16 results with 8 bytes each. This constrains cuBLAS to only use deterministic algorithm paths
+    # that always accumulate in the same order.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+
+    random.seed(seed + rank)
+    np.random.seed(seed + rank)
+    torch.manual_seed(seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed + rank)
+
+    # Force deterministic cuDNN algorithm selection
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def safe_string_to_torch_dtype(dtype_in):
     '''

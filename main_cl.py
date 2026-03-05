@@ -16,7 +16,7 @@ from peft import get_peft_model, LoraConfig
 import configs.load as cfg# all config arguments
 from data_feeds.preference import PreferenceFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
-from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm
+from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, set_random_seeds
 from misc.logging import setup_logging, setup_tracker
 
 
@@ -25,17 +25,6 @@ Algorithm_Registry = {
     'dpo': ('algs.DPO.dpo', 'DPO'),
 }
 
-def set_random_seeds(seed):
-    '''
-        Set random seeds to make runs more reproducible (still not guaranteed). With distributed training,
-        floating-point math and non-deterministic ops (e.g., torch.Tensor.index_add_) can still cause differences,
-        seeding just reduces the variance a bit.
-    '''
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
 def init_rank_world_size():
     '''
         Detect rank and world size from environment variables.
@@ -43,6 +32,10 @@ def init_rank_world_size():
         nnodes=2 -> world_size
         nproc_per_node=4 -> local_world_size/num_local_gpus
     '''
+    # Set deterministic cuBLAS workspace before any CUDA context/device setup
+    # to make it visible to the CUDA runtime from the very start.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+
     # total number of gpus (e.g, 2 nodes x 4 gpus = 8 gpus in total). world size need to be at least 1
     world_size = int(os.environ.get('WORLD_SIZE', 1))
 
@@ -197,9 +190,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
     def worker_init_fn(worker_id):
         # each worker gets a different seed but deterministic across runs when seed fixed
         worker_seed = params.run.seed + worker_id + (rank * 100000)
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
+        set_random_seeds(worker_seed)
 
     if split == 'train':
         # MixedDatasetSampler is a batch sampler (yields batches of indices).
