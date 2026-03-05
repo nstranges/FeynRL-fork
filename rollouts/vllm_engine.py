@@ -461,8 +461,6 @@ class VLLMRolloutEngine:
                             upto = min(i, k)
                             pass_at_ks[i] = float(any(r > 0 for r in group_stats['rewards'][:upto]))
 
-                    pass_at_k = pass_at_ks[self.n_samples]
-                    pass_at_1 = pass_at_ks[1]
                     pass_caret_k = float(all(r > 0 for r in group_stats['rewards'])) if k > 0 else 0.0
                     pass_rate = float(sum(r > 0 for r in group_stats['rewards']) / k) if k > 0 else 0.0
                     group_mean_reward = float(sum(group_stats['rewards']) / k) if k > 0 else 0.0
@@ -479,8 +477,6 @@ class VLLMRolloutEngine:
                     batch_reward_std_sum += reward_std_per_prompt
 
                     for s in group_samples:
-                        s["pass_at_k"] = pass_at_k
-                        s["pass_at_1"] = pass_at_1
                         s["pass_at_ks"] = pass_at_ks
                         s["pass_caret_k"] = pass_caret_k
                         s["pass_rate"] = pass_rate

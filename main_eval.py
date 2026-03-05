@@ -173,8 +173,6 @@ def collect_rollouts(dataloader,
     total_response_len = 0
     total_tokens = 0
     total_prompts = 0.0
-    total_pass_at_1 = 0.0
-    total_pass_at_k = 0.0
     total_pass_at_ks = {i: 0.0 for i in range(1, n_samples + 1)}
     total_pass_caret_k = 0.0
     total_pass_rate = 0.0
@@ -242,8 +240,6 @@ def collect_rollouts(dataloader,
                 if k > 0:
                     prompt_weight = 1.0 / k
                     total_prompts += prompt_weight
-                    total_pass_at_1 += sample.get("pass_at_1", 0.0) * prompt_weight
-                    total_pass_at_k += sample.get("pass_at_k", 0.0) * prompt_weight
                     sample_pass_at_ks = sample.get("pass_at_ks", {})
                     for i in range(1, n_samples + 1):
                         pass_at_i = sample_pass_at_ks.get(i, sample_pass_at_ks.get(str(i), 0.0))
@@ -292,8 +288,6 @@ def collect_rollouts(dataloader,
         avg_reward = 0.0
         avg_response_len = 0.0
         avg_reward_per_prompt = 0.0
-        avg_pass_at_1 = 0.0
-        avg_pass_at_k = 0.0
         avg_pass_at_ks = {i: 0.0 for i in range(1, n_samples + 1)}
         avg_pass_caret_k = 0.0
         avg_pass_rate = 0.0
@@ -303,8 +297,6 @@ def collect_rollouts(dataloader,
         avg_reward = total_reward_sum / total_samples_generated
         avg_response_len = total_response_len / total_samples_generated
         avg_reward_per_prompt = total_reward_per_prompt_sum / max(total_prompts, 1e-9)
-        avg_pass_at_1 = total_pass_at_1 / max(total_prompts, 1e-9)
-        avg_pass_at_k = total_pass_at_k / max(total_prompts, 1e-9)
         avg_pass_at_ks = {
             i: total_pass_at_ks[i] / max(total_prompts, 1e-9)
             for i in range(1, n_samples + 1)
@@ -319,8 +311,6 @@ def collect_rollouts(dataloader,
     return {"total_samples_generated": total_samples_generated,
             "avg_reward": avg_reward,
             "avg_reward_per_prompt": avg_reward_per_prompt,
-            "avg_pass_at_1": avg_pass_at_1,
-            "avg_pass_at_k": avg_pass_at_k,
             "avg_pass_at_ks": avg_pass_at_ks,
             "avg_pass_caret_k": avg_pass_caret_k,
             "avg_pass_rate": avg_pass_rate,
@@ -440,8 +430,6 @@ if __name__ == "__main__":
         tracker_metrics = {
             "eval/avg_reward": rollout_stats['avg_reward'],
             "eval/avg_reward_per_prompt": rollout_stats['avg_reward_per_prompt'],
-            "eval/pass_at_1": rollout_stats['avg_pass_at_1'],
-            "eval/pass_at_k": rollout_stats['avg_pass_at_k'],
             "eval/pass_caret_k": rollout_stats['avg_pass_caret_k'],
             "eval/pass_rate": rollout_stats['avg_pass_rate'],
             "eval/avg_best_of_k_reward": rollout_stats['avg_best_of_k_reward'],
