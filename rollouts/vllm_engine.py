@@ -334,8 +334,7 @@ class VLLMRolloutEngine:
                 # this works even if n_samples >= 1
                 rollout_samples = []
                 batch_num_prompts = 0
-                batch_num_passes = 0.0
-                batch_num_passes_at_1 = 0.0
+                batch_num_passes_at_ks = {i: 0.0 for i in range(1, self.n_samples + 1)}
                 batch_num_passes_caret_k = 0.0
                 batch_pass_rate_sum = 0.0
                 batch_prompt_reward_sum = 0.0
@@ -454,8 +453,16 @@ class VLLMRolloutEngine:
                                            is_per_token=is_per_token)
 
                     k = len(group_stats['rewards'])
-                    pass_at_k = float(any(r > 0 for r in group_stats['rewards'])) if k > 0 else 0.0
-                    pass_at_1 = float(group_stats['rewards'][0] > 0) if k > 0 else 0.0
+                    pass_at_ks = {}
+                    for i in range(1, self.n_samples + 1):
+                        if k == 0:
+                            pass_at_ks[i] = 0.0
+                        else:
+                            upto = min(i, k)
+                            pass_at_ks[i] = float(any(r > 0 for r in group_stats['rewards'][:upto]))
+
+                    pass_at_k = pass_at_ks[self.n_samples]
+                    pass_at_1 = pass_at_ks[1]
                     pass_caret_k = float(all(r > 0 for r in group_stats['rewards'])) if k > 0 else 0.0
                     pass_rate = float(sum(r > 0 for r in group_stats['rewards']) / k) if k > 0 else 0.0
                     group_mean_reward = float(sum(group_stats['rewards']) / k) if k > 0 else 0.0
@@ -463,8 +470,8 @@ class VLLMRolloutEngine:
                     reward_std_per_prompt = float(np.std(group_stats['rewards'])) if k > 0 else 0.0
 
                     batch_num_prompts += 1
-                    batch_num_passes += pass_at_k
-                    batch_num_passes_at_1 += pass_at_1
+                    for i in range(1, self.n_samples + 1):
+                        batch_num_passes_at_ks[i] += pass_at_ks[i]
                     batch_num_passes_caret_k += pass_caret_k
                     batch_pass_rate_sum += pass_rate
                     batch_prompt_reward_sum += group_mean_reward
@@ -474,6 +481,7 @@ class VLLMRolloutEngine:
                     for s in group_samples:
                         s["pass_at_k"] = pass_at_k
                         s["pass_at_1"] = pass_at_1
+                        s["pass_at_ks"] = pass_at_ks
                         s["pass_caret_k"] = pass_caret_k
                         s["pass_rate"] = pass_rate
                         s["k"] = k
@@ -484,10 +492,13 @@ class VLLMRolloutEngine:
                     rollout_samples.extend(group_samples)
 
                 if batch_num_prompts > 0:
+                    pass_at_k_items = ", ".join(
+                        f"avg_pass@{i}={batch_num_passes_at_ks[i] / batch_num_prompts:.4f}"
+                        for i in range(1, self.n_samples + 1)
+                    )
                     self.log(
                         f"Batch metrics: prompts={batch_num_prompts}, "
-                        f"avg_pass@1={batch_num_passes_at_1 / batch_num_prompts:.4f}, "
-                        f"avg_pass@k={batch_num_passes / batch_num_prompts:.4f}, "
+                        f"{pass_at_k_items}, "
                         f"avg_pass^k={batch_num_passes_caret_k / batch_num_prompts:.4f}, "
                         f"avg_pass_rate={batch_pass_rate_sum / batch_num_prompts:.4f}, "
                         f"avg_reward_per_prompt={batch_prompt_reward_sum / batch_num_prompts:.4f}, "
