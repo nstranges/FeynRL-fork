@@ -5,6 +5,7 @@ import yaml
 import sys
 import copy
 import os
+import torch
 
 class Run(BaseModel):
     '''
@@ -249,6 +250,7 @@ class Rollout(BaseModel):
     tensor_parallel_size: int | None = None
     rollout_batch_size_per_gpu: int | None = None
     rollout_samples_per_epoch: int | None = None
+    batch_invariant: bool = False
 
 class Config(BaseModel):
     '''
@@ -695,6 +697,31 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
 
             if config.run.sync_timeout is None:
                 raise ValueError("run.sync_timeout must be specified for RL training")
+
+        # Validate batch_invariant GPU requirements (applies to RL and eval)
+        if config.rollout and config.rollout.batch_invariant:
+            try:
+                if torch.cuda.is_available():
+                    supported = False
+                    for i in range(torch.cuda.device_count()):
+                        cap = torch.cuda.get_device_capability(i)
+                        # compute capability 9.0+ which is Hopper/Blackwell
+                        # https://docs.vllm.ai/en/latest/features/batch_invariance/
+                        if cap[0] >= 9:
+                            supported = True
+                            break
+
+                    if not supported:
+                        cap = torch.cuda.get_device_capability(0)
+                        if rank == 0:
+                            print(f"[Config] WARNING: batch_invariant=True requires NVIDIA GPUs with "
+                                  f"compute capability >= 9.0 (H100, H200, B100, B200). "
+                                  f"Detected compute capability: {cap[0]}.{cap[1]}. "
+                                  f"Batch invariance will be enabled but reproducibility is not guaranteed.")
+            except Exception as e:
+                if rank == 0:
+                    print(f"[Config] WARNING: Could not check GPU compute capability: {e}")
+                    print(f"[Config] Batch invariance will be enabled but reproducibility is not guaranteed.")
 
         if method != "eval":
             # Sync AFTER updating world_size

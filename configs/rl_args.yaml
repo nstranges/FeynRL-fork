@@ -122,6 +122,11 @@ rollout:
   # Number of prompts to process per epoch.
   # Total samples in replay buffer = rollout_samples_per_epoch * n_samples.
   rollout_samples_per_epoch: 100
+  # if true, it reduces throughput depending on model size and batch composition
+  # because it forces batch-invariant kernels.
+  # https://docs.vllm.ai/en/stable/examples/offline_inference/reproducibility/
+  batch_invariant: False
+
 
 model:
   name: "google/gemma-3-1b-it"
