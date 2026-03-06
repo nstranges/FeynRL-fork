@@ -31,6 +31,10 @@ rollout:
   tensor_parallel_size: 1
   # Batch size for the prompt dataloader during rollout generation.
   rollout_batch_size_per_gpu: 2
+  # if true, it reduces throughput depending on model size and batch composition
+  # because it forces batch-invariant kernels.
+  # https://docs.vllm.ai/en/stable/examples/offline_inference/reproducibility/
+  batch_invariant: False
 
 model:
   name: "google/gemma-3-1b-it"
