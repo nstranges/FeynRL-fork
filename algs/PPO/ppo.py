@@ -28,6 +28,7 @@ class PPO(COMMON):
                  update_after_full_replay: bool,
                  deepspeed_config: Any,
                  gradient_checkpointing: bool,
+                 seed: int,
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
                  peft_config: Any = None,
@@ -47,6 +48,7 @@ class PPO(COMMON):
         self.attn_impl = attn_impl
         self.trust_remote_code = trust_remote_code
         self.peft_config = peft_config
+        self.seed = seed
 
         # training related parameters
         self.deepspeed_config = deepspeed_config

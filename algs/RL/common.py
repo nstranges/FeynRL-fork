@@ -1,10 +1,12 @@
 import os
 import torch
 import torch.distributed
+import numpy as np
 from transformers import AutoModelForCausalLM, AutoConfig
 import deepspeed
 from peft import get_peft_model, LoraConfig
 from safetensors.torch import save_file
+from misc.utils import set_random_seeds
 
 class COMMON:
     '''
@@ -83,6 +85,12 @@ class COMMON:
             Since we are using deepspeed with ray, each ray actor MUST create its own deepspeed engine.
             This is because each ray actor process is a separate process (1 actor = 1 gpu = 1 ds rank).
         '''
+        # Seed every ray worker deterministically so model init, random.shuffle,
+        # and any stochastic components are reproducible run-to-run (hopefully).
+        # self.seed is passed from config via the algorithm constructor.
+        rank_for_seed = int(os.environ.get("RANK", "0"))
+        set_random_seeds(self.seed + rank_for_seed)
+
         # Convert pydantic model to python Dict for DeepSpeed
         ds_config_dict = self.deepspeed_config.model_dump()
 

@@ -6,6 +6,16 @@ import numpy as np
 import ray
 from ray.exceptions import GetTimeoutError, RayActorError, RayTaskError
 
+def get_determinism_env_vars():
+    '''
+        Returns environment variables for deterministic runs.
+    '''
+    num_results = 16
+    bytes_per_result = 8
+    # use in os.environ.get('CUBLAS_WORKSPACE_CONFIG', f":{num_results}:{bytes_per_result}") which
+    # returns ":16:8"
+    return f":{num_results}:{bytes_per_result}"
+
 def set_random_seeds(seed, rank=0):
     '''
         Set random seeds and other flags to make runs more reproducible (still not guaranteed).
@@ -22,7 +32,7 @@ def set_random_seeds(seed, rank=0):
     # :16:8 forces cuBLAS to use a fixed workspace allocation and the format is :num_results:bytes_per_result.
     # Specifically 16 results with 8 bytes each. This constrains cuBLAS to only use deterministic algorithm paths
     # that always accumulate in the same order.
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", get_determinism_env_vars())
 
     random.seed(seed + rank)
     np.random.seed(seed + rank)

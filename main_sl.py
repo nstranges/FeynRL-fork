@@ -16,7 +16,7 @@ from peft import get_peft_model, LoraConfig
 import configs.load as cfg# all config arguments
 from data_feeds.paired import PairedFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
-from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, set_random_seeds
+from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
 from misc.logging import setup_logging, setup_tracker
 
 
@@ -33,7 +33,7 @@ def init_rank_world_size():
         nproc_per_node=4 -> local_world_size/num_local_gpus
     '''
     # Set deterministic cuBLAS workspace before any CUDA context/device setup.
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", get_determinism_env_vars())
 
     # total number of gpus (e.g, 2 nodes x 4 gpus = 8 gpus in total). world size need to be at least 1
     world_size = int(os.environ.get('WORLD_SIZE', 1))
