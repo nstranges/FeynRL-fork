@@ -1,5 +1,4 @@
 import os
-import random
 import atexit
 import numpy as np
 import argparse
@@ -15,7 +14,7 @@ import time
 import configs.load as cfg # all config arguments
 from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
 from data_feeds.mixed_sampler import create_prompt_dataset_and_sampler
-from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, ray_get_with_timeout
+from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, ray_get_with_timeout, set_random_seeds, get_determinism_env_vars
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.replay_buffer import ReplayBuffer
 from misc.logging import setup_logging, setup_tracker
@@ -27,16 +26,6 @@ Algorithm_Registry = {
     'ppo':   ('algs.PPO.ppo', 'PPO'),
 }
 
-def set_random_seeds(seed):
-    '''
-        Set random seeds to make runs more reproducible (still not guaranteed). With distributed training,
-        floating-point math and non-deterministic ops (e.g., torch.Tensor.index_add_) can still cause differences,
-        seeding just reduces the variance a bit.
-    '''
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 def setup_ray(ray_address):
     '''
@@ -69,6 +58,7 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                'model_dtype':safe_string_to_torch_dtype(params.model.dtype),
                'trust_remote_code':params.model.trust_remote_code,
                'attn_impl':params.model.attn_implementation,
+               'seed':params.run.seed,
 
                # training related arguments
                'kl_coeff':params.train.kl_coeff,
@@ -98,6 +88,7 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
         kwargs['deepspeed_value_config'] = params.deepspeed_value
     # setup ray runners
     ray_runners = []
+    cublas_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG", get_determinism_env_vars())
     for rank in range(world_size):
         # Since NCCL identifies gpus by their actual PCIe/NVLink topology,
         # not LOCAL_RANK, we keep LOCAL_RANK as 0 for all actors.
@@ -107,6 +98,8 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                     "WORLD_SIZE": str(world_size),
                     "LOCAL_RANK": "0",
                     "PYTHONPATH": os.getcwd(), # Ensure current directory is in path for all workers
+                    "CUBLAS_WORKSPACE_CONFIG": cublas_workspace, # deterministic cuBLAS
+                    "PYTHONHASHSEED": str(params.run.seed),
                     }
 
         # NCCL env vars for multi-node clusters
@@ -157,15 +150,26 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
               "eps_reward_norm":params.reward.eps_reward_norm,
+              "batch_invariant":params.rollout.batch_invariant,
             }
 
     # if model doesn't fit in one gpu, tp can be > 1
     num_engines = max(1, rollout_gpus // tp)
     engines = []
+    cublas_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG", get_determinism_env_vars())
     for i in range(num_engines):
         kwargs['engine_id'] = i
+        rollout_env_vars = {"PYTHONPATH": os.getcwd(),
+                            "CUBLAS_WORKSPACE_CONFIG": cublas_workspace,
+                            "PYTHONHASHSEED": str(params.run.seed),
+                           }
+        # The goal of batch_invariant is topology-invariance. it means that
+        # same prompt → same output regardless of engine count
+        if params.rollout.batch_invariant:
+            rollout_env_vars["VLLM_BATCH_INVARIANT"] = "1"
+
         engines.append(VLLMRolloutEngine.options(num_gpus=tp,
-                                                 runtime_env={"env_vars": {"PYTHONPATH": os.getcwd()}}
+                                                 runtime_env={"env_vars": rollout_env_vars}
                                                 ).remote(**kwargs))
 
     return engines
@@ -217,6 +221,13 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
                                                 shuffle_within_batch=True,
                                                 dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
                                                 )
+    # Seed each DataLoader worker deterministically so any randomness
+    # inside __getitem__ / collate_fn is reproducible across runs.
+    # This DataLoader runs on the driver only, single process, no rank.
+    def worker_init_fn(worker_id):
+        worker_seed = params.run.seed + worker_id
+        set_random_seeds(worker_seed)
+
     # MixedDatasetSampler is a batch sampler (yields batches of indices)
     # pin_memory=False: the collate_fn returns plain Python lists/dicts (no tensors to pin)
     dataloader = DataLoader(dataset=dataset,
@@ -224,6 +235,7 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
                             num_workers=params.data.num_workers,
                             pin_memory=False,
                             collate_fn=collate_fn,
+                            worker_init_fn=worker_init_fn,
                             )
 
     return dataloader
@@ -675,18 +687,22 @@ def finalize_rollouts(all_futures, replay_buffer, logger, rollout_timeout, start
             "rollout_time_with_overlap": wall_time,
             }
 
-def prepare_training_batches(replay_buffer, batch_size: int, num_engines: int) -> list:
+def prepare_training_batches(replay_buffer, batch_size: int, num_engines: int, seed: int = 0, epoch: int = 0) -> list:
     '''
         Create and pad training batches for distributed training.
     '''
     # Create dataloader from replay buffer and convert
-    # to list as ray needs serializable data
+    # to list as ray needs serializable data.
+    # Use a seeded generator for deterministic shuffle order across runs.
+    g = torch.Generator()
+    g.manual_seed(seed + epoch)
     train_batches = list(DataLoader(dataset=replay_buffer,
                                     batch_size=batch_size,
                                     shuffle=True,
                                     num_workers=0,
                                     pin_memory=False,
                                     collate_fn=replay_buffer.collate_fn,
+                                    generator=g,
                                     ))
     # Pad to ensure equal batches per engine (prevents DeepSpeed hang)
     num_batches = len(train_batches)
@@ -1129,7 +1145,9 @@ if __name__ == "__main__":
         # divisible by num_train_engines
         train_batches_padded = prepare_training_batches(replay_buffer=replay_buffer,
                                                         batch_size=config.train.train_batch_size_per_gpu,
-                                                        num_engines=len(training_engine))
+                                                        num_engines=len(training_engine),
+                                                        seed=config.run.seed,
+                                                        epoch=epoch)
         samples_per_engine = len(replay_buffer) // len(training_engine)
         micro_per_engine = len(train_batches_padded) // len(training_engine)
         logger.info(f"[Epoch {epoch+1}] Training: "
