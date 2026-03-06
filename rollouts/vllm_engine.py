@@ -525,38 +525,26 @@ class VLLMRolloutEngine:
                                            prompt_len=prompt_len,
                                            is_per_token=is_per_token)
 
-                    k = len(group_stats['rewards'])
-                    pass_at_ks = {}
-                    for i in range(1, self.n_samples + 1):
-                        if k == 0:
-                            pass_at_ks[i] = 0.0
-                        else:
-                            upto = min(i, k)
-                            pass_at_ks[i] = float(any(r > 0 for r in group_stats['rewards'][:upto]))
-
-                    pass_caret_k = float(all(r > 0 for r in group_stats['rewards'])) if k > 0 else 0.0
-                    pass_rate = float(sum(r > 0 for r in group_stats['rewards']) / k) if k > 0 else 0.0
-                    group_mean_reward = float(sum(group_stats['rewards']) / k) if k > 0 else 0.0
-                    best_of_k_reward = float(max(group_stats['rewards'])) if k > 0 else 0.0
-                    reward_std_per_prompt = float(np.std(group_stats['rewards'])) if k > 0 else 0.0
+                    # compute pass@k metrics and update related variables
+                    pass_at_k_metrics = self.compute_pass_metrics(group_stats['rewards'])
 
                     batch_num_prompts += 1
                     for i in range(1, self.n_samples + 1):
-                        batch_num_passes_at_ks[i] += pass_at_ks[i]
-                    batch_num_passes_caret_k += pass_caret_k
-                    batch_pass_rate_sum += pass_rate
-                    batch_prompt_reward_sum += group_mean_reward
-                    batch_best_of_k_reward_sum += best_of_k_reward
-                    batch_reward_std_sum += reward_std_per_prompt
+                        batch_num_passes_at_ks[i] += pass_at_k_metrics['pass_at_ks'][i]
+                    batch_num_passes_caret_k += pass_at_k_metrics['pass_caret_k']
+                    batch_pass_rate_sum += pass_at_k_metrics['pass_rate']
+                    batch_prompt_reward_sum += pass_at_k_metrics['group_mean_reward']
+                    batch_best_of_k_reward_sum += pass_at_k_metrics['best_of_k_reward']
+                    batch_reward_std_sum += pass_at_k_metrics['reward_std_per_prompt']
 
                     for s in group_samples:
-                        s["pass_at_ks"] = pass_at_ks
-                        s["pass_caret_k"] = pass_caret_k
-                        s["pass_rate"] = pass_rate
-                        s["k"] = k
-                        s["group_mean_reward"] = group_mean_reward
-                        s["best_of_k_reward"] = best_of_k_reward
-                        s["reward_std_per_prompt"] = reward_std_per_prompt
+                        s["pass_at_ks"] = pass_at_k_metrics['pass_at_ks']
+                        s["pass_caret_k"] = pass_at_k_metrics['pass_caret_k']
+                        s["pass_rate"] = pass_at_k_metrics['pass_rate']
+                        s["k"] = pass_at_k_metrics['k']
+                        s["group_mean_reward"] = pass_at_k_metrics['group_mean_reward']
+                        s["best_of_k_reward"] = pass_at_k_metrics['best_of_k_reward']
+                        s["reward_std_per_prompt"] = pass_at_k_metrics['reward_std_per_prompt']
 
                     rollout_samples.extend(group_samples)
 
@@ -565,17 +553,44 @@ class VLLMRolloutEngine:
                         f"avg_pass@{i}={batch_num_passes_at_ks[i] / batch_num_prompts:.4f}"
                         for i in range(1, self.n_samples + 1)
                     )
-                    self.log(
-                        f"Batch metrics: prompts={batch_num_prompts}, "
-                        f"{pass_at_k_items}, "
-                        f"avg_pass^k={batch_num_passes_caret_k / batch_num_prompts:.4f}, "
-                        f"avg_pass_rate={batch_pass_rate_sum / batch_num_prompts:.4f}, "
-                        f"avg_reward_per_prompt={batch_prompt_reward_sum / batch_num_prompts:.4f}, "
-                        f"avg_best_of_k_reward={batch_best_of_k_reward_sum / batch_num_prompts:.4f}, "
-                        f"avg_reward_std_per_prompt={batch_reward_std_sum / batch_num_prompts:.4f}"
-                    )
+                    self.log(f"Batch metrics: prompts={batch_num_prompts}, "
+                             f"{pass_at_k_items}, "
+                             f"avg_pass^k={batch_num_passes_caret_k / batch_num_prompts:.4f}, "
+                             f"avg_pass_rate={batch_pass_rate_sum / batch_num_prompts:.4f}, "
+                             f"avg_reward_per_prompt={batch_prompt_reward_sum / batch_num_prompts:.4f}, "
+                             f"avg_best_of_k_reward={batch_best_of_k_reward_sum / batch_num_prompts:.4f}, "
+                             f"avg_reward_std_per_prompt={batch_reward_std_sum / batch_num_prompts:.4f}")
 
                 return rollout_samples
+
+    def compute_pass_metrics(self, rewards: List[float]) -> Dict[str, float]:
+        '''
+            Compute pass@k metrics for a list of rewards.
+            rewards: List of rewards for different responses to the same prompt
+            Returns: Dictionary with pass@k metrics
+        '''
+        k = len(rewards)
+        pass_at_ks = {}
+        for i in range(1, self.n_samples + 1):
+            if k == 0:
+                pass_at_ks[i] = 0.0
+            else:
+                upto = min(i, k)
+                pass_at_ks[i] = float(any(r > 0 for r in rewards[:upto]))
+
+        pass_caret_k = float(all(r > 0 for r in rewards)) if k > 0 else 0.0
+        pass_rate = float(sum(r > 0 for r in rewards) / k) if k > 0 else 0.0
+        group_mean_reward = float(sum(rewards) / k) if k > 0 else 0.0
+        best_of_k_reward = float(max(rewards)) if k > 0 else 0.0
+        reward_std_per_prompt = float(np.std(rewards)) if k > 0 else 0.0
+
+        return {"pass_at_ks": pass_at_ks,
+                "pass_caret_k": pass_caret_k,
+                "pass_rate": pass_rate,
+                "k": k,
+                "group_mean_reward": group_mean_reward,
+                "best_of_k_reward": best_of_k_reward,
+                "reward_std_per_prompt": reward_std_per_prompt}
 
     def score_response(self, prompt: Dict[str, Any], response: Any) -> torch.Tensor:
         '''
