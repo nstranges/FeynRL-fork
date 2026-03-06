@@ -18,6 +18,9 @@ class WeightSyncExtension:
             vllm's load_weights handles name remapping and tp sharding internally.
             serialized_state: file path to pickled state_dict on /dev/shm,
             or a raw dict for backward compatibility.
+
+            Returns the number of parameters in the state_dict that were loaded.
+            This is used by the caller to verify all TP workers loaded the same weights.
         '''
         if isinstance(serialized_state, str):
             with open(serialized_state, 'rb') as f:
@@ -29,8 +32,10 @@ class WeightSyncExtension:
         else:
             raise TypeError(f"Unsupported weight payload type: {type(serialized_state)}")
 
+        num_params = len(state_dict)
         self.model_runner.model.load_weights(weights=state_dict.items())
         torch.cuda.synchronize()
+        return num_params
 
     def check_weights_hash(self, param_name):
         '''

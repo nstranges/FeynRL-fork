@@ -161,10 +161,11 @@ class VLLMRolloutEngine:
                           tensor_parallel_size=self.tensor_parallel_size,
                           gpu_memory_utilization=self.gpu_memory_utilization,
                           dtype=self.model_dtype,
-                          # This enables collective_rpc("update_weights", ...) on all TP workers
-                          # for direct weight updates. If update_weights_direct is never called,
+                          # This enables collective_rpc("update_weights", ...) on all TP workers within one
+                          # rollout engine for direct weight updates. If update_weights_direct is never called,
                           # this sits idle and there is no real overhead since it is just a class
-                          # attached to the vllm worker.
+                          # attached to the vllm worker. The orchestrator in main_rl.py calls update_weights on each
+                          # rollout engine separately via ray remote so the weight sync happens at both levels.
                           worker_extension_cls="rollouts.weight_sync.WeightSyncExtension",
                           **llm_extra_kwargs)
         try:
@@ -233,10 +234,28 @@ class VLLMRolloutEngine:
         self.log(f"Updating weights directly to version {version}")
 
         try:
-            self.vllm_engine.collective_rpc("update_weights", args=(shm_path,))
+            results = self.vllm_engine.collective_rpc("update_weights", args=(shm_path,))
 
         finally:
             os.remove(shm_path)
+
+        # Verify that weights were actually updated on all tp workers.
+        # collective_rpc may silently swallow errors on non-rank-0 tp workers,
+        # which would leave some shards with stale weights. update_weights
+        # returns the number of parameters loaded where all workers should agree.
+        # collective_rpc broadcasts to all TP workers within one rollout engine
+        if results is not None:
+            if any(r is None or r == 0 for r in results):
+                failed = [i for i, r in enumerate(results) if r is None or r == 0]
+                raise RuntimeError(f"Weight sync verification failed: TP workers {failed} "
+                                   f"returned {[results[i] for i in failed]} after update_weights. "
+                                   f"Weights may be out of sync across TP shards.")
+
+            # check if all tp workers loaded the same number of parameters.
+            # it should be one, otherwise there is a problem
+            if len(set(results)) > 1:
+                raise RuntimeError(f"Weight sync verification failed: TP workers loaded different "
+                                   f"param counts: {results}. Weights may be out of sync.")
 
         self.loaded_version = version
         self.log(f"Weights updated to version {version}")
