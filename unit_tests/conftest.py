@@ -14,6 +14,7 @@ mock_modules = [
     "peft",
     "safetensors",
     "safetensors.torch",
+    "huggingface_hub",
 ]
 
 for mod in mock_modules:

@@ -10,3 +10,4 @@ pyyaml
 pydantic
 tqdm
 math-verify
+huggingface_hub
