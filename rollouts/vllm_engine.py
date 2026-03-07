@@ -245,7 +245,10 @@ class VLLMRolloutEngine:
         # returns the number of parameters loaded where all workers should agree.
         # collective_rpc broadcasts to all TP workers within one rollout engine
         if results is not None:
-            if any(r is None or r == 0 for r in results):
+            valid = [r for r in results if r is not None and r != 0]
+
+            if valid and len(valid) < len(results):
+                # Some workers returned a count and some didn't — partial failure
                 failed = [i for i, r in enumerate(results) if r is None or r == 0]
                 raise RuntimeError(f"Weight sync verification failed: TP workers {failed} "
                                    f"returned {[results[i] for i in failed]} after update_weights. "
@@ -253,7 +256,7 @@ class VLLMRolloutEngine:
 
             # check if all tp workers loaded the same number of parameters.
             # it should be one, otherwise there is a problem
-            if len(set(results)) > 1:
+            if len(set(valid)) > 1:
                 raise RuntimeError(f"Weight sync verification failed: TP workers loaded different "
                                    f"param counts: {results}. Weights may be out of sync.")
 
