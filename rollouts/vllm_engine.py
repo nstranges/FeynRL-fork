@@ -129,25 +129,27 @@ class VLLMRolloutEngine:
            Load vLLM engine with cleanup and error handling steps.
         '''
         if self.vllm_engine is not None:
-            # delete the old engine and free up memory
+            # Synchronize first so all pending cuda ops complete before teardown.
+            # pytorch and vllm execute cuda kernels asynchronously. Without this synchronization
+            # step, calling del might destroy the object reference while kernels are still
+            # actively running on the gpu, causing memory leaks.
+
+            try:
+                if torch.cuda.is_available():
+                    # Blocks the cpu until all pending gpu tasks finish.
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+
             try:
                 del self.vllm_engine
             except Exception as e:
                 print(f"Error deleting vllm_engine: {e}")
-                pass
 
             self.vllm_engine = None
-            # memory cleanup
             gc.collect()
             try:
                 torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-            # more cleanup
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
             except Exception:
                 pass
 
