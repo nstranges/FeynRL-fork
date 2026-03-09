@@ -626,6 +626,19 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 if config.train.tau is None or config.train.gamma is None or not config.model.value_model:
                     raise ValueError("tau and gamma and value_model must be specified for ppo")
 
+                # value model in ppo lives only in ds training engine memory.
+                # When using direct weight sync, only the policy is pushed to vllm and the value
+                # net is only persisted via disk checkpoints.  If checkpoint_save_interval > 1,
+                # a crash between saves loses the value model. However, we only warn users for this case.
+                # Otherwise, if we do valueerror, it would be overly restrictive for large models.
+                save_interval = config.run.checkpoint_save_interval
+                if config.run.weight_sync_method == "direct" and save_interval is not None and save_interval > 1:
+                    if rank ==0:
+                        print(f"[Config] WARNING: PPO requires checkpoint_save_interval=1 when weight_sync_method='direct' "
+                                     f"(got {save_interval}). The value model is not included in direct weight sync and "
+                                     f"can only be recovered from disk checkpoints. Set checkpoint_save_interval=1 "
+                                     f"or use weight_sync_method='disk'.")
+
             weight_sync_method = config.run.weight_sync_method
             if weight_sync_method is None:
                 raise ValueError("weight_sync_method must be specified for rl training")
