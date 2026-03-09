@@ -301,7 +301,7 @@ def merge_rollout_with_stats(rollout_lists):
             # pred_old_logprobs only contains logprob for response
             resp_logprobs = sample['pred_old_logprobs']
             total_logprob_sum += resp_logprobs.sum().item()
-            total_logprob_tokens += resp_logprobs.numel()
+            total_logprob_tokens += (sample['pred_masks'] > 0.5).sum().item()
             # other stats
             if sample.get('ended_on_eos', False):
                 total_eos += 1
