@@ -15,7 +15,7 @@ def test_compute_score_correct():
         text="Blah blah #### 42",
         token_ids=[1, 2, 3]
     )
-    r, is_per_token = compute_score(prompt_data, response_data)
+    r, is_per_token, _ = compute_score(prompt_data, response_data)
     assert not is_per_token
     assert r[-1] == 1.0
     assert r[:-1].sum() == 0.0
@@ -26,7 +26,7 @@ def test_compute_score_incorrect():
         text="Blah blah #### 43",
         token_ids=[1, 2, 3]
     )
-    r, is_per_token = compute_score(prompt_data, response_data)
+    r, is_per_token, _ = compute_score(prompt_data, response_data)
     assert r[-1] == 0.0
 
 def test_compute_score_no_format():
@@ -35,5 +35,5 @@ def test_compute_score_no_format():
         text="Blah blah no answer",
         token_ids=[1, 2, 3]
     )
-    r, is_per_token = compute_score(prompt_data, response_data)
+    r, is_per_token, _ = compute_score(prompt_data, response_data)
     assert r.sum() == 0.0

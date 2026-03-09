@@ -9,7 +9,7 @@ def test_compute_score_correct_simple():
         text="The final answer is 42",
         token_ids=[1, 2, 3, 4, 5]
     )
-    r, is_per_token = compute_score(prompt_data, response_data)
+    r, is_per_token, _ = compute_score(prompt_data, response_data)
     assert not is_per_token
     assert r[-1] == 1.0
     assert r[:-1].sum() == 0.0
@@ -20,7 +20,7 @@ def test_compute_score_correct_latex():
         text="It simplifies to $x^2 + y^2$.",
         token_ids=[1, 2, 3, 4, 5, 6]
     )
-    r, is_per_token = compute_score(prompt_data, response_data)
+    r, is_per_token, _ = compute_score(prompt_data, response_data)
     assert r[-1] == 1.0
 
 def test_compute_score_correct_greek():
@@ -29,7 +29,7 @@ def test_compute_score_correct_greek():
         text="The ratio is 3.14159, which is $\\pi$.",
         token_ids=[1, 2, 3, 4, 5, 6, 7]
     )
-    r, is_per_token = compute_score(prompt_data, response_data)
+    r, is_per_token, _ = compute_score(prompt_data, response_data)
     assert r[-1] == 1.0
 
 def test_compute_score_incorrect():
@@ -38,7 +38,7 @@ def test_compute_score_incorrect():
         text="The final answer is 43",
         token_ids=[1, 2, 3, 4, 5]
     )
-    r, is_per_token = compute_score(prompt_data, response_data)
+    r, is_per_token, _ = compute_score(prompt_data, response_data)
     assert r[-1] == 0.0
 
 def test_compute_score_boxed_gt():
@@ -47,7 +47,7 @@ def test_compute_score_boxed_gt():
         text="The answer is 42",
         token_ids=[1, 2, 3, 4, 5]
     )
-    r, is_per_token = compute_score(prompt_data, response_data)
+    r, is_per_token, _ = compute_score(prompt_data, response_data)
     assert r[-1] == 1.0
 
 def test_compute_score_empty_response():
@@ -56,6 +56,6 @@ def test_compute_score_empty_response():
         text="",
         token_ids=[]
     )
-    r, is_per_token = compute_score(prompt_data, response_data)
+    r, is_per_token, _ = compute_score(prompt_data, response_data)
     assert r.numel() == 0
     assert not is_per_token
