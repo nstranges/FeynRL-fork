@@ -164,15 +164,15 @@ def ray_get_with_timeout(refs, timeout, description, logger):
     try:
         return ray.get(refs, timeout=timeout)
 
-    except GetTimeoutError:
+    except GetTimeoutError as e:
         logger.error(f"[Timeout] {description} did not complete within {timeout}s")
-        raise RuntimeError(f"{description} timed out after {timeout}s. Check actor logs for OOM, GPU faults, or NCCL hangs.")
+        raise RuntimeError(f"{description} timed out after {timeout}s. Check actor logs for OOM, GPU faults, or NCCL hangs.") from e
 
     except RayActorError as e:
         logger.error(f"[ActorDied] {description} failed: actor died: {e}")
-        raise RuntimeError(f"{description} failed because a Ray actor died: {e}")
+        raise RuntimeError(f"{description} failed because a Ray actor died: {e}") from e
 
     # Debug remote execution failures exactly as if they had occurred locally.
     except RayTaskError as e:
         logger.error(f"[TaskError] {description} failed: {e}")
-        raise RuntimeError(f"{description} failed with a remote exception: {e}")
+        raise RuntimeError(f"{description} failed with a remote exception: {e}") from e
