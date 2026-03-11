@@ -766,8 +766,8 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             print(46*"=")
 
             # save locally
-            os.makedirs(config.run.checkpoint_dir, exist_ok=True)
-            with open(f"{config.run.checkpoint_dir}/{experiment_id}_{config.run.method}_config.yaml", "w") as f:
+            os.makedirs(f"{config.run.checkpoint_dir}/{experiment_id}", exist_ok=True)
+            with open(f"{config.run.checkpoint_dir}/{experiment_id}/{config.run.method}_config.yaml", "w") as f:
                 yaml.dump(config.model_dump(), f)
 
     except ValidationError as e:
