@@ -230,10 +230,12 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer,
                 merged_sd = merge_peft_state_dict(raw_state_dict=raw_sd,
                                                   lora_alpha=peft_config.lora_alpha,
                                                   lora_rank=peft_config.lora_rank)
-                save_state_dict_sharded(state_dict=merged_sd, save_dir=model_path)
+                save_state_dict_sharded(state_dict=merged_sd, output_dir=model_path)
+                print(f"[Alg:{label.upper()}][Rank {rank}] Saved merged PEFT model")
 
             else:
-                save_state_dict_sharded(state_dict=raw_sd, save_dir=model_path)
+                save_state_dict_sharded(state_dict=raw_sd, output_dir=model_path)
+                print(f"[Alg:{label.upper()}][Rank {rank}] Saved non-PEFT model")
 
     except Exception as e:
         save_ok = False

@@ -225,6 +225,7 @@ if __name__ == "__main__":
     # setup remote experiment tracker
     tracker = setup_tracker(config=config, rank=rank)
     logger.info(f"Config loaded. experiment_id: {config.run.experiment_id}")
+    checkpoint_save_interval = config.run.checkpoint_save_interval if config.run.checkpoint_save_interval is not None else 1
 
     ########
     # 4. load model or previous checkpoints
@@ -346,6 +347,7 @@ if __name__ == "__main__":
 
     for epoch in range(start_epoch, config.train.total_number_of_epochs):
         epoch_start_time = time.time()
+        is_last_epoch = (epoch == config.train.total_number_of_epochs - 1)
         train_sampler.set_epoch(epoch)
         # Ensure gradients are zeroed at the start of epoch to prevent any bleeding from previous epoch
         # if accumulation steps were not perfectly aligned (though we enforce alignment above).
@@ -440,8 +442,10 @@ if __name__ == "__main__":
 
         tag = f"iter{epoch+1:06d}"
         model_path = get_experiment_dir_name(output_dir=config.run.checkpoint_dir, tag=tag, experiment_id=config.run.experiment_id)
-        logger.info(f"[Epoch {epoch+1}] Saving checkpoint to {model_path}")
-        save_training_checkpoint(epoch=epoch,
+        should_save = is_last_epoch or (checkpoint_save_interval > 0 and (epoch + 1) % checkpoint_save_interval == 0)
+        if should_save:
+            logger.info(f"[Epoch {epoch+1}] Saving checkpoint to {model_path}")
+            save_training_checkpoint(epoch=epoch,
                                  global_step=global_step,
                                  model_engine=model_engine,
                                  tokenizer=tokenizer,
