@@ -8,6 +8,19 @@ All experiments are configured via YAML files validated by Pydantic schemas in `
 3. **Contrastive Learning (CL)**: `cl_args.yaml` — Direct Preference Optimization (DPO)
 4. **Evaluation**: `eval_args.yaml` — inference and scoring
 
+## Command-Line Arguments
+
+All `main_*.py` entry points accept the following arguments:
+
+| Argument | Description | Default |
+|:---|:---|:---|
+| `--config_file` | Path to the YAML config file | `"./config/myexp_rl.yaml"`|
+| `--experiment_id` | Unique experiment identifier | `"run_1"` |
+| `--log_level` | Logging level | `"INFO"` |
+| `--resume_from` | Path to a checkpoint directory to resume training (not available in `main_eval.py`) | `None` |
+
+**Resuming from a checkpoint:** The checkpoint directory must contain a `CHECKPOINT_COMPLETE` marker. The run configuration such as number of GPUs, DeepSpeed settings, etc., must exactly match the original run.
+
 ---
 
 ## `run` — Experiment Settings
@@ -98,9 +111,9 @@ All experiments are configured via YAML files validated by Pydantic schemas in `
 |:---|:---|:---|:---|
 | `tau` | GAE lambda | Float \| `null` | `0.95` |
 | `gamma` | Discount factor | Float \| `null` | `0.99` |
-| `value_lr` | Value model LR | Float \| `null` | `1e-5` |
-| `value_weight_decay` | Value model weight decay | Float \| `null` | `0.01` |
-| `value_clip_grad_norm` | Value model gradient clipping | Float \| `null` | `1.0` |
+| `value_lr` | Value model LR; defaults to policy `lr` if `null` | Float \| `null` | `1e-5` |
+| `value_weight_decay` | Value model weight decay; defaults to policy `weight_decay` if `null` | Float \| `null` | `0.01` |
+| `value_clip_grad_norm` | Value model gradient clipping; defaults to policy `clip_grad_norm` if `null` | Float \| `null` | `1.0` |
 
 ### CL/DPO-Specific
 
