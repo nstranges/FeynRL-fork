@@ -1,5 +1,6 @@
 import os
 import sys
+import glob
 import torch
 import gc
 import ray
@@ -253,8 +254,13 @@ class VLLMRolloutEngine:
         # collective_rpc broadcasts to all TP workers within one rollout engine
         if results is not None:
             valid = [r for r in results if r is not None and r != 0]
+            # Complete failure when all workers returned None or 0
+            if not valid:
+                raise RuntimeError(f"Weight sync verification failed: all {len(results)} TP workers "
+                                   f"returned {results} after update_weights. No parameters were loaded. "
+                                   f"This likely means load_weights silently failed on all shards.")
 
-            if valid and len(valid) < len(results):
+            if len(valid) < len(results):
                 # Some workers returned a count and some didn't — partial failure
                 failed = [i for i, r in enumerate(results) if r is None or r == 0]
                 raise RuntimeError(f"Weight sync verification failed: TP workers {failed} "
