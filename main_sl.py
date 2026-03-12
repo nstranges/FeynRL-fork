@@ -1,6 +1,4 @@
 import os
-import random
-import numpy as np
 import argparse
 import deepspeed
 import torch
@@ -13,11 +11,12 @@ import time
 from peft import get_peft_model, LoraConfig
 
 # imports local methods, classes, etc.
-import configs.load as cfg# all config arguments
+import configs.load as cfg # all config arguments
 from data_feeds.paired import PairedFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
 from misc.logging import setup_logging, setup_tracker
+from misc.checkpoint_utils import resume_from_checkpoint, save_training_checkpoint, cleanup_incomplete_checkpoints
 
 
 Algorithm_Registry = {
@@ -200,9 +199,10 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
 if __name__ == "__main__":
     # parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config-file", type=str, default="./config/dummy.yaml", help="config file")
+    parser.add_argument("--config_file", type=str, default="./config/dummy.yaml", help="config file")
     parser.add_argument("--experiment_id", type=str, default="run_1", help="experiment id")
-    parser.add_argument("--log-level", type=str, default="INFO", help="logging level")
+    parser.add_argument("--log_level", type=str, default="INFO", help="logging level")
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to a checkpoint to resume training. It must contain a CHECKPOINT_COMPLETE marker.")
     args = parser.parse_args()
 
     ########
@@ -309,6 +309,20 @@ if __name__ == "__main__":
             f"Adjust configuration. Remainder: {remainder}"
         )
 
+    ########
+    # 8a. Resume from checkpoint
+    ########
+    start_epoch = 0
+    global_step = 0
+    if args.resume_from:
+        start_epoch, global_step = resume_from_checkpoint(resume_path=args.resume_from,
+                                                          model_engine=model_engine,
+                                                          world_size=world_size,
+                                                          logger=logger)
+
+    experiment_dir = os.path.join(config.run.checkpoint_dir, config.run.experiment_id)
+    cleanup_incomplete_checkpoints(experiment_dir=experiment_dir, rank=rank, logger=logger)
+
     logger.info("=" * 50)
     logger.info(f"Starting training: {config.train.total_number_of_epochs} epochs")
     logger.info(
@@ -321,18 +335,21 @@ if __name__ == "__main__":
         f"batch_size_per_gpu={config.train.train_batch_size_per_gpu} | "
         f"global_batch_size={config.train.train_batch_size_per_gpu * config.train.gradient_accumulation_steps * world_size}"
     )
+    if args.resume_from:
+        logger.info(f"Resuming from: {args.resume_from} (epoch {start_epoch + 1}/{config.train.total_number_of_epochs})")
     logger.info("=" * 50)
-    global_step = 0
+
     # Sync before starting
     # Ensure all nodes have loaded the model and data before anyone starts iterating
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    for epoch in range(config.train.total_number_of_epochs):
+    for epoch in range(start_epoch, config.train.total_number_of_epochs):
         epoch_start_time = time.time()
         train_sampler.set_epoch(epoch)
         # Ensure gradients are zeroed at the start of epoch to prevent any bleeding from previous epoch
         # if accumulation steps were not perfectly aligned (though we enforce alignment above).
+        model_engine.train()
         model_engine.optimizer.zero_grad()
 
         ########
@@ -418,39 +435,22 @@ if __name__ == "__main__":
         ########
         # 8.3 Save checkpoint
         ########
-        # Sync before saving to ensure no one is still writing
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
         tag = f"iter{epoch+1:06d}"
         model_path = get_experiment_dir_name(output_dir=config.run.checkpoint_dir, tag=tag, experiment_id=config.run.experiment_id)
         logger.info(f"[Epoch {epoch+1}] Saving checkpoint to {model_path}")
-
-        # Save as HuggingFace format
-        if config.peft.use_peft:
-            # All ranks must participate in GatheredParameters for ZeRO-3,
-            # but only rank 0 writes the adapter weights to disk.
-            peft_params = [p for p in model_engine.module.parameters() if p.requires_grad]
-            with deepspeed.zero.GatheredParameters(peft_params, modifier_rank=0):
-                if rank == 0:
-                    model_engine.module.save_pretrained(model_path)
-        else:
-            model_engine.save_16bit_model(model_path)
-
-        # Barrier to ensure all ranks finished writing before rank 0 saves config
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
-        # Save model config and tokenizer on rank 0 only
-        if rank == 0:
-            if hasattr(model_engine.module, 'config'):
-                model_engine.module.config.save_pretrained(model_path)
-            tokenizer.save_pretrained(model_path)
-            logger.info(f"[Epoch {epoch+1}] Model config and tokenizer saved")
-
-        # Wait for saving to complete on all ranks
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        save_training_checkpoint(epoch=epoch,
+                                 global_step=global_step,
+                                 model_engine=model_engine,
+                                 tokenizer=tokenizer,
+                                 model_path=model_path,
+                                 peft_config=config.peft,
+                                 rank=rank,
+                                 world_size=world_size,
+                                 logger=logger,
+                                 label="sl")
 
     logger.info("Training completed successfully!")
 
