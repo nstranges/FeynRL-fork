@@ -72,7 +72,7 @@ For RL, Ray orchestrates the full training loop: it schedules DeepSpeed training
 🛠️ **[Installation & Setup](docs/INSTALL.md)**
 Read the guide to configure your environment and dependencies.
 
-🚀 **[Usage & Examples](experiments/README.md)**
+🚀 **[Usage & Examples](docs/HOWTO.md)**
 Learn how to launch jobs and run experiments.
 
 ⚙️ **[Configuration Reference](configs/README.md)**
