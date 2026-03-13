@@ -303,12 +303,10 @@ if __name__ == "__main__":
     if micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
         remainder = micro_batches_per_epoch % config.train.gradient_accumulation_steps
         # raising error to enforce correctness
-        raise ValueError(
-            f"micro_batches_per_epoch ({micro_batches_per_epoch}) MUST be divisible by "
-            f"gradient_accumulation_steps ({config.train.gradient_accumulation_steps}) to ensure "
-            "all gradients are applied within the epoch boundaries. "
-            f"Adjust configuration. Remainder: {remainder}"
-        )
+        raise ValueError(f"micro_batches_per_epoch ({micro_batches_per_epoch}) MUST be divisible by "
+                         f"gradient_accumulation_steps ({config.train.gradient_accumulation_steps}) to ensure "
+                         "all gradients are applied within the epoch boundaries. "
+                         f"Adjust configuration. Remainder: {remainder}")
 
     ########
     # 8a. Resume from checkpoint
@@ -324,18 +322,28 @@ if __name__ == "__main__":
     experiment_dir = os.path.join(config.run.checkpoint_dir, config.run.experiment_id)
     cleanup_incomplete_checkpoints(experiment_dir=experiment_dir, rank=rank, logger=logger)
 
+    # Use ds_numel for ZeRO-3 partitioned params, numel() for non-ZeRO
+    total_params = sum(getattr(p, 'ds_numel', p.numel()) for p in model_engine.module.parameters())
+    trainable_params = sum(getattr(p, 'ds_numel', p.numel()) for p in model_engine.module.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+
     logger.info("=" * 50)
     logger.info(f"Starting training: {config.train.total_number_of_epochs} epochs")
-    logger.info(
-        f"Train set: {len(train_dataloader.dataset)} samples | "
-        f"micro_batches/epoch={micro_batches_per_epoch} | "
-        f"optimizer_steps/epoch={optimizer_steps_per_epoch} | "
-        f"grad_accum={config.train.gradient_accumulation_steps}"
-    )
-    logger.info(
-        f"batch_size_per_gpu={config.train.train_batch_size_per_gpu} | "
-        f"global_batch_size={config.train.train_batch_size_per_gpu * config.train.gradient_accumulation_steps * world_size}"
-    )
+    logger.info(f"Train set: {len(train_dataloader.dataset)} samples | micro_batches/epoch={micro_batches_per_epoch} | "
+                f"optimizer_steps/epoch={optimizer_steps_per_epoch} | grad_accum={config.train.gradient_accumulation_steps}")
+    logger.info(f"batch_size_per_gpu={config.train.train_batch_size_per_gpu} | "
+                f"global_batch_size={config.train.train_batch_size_per_gpu * config.train.gradient_accumulation_steps * world_size}")
+
+    if config.peft.use_peft:
+        logger.info(f"Model: {config.model.name} | PEFT: {config.peft.peft_type} | "
+                    f"params: {total_params:,} total, {trainable_params:,} peft ({100*trainable_params/total_params:.2f}%), "
+                    f"{frozen_params:,} frozen | checkpoint_save_interval: {checkpoint_save_interval}")
+
+    else:
+        logger.info(f"Model: {config.model.name} | PEFT: off | "
+                    f"params: {total_params:,} total, {trainable_params:,} trainable | "
+                    f"checkpoint_save_interval: {checkpoint_save_interval}")
+
     if args.resume_from:
         logger.info(f"Resuming from: {args.resume_from} (epoch {start_epoch + 1}/{config.train.total_number_of_epochs})")
     logger.info("=" * 50)
@@ -345,6 +353,7 @@ if __name__ == "__main__":
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
+    training_start_time = time.time()
     for epoch in range(start_epoch, config.train.total_number_of_epochs):
         epoch_start_time = time.time()
         is_last_epoch = (epoch == config.train.total_number_of_epochs - 1)
@@ -365,6 +374,8 @@ if __name__ == "__main__":
         # micro_batches_per_epoch = number of micro-batch iterations per epoch.
         # This allows processing a subset of the data per epoch (useful for large datasets).
         # Optimizer steps per epoch = micro_batches_per_epoch // gradient_accumulation_steps
+        epoch_loss_sum = 0.0
+        epoch_step_count = 0
 
         for step, micro_batch in enumerate(progress_bar):
             # Move batch to gpu (deepspeed engine device)
@@ -372,6 +383,8 @@ if __name__ == "__main__":
 
             # Run one train step for micro-batch.
             metric = alg.train_step(micro_batch)
+            epoch_loss_sum += metric['loss']
+            epoch_step_count += 1
 
             # Only increment global_step when ds actually updates weights
             if model_engine.is_gradient_accumulation_boundary():
@@ -381,10 +394,11 @@ if __name__ == "__main__":
             if rank == 0:
                 progress_bar.set_postfix(loss=metric['loss'])
 
-
                 if tracker and model_engine.is_gradient_accumulation_boundary():
+                    current_lr = optimizer.param_groups[0]['lr']
                     tracker.log_metrics({
                         "train/loss": metric['loss'],
+                        "train/lr": current_lr,
                     }, step=global_step)
 
         # Sync before validation to ensure consistent state
@@ -392,7 +406,11 @@ if __name__ == "__main__":
             torch.distributed.barrier()
 
         epoch_time = time.time() - epoch_start_time
-        logger.info(f"Epoch {epoch+1}/{config.train.total_number_of_epochs} completed in {epoch_time:.2f} seconds")
+        avg_train_loss = epoch_loss_sum / epoch_step_count if epoch_step_count > 0 else 0.0
+        gpu_mem_gb = torch.cuda.max_memory_allocated(model_engine.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
+        logger.info(f"Epoch {epoch+1}/{config.train.total_number_of_epochs} completed in {epoch_time:.2f}s | "
+                    f"avg_train_loss: {avg_train_loss:.4f} | global_step: {global_step} | "
+                    f"lr: {optimizer.param_groups[0]['lr']:.2e} | gpu_peak_mem: {gpu_mem_gb:.2f}GB")
 
         # Clear graph and to reclaim fragmented memory from training ONCE per epoch
         torch.cuda.empty_cache()
@@ -406,6 +424,7 @@ if __name__ == "__main__":
         local_loss_sum   = torch.tensor(0.0, device=model_engine.device)
         local_token_count = torch.tensor(0.0, device=model_engine.device)
 
+        val_start_time = time.time()
         val_iter = tqdm(val_dataloader, desc="Validation", disable=(rank != 0))
         model_engine.eval()
         with torch.no_grad():
@@ -427,12 +446,11 @@ if __name__ == "__main__":
         else:
             global_avg_loss = (local_loss_sum / local_token_count).item()
 
+        val_time = time.time() - val_start_time
+        logger.info(f"Epoch {epoch+1}, val_loss: {global_avg_loss:.4f} | val_time: {val_time:.2f}s")
         if rank == 0:
-            print(f"Epoch {epoch+1}, Validation Loss: {global_avg_loss}")
             if tracker:
-                tracker.log_metrics({
-                    "val/loss": global_avg_loss,
-                }, step=global_step)
+                tracker.log_metrics({"val/loss": global_avg_loss}, step=global_step)
 
         ########
         # 8.3 Save checkpoint
@@ -446,17 +464,18 @@ if __name__ == "__main__":
         if should_save:
             logger.info(f"[Epoch {epoch+1}] Saving checkpoint to {model_path}")
             save_training_checkpoint(epoch=epoch,
-                                 global_step=global_step,
-                                 model_engine=model_engine,
-                                 tokenizer=tokenizer,
-                                 model_path=model_path,
-                                 peft_config=config.peft,
-                                 rank=rank,
-                                 world_size=world_size,
-                                 logger=logger,
-                                 label="sl")
+                                     global_step=global_step,
+                                     model_engine=model_engine,
+                                     tokenizer=tokenizer,
+                                     model_path=model_path,
+                                     peft_config=config.peft,
+                                     rank=rank,
+                                     world_size=world_size,
+                                     logger=logger,
+                                     label="sl")
 
-    logger.info("Training completed successfully!")
+    total_training_time = time.time() - training_start_time
+    logger.info(f"Training completed successfully! Total time: {total_training_time:.2f}s ({total_training_time/3600:.2f}h)")
 
     # End experiment tracker run
     if tracker:
