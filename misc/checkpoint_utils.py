@@ -301,15 +301,16 @@ def cleanup_incomplete_checkpoints(experiment_dir, rank, logger):
         These are leftovers from crashed runs and are not safe to resume from.
         Must be called on all ranks (rank 0 does the deletion, then barrier).
     '''
-    if not os.path.isdir(experiment_dir):
-        return
+    if os.path.isdir(experiment_dir):
+        for entry in os.listdir(experiment_dir):
+            ckpt_path = os.path.join(experiment_dir, entry)
 
-    for entry in os.listdir(experiment_dir):
-        ckpt_path = os.path.join(experiment_dir, entry)
-        if os.path.isdir(ckpt_path) and not os.path.exists(os.path.join(ckpt_path, "CHECKPOINT_COMPLETE")):
-            if rank == 0:
-                logger.warning(f"Removing incomplete checkpoint: {ckpt_path}")
-                shutil.rmtree(ckpt_path, ignore_errors=True)
+            if os.path.isdir(ckpt_path) and not os.path.exists(os.path.join(ckpt_path, "CHECKPOINT_COMPLETE")):
+                if rank == 0:
+                    logger.warning(f"Removing incomplete checkpoint: {ckpt_path}")
+                    shutil.rmtree(ckpt_path, ignore_errors=True)
 
+    # Barrier must always be reached by all ranks, even when the directory
+    # doesn't exist on some ranks, for example nfs propagation delay, to avoid deadlock.
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
