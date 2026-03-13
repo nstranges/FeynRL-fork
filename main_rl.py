@@ -893,11 +893,15 @@ def load_checkpoint_for_resume(resume_path,
     # Sync resumed policy to rollout engines so they match the training policy
     success = False
     if weight_sync_method == "direct":
-        success = sync_weights_direct(training_engines=training_engines,
-                                      rollout_engines=rollout_engines,
-                                      version=policy_version,
-                                      logger=logger,
-                                      sync_timeout=sync_timeout)
+        try:
+            success = sync_weights_direct(training_engines=training_engines,
+                                          rollout_engines=rollout_engines,
+                                          version=policy_version,
+                                          logger=logger,
+                                          sync_timeout=sync_timeout)
+        except Exception as e:
+            logger.warning(f"[Resume] Direct sync raised {e}, falling back to disk refresh")
+            success = False
 
         if not success:
             logger.warning("[Resume] Direct sync failed, falling back to disk refresh")
