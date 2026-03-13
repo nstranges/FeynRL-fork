@@ -312,15 +312,32 @@ class COMMON:
         status = True
         try:
             if rank == 0:
-                if hasattr(self.policy_engine.module, 'config'):
-                    self.policy_engine.module.config.save_pretrained(output_dir)
+                # When PEFT is active, self.policy_engine.module is a PeftModel.
+                # We must save the underlying base model's config so vllm can
+                # load the merged checkpoint without peft specific fields.
+                model_module = self.policy_engine.module
+                if self.peft_config.use_peft and hasattr(model_module, 'get_base_model'):
+                    base_config = model_module.get_base_model().config
+
+                elif hasattr(model_module, 'config'):
+                    base_config = model_module.config
+
+                else:
+                    base_config = None
+
+                if base_config is not None:
+                    base_config.save_pretrained(output_dir)
                     print(f"[Alg:{self.alg_name}][Rank {rank}] Policy config saved")
 
                 else:
                     print(f"[Alg:{self.alg_name}][Rank {rank}] WARNING: Could not find model config to save for policy")
 
                 # Save generation_config.json if available. This is needed by some hf pipelines or vllm.
-                gen_cfg = getattr(self.policy_engine.module, 'generation_config', None)
+                gen_cfg = getattr(model_module, 'generation_config', None)
+                # For peft, generation_config lives on the base model.
+                if gen_cfg is None and hasattr(model_module, 'get_base_model'):
+                    gen_cfg = getattr(model_module.get_base_model(), 'generation_config', None)
+
                 if gen_cfg is not None:
                     gen_cfg.save_pretrained(output_dir)
                     print(f"[Alg:{self.alg_name}][Rank {rank}] Generation config saved")
@@ -610,6 +627,14 @@ class COMMON:
             Python/NumPy/PyTorch/CUDA random generator state.
         '''
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+        # Create the directory from inside the actor (rank 0) rather than from the driver
+        # to avoid NFS metadata propagation races on multi-node clusters.
+        if rank == 0:
+            os.makedirs(engine_state_dir, exist_ok=True)
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
         client_state = {'rng_python': random.getstate(),
                         'rng_numpy': np.random.get_state(),
