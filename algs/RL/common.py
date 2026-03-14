@@ -17,6 +17,103 @@ class COMMON:
         This class provides common functions for policy gradient algorithms.
         Only contains methods that are 100% identical across all PG algorithms.
     '''
+    def policy_forward(self, input_ids, att_mask, pos_ids):
+        '''
+            input_ids and att_mask are [B, T]
+            pos_ids is [B, T] or None
+            Returns:
+                logits is [B, T-1, vocab_size]
+                entropies is [B, T-1]
+        '''
+        # if pos_ids is not provided, HF will add that automatically.
+        if pos_ids is not None:
+            pos_ids = pos_ids.to(input_ids.device)
+
+        # feed data to model
+        # use_cache=False: KV cache is never useful during training
+        output = self.policy_engine(input_ids=input_ids,
+                                   attention_mask=att_mask,
+                                   position_ids=pos_ids,
+                                   use_cache=False)
+
+        # [B, T, V] -> [B, T-1, V]
+        logits = output.logits[:, :-1, :].contiguous()
+        B, T_minus_1, vocab_size = logits.shape
+
+        # [B, T] -> [B, T-1]
+        target_ids = input_ids[:, 1:].contiguous()
+
+        # cross_entropy return -logprobs but we need logprobs
+        # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
+        # target_ids is [B, T-1] --> [B * (T-1)]
+        # Compute token logprobs in float32 to avoid bf16/fp16 quantization
+        neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
+        logprobs = -neg_logprobs.view(B, T_minus_1)
+        # we can also do this, but it is less efficient I guess
+        #   logprobs = logits.log_softmax(dim=-1)
+        #   logprobs = torch.gather(logprobs, dim=-1, index=target_ids)
+
+        entropies = None
+        if self.ent_coeff > 0.0:
+            entropies = torch.distributions.Categorical(logits=logits.to(torch.float32)).entropy()
+
+        return logprobs, entropies, target_ids
+
+    def ref_forward(self, input_ids, att_mask, pos_ids):
+        '''
+            input_ids and att_mask are [B, T]
+            pos_ids is [B, T] or None
+            Returns:
+                ref_logprobs is [B, T-1]
+        '''
+        # feed data to model
+        with torch.no_grad():
+            if pos_ids is not None:
+                pos_ids = pos_ids.to(input_ids.device)
+
+            # use_cache=False: full-sequence forward
+            output = self.ref_model_engine(input_ids=input_ids,
+                                           attention_mask=att_mask,
+                                           position_ids=pos_ids,
+                                           use_cache=False)
+
+            # [B, T, V] -> [B, T-1, V]
+            logits = output.logits[:, :-1, :].contiguous()
+            B, T_minus_1, vocab_size = logits.shape
+
+            # [B, T] -> [B, T-1]
+            target_ids = input_ids[:, 1:].contiguous()
+
+            # cross_entropy return -logprobs but we need logprobs
+            # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
+            # target_ids is [B, T-1] --> [B * (T-1)]
+            # Match policy path: keep logprob computation in float32 for KL stability.
+            neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
+            ref_logprobs = -neg_logprobs.view(B, T_minus_1)
+
+        return ref_logprobs
+
+    def compute_kl_distance(self, logprobs, ref_logprobs):
+        '''
+            Compute KL divergence between two policies.
+            using var_reduced form:
+            kl = E[log pi/pi_ref] + pi_ref/pi - 1
+        '''
+        # [B, T-1]
+        # Perform KL math in float32 for numerical stability under bf16/fp16.
+        logprobs = logprobs.to(torch.float32)
+        ref_logprobs = ref_logprobs.to(torch.float32)
+
+        log_ratio = logprobs - ref_logprobs
+        # pi_ref/pi = exp(ref_logprobs - logprobs)
+        exponent = ref_logprobs - logprobs
+        if exponent.max().item() > 10.0:
+            print(f"[WARNING] compute_kl_distance: extreme divergence detected, max exponent={exponent.max().item():.1f}")
+
+        ratio_inv = torch.exp(exponent)
+        kl_dist = log_ratio + ratio_inv - 1
+        return kl_dist
+
     def load_single_model(self, model_path: str, dtype: torch.dtype, model_name: str):
         '''
             Helper to load a single model from HuggingFace.
@@ -157,103 +254,6 @@ class COMMON:
                                                     config=value_ds_dict
                                                     )
             print(f"[Alg:{self.alg_name}][Rank {rank}] Value model initialized with DeepSpeed")
-
-    def policy_forward(self, input_ids, att_mask, pos_ids):
-        '''
-            input_ids and att_mask are [B, T]
-            pos_ids is [B, T] or None
-            Returns:
-                logits is [B, T-1, vocab_size]
-                entropies is [B, T-1]
-        '''
-        # if pos_ids is not provided, HF will add that automatically.
-        if pos_ids is not None:
-            pos_ids = pos_ids.to(input_ids.device)
-
-        # feed data to model
-        # use_cache=False: KV cache is never useful during training
-        output = self.policy_engine(input_ids=input_ids,
-                                   attention_mask=att_mask,
-                                   position_ids=pos_ids,
-                                   use_cache=False)
-
-        # [B, T, V] -> [B, T-1, V]
-        logits = output.logits[:, :-1, :].contiguous()
-        B, T_minus_1, vocab_size = logits.shape
-
-        # [B, T] -> [B, T-1]
-        target_ids = input_ids[:, 1:].contiguous()
-
-        # cross_entropy return -logprobs but we need logprobs
-        # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
-        # target_ids is [B, T-1] --> [B * (T-1)]
-        # Compute token logprobs in float32 to avoid bf16/fp16 quantization
-        neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
-        logprobs = -neg_logprobs.view(B, T_minus_1)
-        # we can also do this, but it is less efficient I guess
-        #   logprobs = logits.log_softmax(dim=-1)
-        #   logprobs = torch.gather(logprobs, dim=-1, index=target_ids)
-
-        entropies = None
-        if self.ent_coeff > 0.0:
-            entropies = torch.distributions.Categorical(logits=logits.to(torch.float32)).entropy()
-
-        return logprobs, entropies, target_ids
-
-    def ref_forward(self, input_ids, att_mask, pos_ids):
-        '''
-            input_ids and att_mask are [B, T]
-            pos_ids is [B, T] or None
-            Returns:
-                ref_logprobs is [B, T-1]
-        '''
-        # feed data to model
-        with torch.no_grad():
-            if pos_ids is not None:
-                pos_ids = pos_ids.to(input_ids.device)
-
-            # use_cache=False: full-sequence forward
-            output = self.ref_model_engine(input_ids=input_ids,
-                                           attention_mask=att_mask,
-                                           position_ids=pos_ids,
-                                           use_cache=False)
-
-            # [B, T, V] -> [B, T-1, V]
-            logits = output.logits[:, :-1, :].contiguous()
-            B, T_minus_1, vocab_size = logits.shape
-
-            # [B, T] -> [B, T-1]
-            target_ids = input_ids[:, 1:].contiguous()
-
-            # cross_entropy return -logprobs but we need logprobs
-            # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
-            # target_ids is [B, T-1] --> [B * (T-1)]
-            # Match policy path: keep logprob computation in float32 for KL stability.
-            neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
-            ref_logprobs = -neg_logprobs.view(B, T_minus_1)
-
-        return ref_logprobs
-
-    def compute_kl_distance(self, logprobs, ref_logprobs):
-        '''
-            Compute KL divergence between two policies.
-            using var_reduced form:
-            kl = E[log pi/pi_ref] + pi_ref/pi - 1
-        '''
-        # [B, T-1]
-        # Perform KL math in float32 for numerical stability under bf16/fp16.
-        logprobs = logprobs.to(torch.float32)
-        ref_logprobs = ref_logprobs.to(torch.float32)
-
-        log_ratio = logprobs - ref_logprobs
-        # pi_ref/pi = exp(ref_logprobs - logprobs)
-        exponent = ref_logprobs - logprobs
-        if exponent.max().item() > 10.0:
-            print(f"[WARNING] compute_kl_distance: extreme divergence detected, max exponent={exponent.max().item():.1f}")
-
-        ratio_inv = torch.exp(exponent)
-        kl_dist = log_ratio + ratio_inv - 1
-        return kl_dist
 
     def save_checkpoint(self, output_dir: str, tag: str, value_output_dir: str = None):
         '''
