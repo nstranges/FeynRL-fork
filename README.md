@@ -6,9 +6,9 @@
 
 <p align="center">
   <a href="https://github.com/boson-ai/FeynRL"><img src="https://img.shields.io/badge/GitHub-FeynRL-181717?style=flat-square&logo=github" alt="GitHub"></a>&nbsp;
-  <a href="https://rasoolfa.github.io"><img src="https://img.shields.io/badge/Blog-FeynRL-4285F4?style=flat-square&logo=googlechrome&logoColor=white" alt="Blog"></a>&nbsp;
+  <a href="https://rasoolfa.github.io"><img src="https://img.shields.io/badge/Blog-FeynRL-E65100?style=flat-square&logo=googlechrome&logoColor=white" alt="Blog"></a>&nbsp;
   <a href="https://discord.gg/HQE9TVXCNS"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>&nbsp;
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-2E7D32?style=flat-square" alt="License"></a>
 </p>
 
 ---
@@ -55,7 +55,7 @@ For a more detailed breakdown, see the **[Architecture Overview](docs/ARCHITECTU
 - 🖥️ **Distributed training**: Multi-GPU and multi-node via DeepSpeed (ZeRO Stage 1/2/3)
 - 🎲 **Rollouts / inference**: vLLM-powered rollout engines with tensor parallelism
 - 🛰️ **Orchestration**: Ray for scheduling training and rollout workers across nodes
-- 🔁 **Training↔rollout scheduling**: Sync and Async modes to further improve throughput
+- 🔀 **Training↔rollout scheduling**: Sync and Async modes to further improve throughput
 - 🔄 **Weight sync**: Fast in-memory transfer with disk fallback
 - 🧷 **Parameter-efficient fine-tuning**: LoRA via PEFT
 - 📈 **Experiment tracking**: MLflow and Weights & Biases support
@@ -85,7 +85,3 @@ Contributions are welcome! Please see our **[Contributing Guidelines](CONTRIBUTI
 ## FAQ
 
 Check out the [FAQ](docs/FAQ.md) for common questions and answers.
-
-## Acknowledgments
-
-Some components of this codebase are inspired by practices from open source projects. We try to cite sources wherever we directly reuse exact code. If we missed a citation, please let us know and we will credit the source.
