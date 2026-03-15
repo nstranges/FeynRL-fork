@@ -1385,7 +1385,7 @@ if __name__ == "__main__":
         logger.info(f"[Epoch {epoch+1}] Training complete: time={train_time:.2f}s, "
                     f"avg_loss={epoch_avg.get('loss_total', 0.0):.4f}, "
                     f"avg_kl_ref={epoch_avg.get('kl_ref', 0.0):.4f}, "
-                    f"avg_kl_old={epoch_avg.get('kl_old', 0.0):.6f}, "
+                    f"avg_approx_kl={epoch_avg.get('approx_kl', 0.0):.6f}, "
                     f"lr={current_lr:.2e}, gpu_peak_mem={gpu_mem_gb:.2f}GB")
 
         if tracker:
