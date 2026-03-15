@@ -2,10 +2,20 @@ import os
 import json
 import torch
 import torch.nn as nn
-from types import SimpleNamespace
+from dataclasses import dataclass
 from peft import PeftModel, get_peft_model, LoraConfig
 from transformers import AutoModelForCausalLM, AutoConfig
 from safetensors.torch import load_file
+
+@dataclass
+class ValueOutput:
+    '''
+        Typed return object for ValueNetwork.forward(). Using a dataclass instead
+        of SimpleNamespace as SimpleNamespace is opaque to DeepSpeed and triggers:
+        e.g, A module has unknown inputs or outputs type.
+        dataclass is introspectable via its fields, so ds zero-3 can find the logits tensor and hook correctly.
+    '''
+    logits: torch.Tensor
 
 class ValueNetwork(nn.Module):
     '''
@@ -51,7 +61,7 @@ class ValueNetwork(nn.Module):
     def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
         '''
             input_ids, attention_mask, position_ids: [B, T]
-            return: SimpleNamespace(logits=[B, T, 1])
+            return: ValueOutput(logits=[B, T, 1])
         '''
         # [B, T, hidden_dim]
         outputs = self.backbone(input_ids=input_ids,
@@ -74,7 +84,7 @@ class ValueNetwork(nn.Module):
         # Since ValueModel uses a custom head, we need something that also has .logits 
         # so value_forward can do output.logits without caring whether it's a policy model or value model
         # and to be consistent with the policy model's forward pass.
-        return SimpleNamespace(logits=values)
+        return ValueOutput(logits=values)
 
     def gradient_checkpointing_enable(self):
         '''
