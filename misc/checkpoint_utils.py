@@ -99,8 +99,8 @@ def merge_peft_state_dict(raw_state_dict, lora_alpha, lora_rank):
 
     for module_path in lora_a:
         if module_path not in lora_b:
-            print(f"[WARNING] merge_peft_state_dict: found lora_A but no lora_B for {module_path}")
-            continue
+            raise RuntimeError(f"merge_peft_state_dict: found lora_A but no lora_B for {module_path}. "
+                               f"State dict is corrupt or incomplete.")
 
         A = lora_a[module_path]  # [r, D]
         B = lora_b[module_path]  # [H, r]
@@ -116,7 +116,7 @@ def merge_peft_state_dict(raw_state_dict, lora_alpha, lora_rank):
 
         else:
             raise RuntimeError(f"merge_peft_state_dict: no base weight found for {module_path}, "
-                               f"LoRA delta would be silently dropped. Look for before merging: ")
+                               f"LoRA delta would be silently dropped.")
 
     # 3. Remap names: strip peft_prefix and .base_layer suffix
     for peft_name, tensor in base_weights.items():
