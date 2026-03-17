@@ -57,6 +57,8 @@ def save_state_dict_sharded(state_dict, output_dir, max_shard_size="5GB"):
 
         with open(os.path.join(output_dir, "model.safetensors.index.json"), "w") as f:
             json.dump(index, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
 
 
 def merge_peft_state_dict(raw_state_dict, lora_alpha, lora_rank):
