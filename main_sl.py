@@ -19,10 +19,9 @@ from misc.logging import setup_logging, setup_tracker
 from misc.checkpoint_utils import resume_from_checkpoint, save_training_checkpoint, cleanup_incomplete_checkpoints
 
 
-Algorithm_Registry = {
-    # supported algorithms
-    'sft': ('algs.SFT.sft', 'SFT'),
-}
+Algorithm_Registry = {# supported algorithms
+                     'sft': ('algs.SFT.sft', 'SFT'),
+                     }
 
 def init_rank_world_size():
     '''
