@@ -194,7 +194,7 @@ class VLLMRolloutEngineAsync:
 
     def run_async(self, coro):
         '''
-            Run an async coroutine on the background event loop and wait for result.
+            Run an async on the background event loop and wait for result.
             Bridges the sync Ray actor method with async vllm calls.
         '''
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -656,9 +656,9 @@ class VLLMRolloutEngineAsync:
             collective_rpc broadcasts to all tp workers simultaneously.
             Each worker computes its own rank as rank_offset + tp_rank internally.
         '''
-        results = self.async_engine.collective_rpc( "init_weight_sync_group",
-            args=(master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds)
-        )
+        results = self.async_engine.collective_rpc( "init_weight_nccl_group",
+                                                   args=(master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds)
+                                                  )
         self.log(f"NCCL weight sync group initialized (rank_offset={rank_offset}, tp={self.tensor_parallel_size})")
         return all(r for r in results if r is not None)
 
@@ -676,8 +676,7 @@ class VLLMRolloutEngineAsync:
             the non-NCCL driver). The two paths are never mixed in the same run.
         '''
         results = self.async_engine.collective_rpc("update_weights_nccl", 
-                                                   args=(param_name, dtype_str, 
-                                                         tuple(shape), empty_cache))
+                                                   args=(param_name, dtype_str, tuple(shape), empty_cache))
         return results
 
     def finalize_weight_nccl(self, version):
@@ -695,7 +694,7 @@ class VLLMRolloutEngineAsync:
             Destroy the NCCL weight sync group on all TP workers.
         '''
         try:
-            self.async_engine.collective_rpc("close_weight_sync_group")
+            self.async_engine.collective_rpc("close_weight_nccl_group")
         except Exception:
             pass
 

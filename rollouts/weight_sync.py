@@ -64,7 +64,7 @@ class WeightSyncExtension:
                 return param.data.float().sum().item()
         return None
 
-    def init_weight_sync_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds):
+    def init_weight_nccl_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds):
         '''
             Initialize a custom NCCL process group for direct gpu-to-gpu broadcast.
             This group connects training rank 0 (rank=0) to all vllm TP workers
@@ -126,7 +126,7 @@ class WeightSyncExtension:
 
         return 1
 
-    def close_weight_sync_group(self):
+    def close_weight_nccl_group(self):
         '''
             Destroy the custom NCCL process group which is called during shutdown.
         '''
