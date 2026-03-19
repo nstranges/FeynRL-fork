@@ -4,7 +4,7 @@ from torch.distributed.distributed_c10d import (
     )
 from datetime import timedelta
 
-def create_nccl_process_group(init_method, rank, world_size, group_name, timeout_minutes=30):
+def create_nccl_process_group(init_method, rank, world_size, group_name, timeout_seconds):
     '''
         Create an NCCL process group for weight broadcast between training rank 0
         and vllm rollout workers. We can't reuse ds's or vllm's groups because
@@ -12,7 +12,7 @@ def create_nccl_process_group(init_method, rank, world_size, group_name, timeout
         (_new_process_group_helper) instead of init_process_group() to avoid overwriting
         the default process group that ds and vllm depend on.
     '''
-    timeout = timedelta(minutes=timeout_minutes)
+    timeout = timedelta(seconds=timeout_seconds)
 
     # All participants connect to a shared TCP store and wait for world_size peers
     rendezvous_iterator = rendezvous(url=init_method, rank=rank, world_size=world_size, timeout=timeout)
