@@ -49,6 +49,7 @@ class P3O(COMMON):
 
         # policy related parameters
         self.kl_coeff = float(kl_coeff)
+        # p3o does not use clip_low and clip_high in loss calculation
         self.clip_low = float(clip_low)
         self.clip_high = float(clip_high)
         self.ent_coeff = float(entropy_coeff)
@@ -86,6 +87,23 @@ class P3O(COMMON):
 
         return {"policy_model": model, "ref_model": ref_model}
 
+    def calculate_ess(self, ratio, mask_bool):
+        '''
+            Calculate the effective sample size (ESS)
+            ESS = ||w||^2_1 / ||w||^2_2 , ratio = exp(logprobs - old_logprobs)
+            ESS = ESS / n where n is number of valid (non-padded) samples to normalize
+            ESS would be between 1/n and 1, effectively 0 < ESS <= 1
+        '''
+        # Only use valid (non-padded) positions. Padded positions have
+        # ratio = exp(0) = 1.0 which would bias ESS toward 1.0.
+        valid_ratios = ratio[mask_bool]
+        n = valid_ratios.numel()
+        if n == 0:
+            return torch.tensor(1.0, device=ratio.device)
+
+        ess = (valid_ratios.sum()**2) / (valid_ratios.pow(2).sum() + 1e-8) / n
+        return ess
+
     def compute_policy_loss(self,
                             logprobs: torch.Tensor,
                             old_logprobs: torch.Tensor,
@@ -99,9 +117,11 @@ class P3O(COMMON):
             old_logprobs, advantages, mask: [B, T - 1]
             entropies: [B, T-1]
             ref_logprobs: [B, T-1]
-            Compute policy loss:
+            Compute P3O policy loss:
                 1. ratio = exp(logprobs - old_logprobs)
-                2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
+                2. ess = ||w||^2_1 / ||w||^2_2 / n
+                3. rho = clip(ratio, 0, ess) (detached weighting factor)
+                4. loss = -(rho.detach() * logprobs * adv) * mask
         '''
         device = logprobs.device
         dtype = logprobs.dtype
@@ -118,14 +138,15 @@ class P3O(COMMON):
         # 2. calculate ratio = pi / pi_old = exp(logprobs - old_logprobs)
         raw_logratio = (logprobs - old_logprobs).to(torch.float32)
         # Ignore invalid (padded) positions before exp to avoid inf * 0 -> nan.
-        logratio = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
-        ratio    = torch.exp(logratio)
+        logratio     = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
+        ratio        = torch.exp(logratio)
+        ess_factor   = self.calculate_ess(ratio=ratio, mask_bool=mask_bool)
 
-        # 3. CISPO loss: clipped_ratio.detach() * log(pi) * advantage
-        # Unlike PPO, CISPO clips the importance ratio and uses it as a weighting
+        # 3. P3O loss: rho.detach() * log(pi) * advantage
+        # Unlike PPO, P3O clips the importance ratio and uses it as a weighting
         # coefficient for the policy's log-probability more like policy gradient.
-        clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high)
-        loss_pi = -(clipped_ratio.detach() * logprobs * adv * mask).sum() / denom
+        rho = torch.clamp(ratio,  min=0.0, max=ess_factor)
+        loss_pi = -(rho.detach() * logprobs * adv * mask).sum() / denom
 
         # 4. compute entropy loss
         if entropies is not None and self.ent_coeff > 0.0:
@@ -161,6 +182,7 @@ class P3O(COMMON):
                 'pi_loss': loss_pi.item(),
                 'loss_total': loss_total.item(),
                 'kl_ref': kl_ref.item(),
+                'ess_factor': ess_factor.item(),
             }
 
         return loss_total, metrics
