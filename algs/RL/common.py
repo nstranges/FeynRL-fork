@@ -11,6 +11,9 @@ from huggingface_hub import split_torch_state_dict_into_shards
 from misc.utils import set_random_seeds
 import copy
 import random
+import time
+# internal and local import
+from misc.nccl_utils import create_nccl_process_group
 
 class COMMON:
     '''
@@ -645,6 +648,84 @@ class COMMON:
             print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict (peft={self.peft_config.use_peft})!")
 
         return state_dict
+
+    def init_weight_nccl_group(self, master_addr, master_port, rank, world_size, group_name, timeout_seconds):
+        '''
+            Initialize a custom NCCL process group for weight broadcast.
+            Called only on training rank 0, concurrently with all vllm rollout
+            workers, as NCCL rendezvous requires all participants to call in together.
+            Other training ranks are not part of this group as they only participate
+            in broadcast_weights_nccl for the ZeRO-3 gather collective.
+        '''
+        torch.cuda.set_device(self.policy_engine.device)
+        self.weight_sync_group = create_nccl_process_group(init_method=f"tcp://{master_addr}:{master_port}",
+                                                           rank=rank,
+                                                           world_size=world_size,
+                                                           group_name=group_name,
+                                                           timeout_seconds=timeout_seconds,
+                                                            )
+
+        return True
+
+    def broadcast_weights_nccl(self, rollout_engines):
+        '''
+            Broadcast policy weights to vllm rollout engines via NCCL.
+            Must be called on ALL training ranks (gather_params_for_save is collective).
+            Only rank 0 actually broadcasts and schedules vllm side receives.
+            Protocol per parameter:
+              1. All ranks gather the parameter (ZeRO-3 collective).
+              2. Rank 0 schedules update_weights_nccl.remote() on rollout engines
+                 (starts vllms workers listening for broadcast).
+              3. Rank 0 broadcasts the parameter via NCCL.
+              4. NCCL synchronizes sender and receivers automatically.
+
+            Returns list of rollout engine Ray ObjectRefs only from rank 0.
+        '''
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        device = self.policy_engine.device
+        torch.cuda.set_device(device)
+
+        # Gather full state_dict. it is collective so all ranks must call this.
+        state_dict = self.gather_state_dict()
+
+        all_refs = []
+        if rank == 0 and state_dict:
+            param_names = list(state_dict.keys())
+            num_params = len(param_names)
+            start = time.time()
+
+            for i, name in enumerate(param_names):
+                param = state_dict[name]
+                is_last = (i == num_params - 1)
+                shape = tuple(param.shape)
+                dtype_str = str(param.dtype)
+
+                # Schedule vllm workers to start listening for broadcast
+                refs = [eng.update_weights_nccl.remote(name, dtype_str, shape, is_last) for eng in rollout_engines]
+                all_refs.extend(refs)
+
+                # Move to gpu and broadcast
+                param_gpu = param.to(device)
+                torch.distributed.broadcast(param_gpu, src=0, group=self.weight_sync_group)
+                del param_gpu
+
+            elapsed = time.time() - start
+            print(f"[Alg:{self.alg_name}][Rank 0] NCCL broadcast {num_params} params in {elapsed:.2f}s")
+
+        del state_dict
+        return all_refs
+
+    def close_weight_nccl_group(self):
+        '''
+            Destroy the custom NCCL weight sync group. Called during shutdown.
+        '''
+        if hasattr(self, 'weight_sync_group') and self.weight_sync_group is not None:
+            try:
+                torch.distributed.destroy_process_group(self.weight_sync_group)
+            except Exception:
+                pass
+
+            self.weight_sync_group = None
 
     def barrier_with_error_check(self, succeeded: bool):
         '''
