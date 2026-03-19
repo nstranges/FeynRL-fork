@@ -1,33 +1,39 @@
-### CISPO (vs GRPO-style clipping)
+### P3O (Policy Performance on Previous Policies Optimization)
 
-CISPO differs from typical PPO/GRPO-style updates only in the **policy loss / clipping form**. GRPO-style clipping uses the "min of unclipped vs clipped objective": with ratio $r=\exp(\log p_\theta-\log q)$, it optimizes
+P3O uses the **Effective Sample Size (ESS)** of importance weights to adaptively clip the importance ratio, enabling safe learning from off-policy (stale) data. The clipped ratio serves as a stop-gradient weighting coefficient for the log-probability.
 
-$$
-\mathcal{L}_{\text{GRPO}}(\theta)=-\mathbb{E}\Big[\min\big(rA,\ \mathrm{clip}(r,1-\epsilon_l,1+\epsilon_h)A\big)\Big].
-$$
+Based on [Fakoor et al., 2019 (arXiv:1905.01756)](https://arxiv.org/abs/1905.01756).
 
-CISPO instead clips the ratio and uses the **clipped ratio as a stop-gradient coefficient** multiplying the log-prob term:
+#### P3O loss (Eq. 1 in the paper)
 
 $$
-\mathcal{L}_{\text{CISPO}}(\theta)= -\mathbb{E}\Big[\mathrm{sg}\big(\mathrm{clip}(r,1-\epsilon_l,1+\epsilon_h)\big)\ \log p_\theta(\cdot)\ A\Big].
+\mathcal{L}_{\text{P3O}}(\theta)= -\mathbb{E}\Big[\mathrm{sg}\big(\mathrm{clip}(r,\, 0,\, \text{ESS})\big)\ \log p_\theta(\cdot)\ A\Big].
 $$
 
-In this repo, CISPO is therefore "SGRPO with a different `compute_policy_loss(...)`": the replay format, uniform replay sampling, masking, DeepSpeed micro-batching/accumulation, micro-batch shuffling, GA remainder scaling, and optional entropy/KL terms are all unchanged — only the clipping/weighting in the policy objective differs.
+where the Effective Sample Size is:
 
-#### How CISPO differs in practice
+$$
+\text{ESS} = \frac{\left(\sum_i w_i\right)^2}{\sum_i w_i^2} \cdot \frac{1}{n}
+$$
 
-In standard PPO/SGRPO clipping, the gradient is zeroed when the ratio moves outside the clip range (in the direction that the advantage would encourage further movement). CISPO takes a different approach: it always passes a gradient through `log p_θ`, but weights it by the *detached* clipped ratio. This means:
+with $w_i = \exp(\log \pi_\theta - \log \pi_{\text{old}})$ being the importance ratios over valid (non-padded) tokens.
 
-- When the ratio is within `[1 - clip_low, 1 + clip_high]`, the gradient magnitude scales with the importance weight (the ratio itself).
-- When the ratio exceeds the clip bounds, the gradient still flows but the weighting coefficient is clamped, preventing the effective step size from growing unboundedly.
+CISPO uses the same stop-gradient formulation but with fixed clip bounds $[1-\epsilon_l, 1+\epsilon_h]$ instead of the data-driven $[0, \text{ESS}]$.
 
-The result is that CISPO never fully "turns off" the gradient for a token (as PPO clipping can), but limits how much the importance weight can amplify it.
+#### ESS behavior
+
+ESS $\in [1/n,\, 1]$ (effectively $[0,\, 1]$ for typical LLM batch sizes):
+
+- **ESS $\approx$ 1**: Data is fresh (ratios $\approx$ 1), clipping is loose, gradients flow normally.
+- **ESS $\to$ 0**: Data is stale (ratios diverge), clipping becomes very tight, effectively zeroing out the gradient for that micro-batch.
+
+This makes P3O naturally suited for settings where the replay buffer contains data from multiple policy versions (off-policy training with staleness).
 
 #### Algorithm box
 
 **Input:** initial policy parameters $\theta_0$, replay shards $\mathcal{B}$ (`micro_batches`)
 
-**Hyperparams:** clip range $(1-\epsilon_\ell,\ 1+\epsilon_h)$, entropy weight $\beta_{\mathrm{ent}}$, KL weight $\beta_{\mathrm{kl}}$
+**Hyperparams:** entropy weight $\beta_{\mathrm{ent}}$, KL weight $\beta_{\mathrm{kl}}$
 
 **Replay fields:** `mask`, `old_logprobs`, group-normalized advantages `zscore`
 
@@ -36,15 +42,16 @@ For each training step:
 1. For each micro-batch $\mathcal{B}$:
 
    - Forward policy: $(\log \pi_{\theta},\, H_{\theta}) \leftarrow \pi_{\theta}(\mathcal{B})$
-   - PPO ratio: $\rho \leftarrow \exp(\log \pi_{\theta} - \texttt{old\\_logprobs})$
+   - Importance ratio: $r \leftarrow \exp(\log \pi_{\theta} - \texttt{old\\_logprobs})$
+   - Effective Sample Size: $\text{ESS} \leftarrow \frac{(\sum r)^2}{\sum r^2} \cdot \frac{1}{n}$ (over valid tokens only)
 
-   - CISPO policy loss (masked mean, using `zscore`):
+   - P3O policy loss (masked mean, using `zscore`):
 
 $$
 \mathcal{L}_{\pi}
 \leftarrow
 -\mathrm{Mean}_{\texttt{mask}}\Big(
-\mathrm{sg}\big(\mathrm{clip}(\rho, 1-\epsilon_\ell, 1+\epsilon_h)\big)
+\mathrm{sg}\big(\mathrm{clip}(r,\, 0,\, \text{ESS})\big)
 \cdot \log \pi_{\theta}
 \cdot \texttt{zscore}
 \Big)
@@ -75,3 +82,11 @@ $$
    - DeepSpeed backward/step (grad accumulation; optionally one step at shard end)
 
 **Return:** $\theta$
+
+#### Differences from the original P3O paper
+
+The original P3O was originally applied to discrete and continuous games like Atari and MuJoCo. This implementation adapts it for post-training which can be used for autoregressive tasks like text generation, which introduces several differences such as token-level action spaces and group-normalized rewards. However, the core idea of ESS-clipping remains the same.
+
+#### Notes
+
+- `clip_low` and `clip_high` are stored but **not used in the loss calculation**. They are only used for the `clipfrac` monitoring metric (fraction of tokens where the ratio falls outside `[1 - clip_low, 1 + clip_high]`).
