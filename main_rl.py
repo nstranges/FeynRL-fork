@@ -24,7 +24,8 @@ from misc.logging import setup_logging, setup_tracker
 Algorithm_Registry = {# supported algorithms
                       'sgrpo': ('algs.SGRPO.sgrpo', 'SGRPO'),
                       'cispo': ('algs.CISPO.cispo', 'CISPO'),
-                       'ppo':   ('algs.PPO.ppo', 'PPO'),
+                      'p3o':   ('algs.P3O.p3o', 'P3O'),
+                      'ppo':   ('algs.PPO.ppo', 'PPO'),
                      }
 
 def setup_ray(ray_address):
