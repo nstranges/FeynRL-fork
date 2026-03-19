@@ -14,7 +14,7 @@ from misc.metrics import compute_pass_metrics
 @ray.remote
 class VLLMRolloutEngine:
     def __init__(self,
-                 seed:int,
+                 seed: int,
                  model_path: str,
                  trust_remote_code: bool,
                  temperature: float,
@@ -39,7 +39,6 @@ class VLLMRolloutEngine:
                  engine_id: int = 0,
                  batch_invariant: bool = False,
                  ):
-
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
         # https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/reproducibility.py
@@ -135,7 +134,6 @@ class VLLMRolloutEngine:
             # pytorch and vllm execute cuda kernels asynchronously. Without this synchronization
             # step, calling del might destroy the object reference while kernels are still
             # actively running on the gpu, causing memory leaks.
-
             try:
                 if torch.cuda.is_available():
                     # Blocks the cpu until all pending gpu tasks finish.
@@ -204,9 +202,7 @@ class VLLMRolloutEngine:
         '''
             Update vllm model weights directly in gpu memory without disk I/O.
             Uses collective_rpc with WeightSyncExtension (works for any TP size).
-            Requires vllm >= 0.7 with worker_extension_cls support.
             Note: state_dict is created in RL/common.py
-
             state_dict: {param_name: cpu_tensor} from training engine rank 0.
         '''
         if self.vllm_engine is None:
@@ -238,9 +234,7 @@ class VLLMRolloutEngine:
         # Free the CPU state_dict now that it's persisted to /dev/shm.
         # The TP workers will read from the file, so we don't need this copy.
         del state_dict
-
         self.log(f"Updating weights directly to version {version}")
-
         try:
             results = self.vllm_engine.collective_rpc("update_weights", args=(shm_path,))
 
@@ -310,33 +304,32 @@ class VLLMRolloutEngine:
         # batch it lands in (topology-invariant).  Sharding in shard_batch_for_engines
         # ensures each prompt goes to exactly one engine, so duplicates are impossible.
         seed_base = self.seed if self.batch_invariant else (self.seed + self.engine_id * 1000)
-        return SamplingParams(
-            seed=seed_base,
-            n=self.n_samples,
+        return SamplingParams(seed=seed_base,
+                              n=self.n_samples,
 
-            temperature=self.temperature,
-            top_p=self.top_p, 
-            top_k=self.top_k,
-            min_p=0.0,
+                              temperature=self.temperature,
+                              top_p=self.top_p,
+                              top_k=self.top_k,
+                              min_p=0.0,
 
-            max_tokens=self.max_tokens,
-            stop=self.stop,
-            stop_token_ids=self.stop_token_ids,
-            ignore_eos=self.ignore_eos,
+                              max_tokens=self.max_tokens,
+                              stop=self.stop,
+                              stop_token_ids=self.stop_token_ids,
+                              ignore_eos=self.ignore_eos,
 
-            # Neutral penalties and no shaping
-            presence_penalty=0.0,
-            frequency_penalty=0.0,
-            repetition_penalty=1.0,
-            logit_bias=None,
-            allowed_token_ids=None,
-            bad_words=None,
-            logits_processors=None,
+                              # disable penalties
+                              presence_penalty=0.0,
+                              frequency_penalty=0.0,
+                              repetition_penalty=1.0,
+                              logit_bias=None,
+                              allowed_token_ids=None,
+                              bad_words=None,
+                              logits_processors=None,
 
-            # setup to returns required info
-            logprobs=1, # it returns logprobs for each token
-            prompt_logprobs=(1 if self.prompt_logprobs else None), # it returns logprobs for each token in the prompt which is memory intensive
-        )
+                              # setup to returns required info
+                              logprobs=1, # it returns logprobs for each token
+                              prompt_logprobs=(1 if self.prompt_logprobs else None), # it returns logprobs for each token in the prompt which is memory intensive
+                              )
 
     def extract_logprobs(self, response_ids: List[int], logprobs_by_pos: Any) -> torch.Tensor:
         '''
