@@ -21,7 +21,7 @@ from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.vllm_engine_async import VLLMRolloutEngineAsync
 from rollouts.replay_buffer import ReplayBuffer
 from misc.logging import setup_logging, setup_tracker
-from misc.setup_rl import load_tokenizer, save_checkpoint, load_checkpoint_for_resume
+from misc.setup_rl import load_tokenizer, save_checkpoint, load_checkpoint_for_resume, setup_ray
 import misc.rollout_stats as rollout_stats
 
 Algorithm_Registry = {# supported algorithms
@@ -30,27 +30,6 @@ Algorithm_Registry = {# supported algorithms
                       'p3o':   ('algs.P3O.p3o', 'P3O'),
                       'ppo':   ('algs.PPO.ppo', 'PPO'),
                      }
-
-def setup_ray(ray_address):
-    '''
-       Initialize the Ray cluster and retrieve the driver node's IP address.
-    '''
-    if ray_address:
-        ray.init(address=ray_address, ignore_reinit_error=True)
-
-    else:
-        ray.init(ignore_reinit_error=True)
-
-    try:
-        # The IP is used as master_addr for deepspeed/pytorch distributed rendezvous.
-        # rank 0 listens on this address and all other ranks connect to it to form the process group.
-        master_addr = ray.util.get_node_ip_address()
-    except Exception:
-        # Fallback to localhost if we cannot get the IP (e.g. single node without network)
-        print("Warning: Could not get master address, using localhost. This is fine for single-node but will fail for multi-node.")
-        master_addr = "127.0.0.1"
-
-    return master_addr
 
 def create_training_engines(params, alg, world_size, master_addr, master_port):
     '''
@@ -183,8 +162,6 @@ def create_rollout_engines(params, reward_fnc, eos_id):
                                                     ).remote(**kwargs))
 
     return engines
-
-
 
 def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_per_epoch):
     '''
@@ -548,6 +525,165 @@ def refresh_rollout_engine(rollout_engines, updated_policy_path, version, logger
                          timeout=sync_timeout,
                          description=f"refresh rollout engines from disk (v{version})",
                          logger=logger)
+
+def init_nccl_weight_sync(training_engines, rollout_engines, master_addr, nccl_port, tp_size, logger, init_timeout):
+    '''
+        Initialize the NCCL weight sync group across training rank 0 and
+        all vLLM TP workers. All participants must call into the NCCL
+        rendezvous concurrently.
+        Rank assignment:
+          rank 0: training engine rank 0
+          rank 1..tp: rollout engine 0, TP workers 0..tp-1
+          rank tp+1..2*tp: rollout engine 1, TP workers 0..tp-1
+          ....
+        world_size = 1 + num_rollout_engines * tp_size
+    '''
+    num_rollout_engines = len(rollout_engines)
+    world_size = 1 + num_rollout_engines * tp_size
+    group_name = "feynrl_weight_sync"
+
+    logger.info(f"[NCCL] Initializing weight sync group: world_size={world_size}, "
+                f"port={nccl_port}, training_rank=0, "
+                f"{num_rollout_engines} rollout engines x TP={tp_size}")
+
+    # All participants must call rendezvous concurrently.
+    # Training rank 0 gets rank=0.
+    futures = []
+    futures.append(training_engines[0].init_weight_nccl_group.remote(master_addr=master_addr,
+                                                                    master_port=nccl_port,
+                                                                    rank=0,
+                                                                    world_size=world_size,
+                                                                    group_name=group_name,
+                                                                    timeout_seconds=init_timeout))
+    # Each rollout engine gets rank_offset = 1 + engine_idx * tp_size,
+    # and its TP workers compute their own ranks internally.
+    for engine_idx, engine in enumerate(rollout_engines):
+        rank_offset = 1 + engine_idx * tp_size
+        futures.append(engine.init_nccl_group.remote(master_addr=master_addr,
+                                                    master_port=nccl_port,
+                                                    rank=rank_offset,
+                                                    world_size=world_size,
+                                                    group_name=group_name,
+                                                    timeout_seconds=init_timeout))
+    # no need to return results, just waiting for all to finish
+    ray_get_with_timeout(refs=futures,
+                        timeout=init_timeout,
+                        description="NCCL weight sync group initialization at main",
+                        logger=logger)
+    logger.info(f"[NCCL] Weight sync group initialized successfully")
+    return world_size, group_name
+
+def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_timeout):
+    '''
+        Broadcast weights from training engines (all engines should participate) to rollout engines via nccl.
+        Only rank 0 actually broadcasts over nccl though. This function schedules collective operations, on all training engines.
+        It must only be called when ALL training engines are idle, i.e. no train_step in progress.
+        Calling it concurrently with training would deadlock because zero-3 collectives require all ranks
+        to participate in the same operation at the same time.
+    '''
+    start_time = time.time()
+    logger.info(f"[NCCL] Broadcasting weights v{version} to rollout engines...")
+
+    # Each engine returns a list of Ray ObjectRefs for rollout-side receives.
+    broadcast_futures = [engine.broadcast_weights_nccl.remote(rollout_engines) for engine in training_engines]
+    broadcast_results = ray_get_with_timeout(refs=broadcast_futures,
+                                            timeout=sync_timeout,
+                                            description=f"NCCL weight broadcast v{version}",
+                                            logger=logger)
+
+    # Rank 0 returns a list of rollout engine futures; other ranks return [].
+    # Wait for all rollout engines to finish receiving.
+    rollout_refs = []
+    for result in broadcast_results:
+        if isinstance(result, list):
+            rollout_refs.extend(result)
+
+    if rollout_refs:
+        ray_get_with_timeout(refs=rollout_refs,
+                            timeout=sync_timeout,
+                            description=f"rollout engines receive weights v{version}",
+                            logger=logger)
+
+    # Update loaded_version on all rollout engines so generate() version
+    # checks stay consistent, especially with force_strict_on_policy.
+    finalize_refs = [eng.finalize_weight_nccl.remote(version) for eng in rollout_engines]
+    ray_get_with_timeout(refs=finalize_refs,
+                        timeout=sync_timeout,
+                        description=f"finalize weight sync v{version}",
+                        logger=logger)
+
+    elapsed = time.time() - start_time
+    logger.info(f"[NCCL] Weight broadcast v{version} complete in {elapsed:.2f}s")
+    return True
+
+@dataclass
+class ChunkFuture:
+    '''
+        A group of per-engine Ray ObjectRefs covering chunk_size dataloader batches.
+    '''
+    # list of [per-engine ObjectRef lists], one per batch in chunk
+    futures: list
+    dispatch_time: float
+    chunk_idx: int
+
+def dispatch_one_chunk(dataloader_iter, rollout_engines, epoch, policy_version, chunk_size, chunk_idx):
+    '''
+        Dispatch exactly one chunk (given chunk_size) of generation to rollout engines.
+        Only ONE chunk should be in-flight at a time. This keeps each actor's
+        fifo mailbox empty between chunks, creating idle windows where nccl weight sync can execute immediately.
+    '''
+    num_engines = len(rollout_engines)
+    batch_futures = []
+
+    for _ in range(chunk_size):
+        try:
+            # Pull up to chunk_size batches from dataloader_iter and calls
+            # generate.remote() on each engine. it returns a ChunkFuture, or None when
+            # the iterator is exhausted.
+            rollout_batch = next(dataloader_iter)
+
+        except StopIteration as e:
+            logger.info(f"[Main - Dispatcher] Dataloader exhausted after {chunk_idx} chunks.")
+            break
+        # shard batch for rollout engines
+        shards = shard_batch_for_engines(rollout_batch, num_engines)
+        # now generate responses for each shard
+        futures = [rollout_engines[i].generate.remote(prompts=shard,
+                                                      current_iter=epoch,
+                                                      policy_version=policy_version)
+                   for i, shard in enumerate(shards)]
+        batch_futures.append(futures)
+
+    if not batch_futures:
+        return None
+
+    return ChunkFuture(futures=batch_futures, dispatch_time=time.time(), chunk_idx=chunk_idx)
+
+def finalize_chunk(chunk, replay_buffer, logger, rollout_timeout):
+    '''
+        Block until a single chunk's futures resolve, merge results into
+        the replay buffer, and return accumulated per-chunk stats.
+    '''
+    acc = rollout_stats.new_accumulator()
+    for batch_futures in chunk.futures:
+        results = ray_get_with_timeout(refs=batch_futures, timeout=rollout_timeout, description=f"chunk {chunk.chunk_idx}", logger=logger)
+        merged, stats = merge_rollout_with_stats(results)
+        replay_buffer.add_batch_seqs(merged)
+        rollout_stats.accumulate(acc, stats)
+
+    return acc
+
+def aggregate_chunk_stats(chunk_stats_list, generation_time, wall_time):
+    '''
+        Combine partial stats from multiple finalize_chunk calls.
+    '''
+    acc = rollout_stats.new_accumulator()
+    for cs in chunk_stats_list:
+        rollout_stats.accumulate(acc, cs)
+
+    result = rollout_stats.summarize(acc, rollout_time=generation_time)
+    result["rollout_time_with_overlap"] = wall_time
+    return result
 
 if __name__ == "__main__":
     # parse arguments

@@ -4,6 +4,27 @@ import ray
 from transformers import AutoTokenizer
 from misc.utils import ray_get_with_timeout, get_experiment_dir_name
 
+def setup_ray(ray_address):
+    '''
+       Initialize the Ray cluster and retrieve the driver node's IP address.
+    '''
+    if ray_address:
+        ray.init(address=ray_address, ignore_reinit_error=True)
+
+    else:
+        ray.init(ignore_reinit_error=True)
+
+    try:
+        # The IP is used as master_addr for deepspeed/pytorch distributed rendezvous.
+        # rank 0 listens on this address and all other ranks connect to it to form the process group.
+        master_addr = ray.util.get_node_ip_address()
+    except Exception:
+        # Fallback to localhost if we cannot get the IP (e.g. single node without network)
+        print("Warning: Could not get master address, using localhost. This is fine for single-node but will fail for multi-node.")
+        master_addr = "127.0.0.1"
+
+    return master_addr
+
 def load_tokenizer(model_name, trust_remote_code=False, rank=0):
     '''
        Load tokenizer from huggingface.
