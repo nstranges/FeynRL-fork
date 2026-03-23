@@ -738,26 +738,26 @@ if __name__ == "__main__":
                          f"but Ray cluster only has {int(cluster_gpus)} GPUs")
 
     ########
-    # 3. initialize training engine
+    # 3. Initialize training engine
     ########
     logger.info(f"Loading training algorithm: {config.train.alg_name}")
     alg_class = load_algorithm(config.train.alg_name, Algorithm_Registry)
 
-    training_engine = create_training_engines(params=config,
+    training_engines = create_training_engines(params=config,
                                               alg=alg_class,
                                               world_size=training_gpus,
                                               master_addr=master_addr,
                                               master_port=config.run.ray_master_port)
 
-    assert len(training_engine) == training_gpus, "Number of training engines does not match number of training gpus"
-    logger.info(f"Created {len(training_engine)} training engine runners")
+    assert len(training_engines) == training_gpus, "Number of training engines does not match number of training gpus"
+    logger.info(f"Created {len(training_engines)} training engine runners")
 
     # Synchronization barrier to prevent deepspeed rendezvous hang
     # wait for all training actors to finish initialization before proceeding
     logger.info("Waiting for all training engines to initialize...")
 
     init_timeout = config.run.init_timeout
-    ready_checks = [engine.is_ready.remote() for engine in training_engine]
+    ready_checks = [engine.is_ready.remote() for engine in training_engines]
     ray_get_with_timeout(refs=ready_checks,
                          timeout=init_timeout,
                          description="training engine initialization",
@@ -774,9 +774,9 @@ if __name__ == "__main__":
     logger.info(f"Tokenizer loaded. Vocab size: {tokenizer.vocab_size}, Pad token ID: {tokenizer.pad_token_id}")
 
     ########
-    # 5. initialize inference engine
+    # 5. Initialize rollout engines
     ########
-    logger.info("Setting up inference/rollout engines...")
+    logger.info("Setting up rollout engines...")
     reward_func_name = config.reward.reward_func if config.reward.reward_func else None
     if reward_func_name:
         reward_module = importlib.import_module("rewards." + reward_func_name)
@@ -799,7 +799,7 @@ if __name__ == "__main__":
 
     if config.run.weight_sync_method == "nccl":
         nccl_port = config.run.nccl_sync_port if config.run.nccl_sync_port else config.run.ray_master_port + 100
-        nccl_world_size, nccl_gname = init_nccl_weight_sync(training_engines=training_engine,
+        nccl_world_size, nccl_gname = init_nccl_weight_sync(training_engines=training_engines,
                                                             rollout_engines=rollout_engines,
                                                             master_addr=master_addr,
                                                             nccl_port=nccl_port,
@@ -828,8 +828,9 @@ if __name__ == "__main__":
                                  max_seq_len=config.data.max_seq_len,
                                  )
     logger.info(f"Replay buffer initialized (max_seq_len={config.data.max_seq_len})")
+
     ########
-    # 7. Training and evaluation loop
+    # 7. Some variables initialization
     ########
     number_of_epochs = config.train.total_number_of_epochs
     steps_per_epoch  = config.train.train_steps_per_epoch
@@ -848,14 +849,8 @@ if __name__ == "__main__":
     fixed_sync_interval = config.overlap.fixed_sync_interval
     chunk_size = config.overlap.chunk_size
 
-    if overlap_enabled:
-        logger.info(f"ESS sync threshold: {ess_sync_threshold}, fixed_sync_interval: {fixed_sync_interval}, max_lag: {max_lag}")
-        logger.info(f"Overlap mode: max_lag={overlap_max_lag}, chunk_size={chunk_size}")
-
-    logger.info(f"checkpoint_save_interval: {checkpoint_save_interval}")
-
     ########
-    # 7b. Resume from checkpoint (if requested)
+    # 8. Resume from checkpoint if requested and clean up incomplete checkpoint directories
     ########
     start_epoch = 0
     global_step = 0
@@ -881,15 +876,18 @@ if __name__ == "__main__":
     if os.path.isdir(experiment_dir):
         for entry in os.listdir(experiment_dir):
             ckpt_path = os.path.join(experiment_dir, entry)
+
             if os.path.isdir(ckpt_path) and not os.path.exists(os.path.join(ckpt_path, "CHECKPOINT_COMPLETE")):
                 logger.warning(f"Removing incomplete checkpoint: {ckpt_path}")
                 shutil.rmtree(ckpt_path, ignore_errors=True)
 
-    # Fetch model info from rank 0 engine (single remote call)
-    model_info = ray.get(training_engine[0].get_model_info.remote())
-    total_params = model_info['total_params']
+    ########
+    # 9. General logging printout before training-loop
+    ########
+    model_info       = ray.get(training_engines[0].get_model_info.remote())
+    total_params     = model_info['total_params']
     trainable_params = model_info['trainable_params']
-    frozen_params = model_info['frozen_params']
+    frozen_params    = model_info['frozen_params']
 
     logger.info("=" * 50)
     logger.info(f"Starting training: {number_of_epochs} epochs, {steps_per_epoch} steps/epoch")
@@ -898,6 +896,7 @@ if __name__ == "__main__":
         logger.info(f"Model: {config.model.name} | PEFT: {model_info['peft_type']} | "
                     f"params: {total_params:,} total, {trainable_params:,} peft ({100*trainable_params/total_params:.2f}%), "
                     f"{frozen_params:,} frozen")
+
     else:
         logger.info(f"Model: {config.model.name} | PEFT: off | "
                     f"params: {total_params:,} total, {trainable_params:,} trainable")
@@ -906,18 +905,18 @@ if __name__ == "__main__":
         logger.info(f"Value model: {config.model.value_model or config.model.name} | "
                     f"params: {model_info['value_total_params']:,} total, {model_info['value_trainable_params']:,} trainable")
 
+    if overlap_enabled:
+        logger.info(f"ESS sync threshold: {ess_sync_threshold}, fixed_sync_interval: {fixed_sync_interval}, max_lag: {max_lag}")
+        logger.info(f"Overlap mode: max_lag={overlap_max_lag}, chunk_size={chunk_size}")
 
-    logger.info(f"Weight sync: {weight_sync_method}")
-    logger.info(f"Weight sync: NCCL (port={nccl_port}, world_size={nccl_world_size})")
-    logger.info(f"ESS sync threshold: {ess_sync_threshold}, fixed_sync_interval: {fixed_sync_interval}, max_lag: {max_lag}")
-    logger.info(f"Overlap mode: max_lag={overlap_max_lag}, chunk_size={chunk_size}")
     logger.info(f"checkpoint_save_interval: {checkpoint_save_interval}")
-
-
     if args.resume_from:
         logger.info(f"Resuming from: {args.resume_from} (epoch {start_epoch+1}/{number_of_epochs})")
 
     logger.info("=" * 50)
+    ########
+    # 10. Training loop for both sync and async depending on the config
+    ########
     entire_training_start_time = time.time()
 
     for epoch in range(start_epoch, number_of_epochs):
@@ -925,9 +924,20 @@ if __name__ == "__main__":
         is_last_epoch = (epoch == number_of_epochs - 1)
 
         ################
+        # a. Evict stale samples by resetting buffer
+        ################
+        if overlap_enabled and overlap_max_lag > 0:
+            evicted = replay_buffer.evict_stale(policy_version - overlap_max_lag)
+            if evicted > 0:
+                logger.info(f"[Epoch {epoch+1}] Evicted {evicted} stale samples "
+                            f"(older than policy v{policy_version - overlap_max_lag}), "
+                            f"{len(replay_buffer)} retained")
+        else:
+            replay_buffer.reset()
+
+        ################
         # 1. Collect rollouts
         ################
-        replay_buffer.reset()
         logger.info(f"[Epoch {epoch+1}/{number_of_epochs}] Starting rollout generation...")
         rollout_dataloader.batch_sampler.set_epoch(epoch)
         rollout_metrics = collect_rollouts(dataloader=rollout_dataloader,
@@ -974,11 +984,11 @@ if __name__ == "__main__":
         # divisible by num_train_engines
         train_batches_padded = prepare_training_batches(replay_buffer=replay_buffer,
                                                         batch_size=config.train.train_batch_size_per_gpu,
-                                                        num_engines=len(training_engine),
+                                                        num_engines=len(training_engines),
                                                         seed=config.run.seed,
                                                         epoch=epoch)
-        samples_per_engine = len(replay_buffer) // len(training_engine)
-        micro_per_engine = len(train_batches_padded) // len(training_engine)
+        samples_per_engine = len(replay_buffer) // len(training_engines)
+        micro_per_engine = len(train_batches_padded) // len(training_engines)
         logger.info(f"[Epoch {epoch+1}] Training: "
                     f"{len(replay_buffer)} replay samples / {len(training_engine)} training engines "
                     f"= {samples_per_engine} samples/engine / bs={config.train.train_batch_size_per_gpu} "
@@ -995,7 +1005,7 @@ if __name__ == "__main__":
         ################
         epoch_metrics = {}
         for step in range(steps_per_epoch):
-            train_metrics = run_training_step(training_engine, shard_refs,
+            train_metrics = run_training_step(training_engines, shard_refs,
                                                 logger=logger,
                                                 train_step_timeout=train_step_timeout)
 
@@ -1027,7 +1037,7 @@ if __name__ == "__main__":
         epoch_avg = {k: np.mean(v) for k, v in epoch_metrics.items()}
 
         # Fetch lr and gpu memory from rank 0 engine
-        train_stats = ray.get(training_engine[0].get_training_stats.remote())
+        train_stats = ray.get(training_engines[0].get_training_stats.remote())
         current_lr = train_stats.get('lr', 0.0)
         gpu_mem_gb = train_stats.get('gpu_peak_mem_gb', 0.0)
 
@@ -1055,7 +1065,7 @@ if __name__ == "__main__":
                         f"(v{rollout_policy_version} -> v{policy_version})...")
 
             try:
-                sync_success = sync_weights_direct(training_engines=training_engine,
+                sync_success = sync_weights_direct(training_engines=training_engines,
                                                    rollout_engines=rollout_engines,
                                                    version=policy_version,
                                                    logger=logger,
@@ -1084,7 +1094,7 @@ if __name__ == "__main__":
                                          version=policy_version,
                                          global_step=global_step,
                                          tokenizer=tokenizer,
-                                         training_engines=training_engine,
+                                         training_engines=training_engines,
                                          checkpoint_dir=config.run.checkpoint_dir,
                                          experiment_id=config.run.experiment_id,
                                          rank=rank,
@@ -1117,7 +1127,7 @@ if __name__ == "__main__":
 
     # Clean up nccl process groups before ray tears down actors.
     # All engines must call destroy_process_group concurrently. it's collective.
-    shutdown_futures = [engine.shutdown.remote() for engine in training_engine]
+    shutdown_futures = [engine.shutdown.remote() for engine in training_engines]
     try:
         ray.get(shutdown_futures, timeout=30)
 
