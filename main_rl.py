@@ -708,8 +708,7 @@ if __name__ == "__main__":
     config = cfg.load_and_verify(method="rl",
                                  input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
-                                 rank=rank,
-                                 )
+                                 rank=rank)
     set_random_seeds(seed=config.run.seed)
 
     # setup remote experiment tracker
@@ -735,10 +734,8 @@ if __name__ == "__main__":
     cluster_gpus = ray.cluster_resources().get("GPU", 0)
     needed_gpus = training_gpus + rollout_gpus
     if needed_gpus > cluster_gpus:
-        raise ValueError(
-            f"Need {needed_gpus} GPUs (training={training_gpus} + rollout={rollout_gpus}) "
-            f"but Ray cluster only has {int(cluster_gpus)} GPUs"
-        )
+        raise ValueError(f"Need {needed_gpus} GPUs (training={training_gpus} + rollout={rollout_gpus}) "
+                         f"but Ray cluster only has {int(cluster_gpus)} GPUs")
 
     ########
     # 3. initialize training engine
@@ -761,10 +758,10 @@ if __name__ == "__main__":
 
     init_timeout = config.run.init_timeout
     ready_checks = [engine.is_ready.remote() for engine in training_engine]
-    ready = ray_get_with_timeout(refs=ready_checks,
-                                 timeout=init_timeout,
-                                 description="training engine initialization",
-                                 logger=logger)
+    ray_get_with_timeout(refs=ready_checks,
+                         timeout=init_timeout,
+                         description="training engine initialization",
+                         logger=logger)
     logger.info("All training engines ready!")
 
     ########
@@ -796,6 +793,25 @@ if __name__ == "__main__":
     logger.info(f"Created {num_rollout_engines} rollout engines with TP={config.rollout.tensor_parallel_size}")
 
     ########
+    # 5. Initialize weight sync group
+    ########
+    weight_sync_method = config.run.weight_sync_method
+
+    if config.run.weight_sync_method == "nccl":
+        nccl_port = config.run.nccl_sync_port if config.run.nccl_sync_port else config.run.ray_master_port + 100
+        nccl_world_size, nccl_gname = init_nccl_weight_sync(training_engines=training_engine,
+                                                            rollout_engines=rollout_engines,
+                                                            master_addr=master_addr,
+                                                            nccl_port=nccl_port,
+                                                            tp_size=tp_size,
+                                                            logger=logger,
+                                                            init_timeout=config.run.init_timeout)
+        logger.info(f"Weight sync: NCCL (port={nccl_port}, world_size={nccl_world_size}) with NCCL group name {nccl_gname}")
+
+    else:
+        logger.info(f"Weight sync method is {config.run.weight_sync_method}")
+
+    ########
     # 6. load the rollout dataloader
     ########
     logger.info(f"Loading rollout dataloader from {config.data.train_files_path}")
@@ -815,18 +831,28 @@ if __name__ == "__main__":
     ########
     # 7. Training and evaluation loop
     ########
-    number_of_epochs  = config.train.total_number_of_epochs
-    steps_per_epoch = config.train.train_steps_per_epoch
-
-    # Weight sync settings
-    weight_sync_method = config.run.weight_sync_method
+    number_of_epochs = config.train.total_number_of_epochs
+    steps_per_epoch  = config.train.train_steps_per_epoch
     checkpoint_save_interval = config.run.checkpoint_save_interval if config.run.checkpoint_save_interval is not None else 1
 
     # Timeout settings (seconds) for ray.get() calls
-    rollout_timeout = config.run.rollout_timeout
+    rollout_timeout    = config.run.rollout_timeout
     train_step_timeout = config.run.train_step_timeout
     save_timeout = config.run.save_timeout
     sync_timeout = config.run.sync_timeout
+
+    # Overlap settings
+    overlap_enabled = config.overlap.enabled
+    overlap_max_lag = config.overlap.max_lag
+    ess_sync_threshold = config.overlap.ess_sync_threshold
+    fixed_sync_interval = config.overlap.fixed_sync_interval
+    chunk_size = config.overlap.chunk_size
+
+    if overlap_enabled:
+        logger.info(f"ESS sync threshold: {ess_sync_threshold}, fixed_sync_interval: {fixed_sync_interval}, max_lag: {max_lag}")
+        logger.info(f"Overlap mode: max_lag={overlap_max_lag}, chunk_size={chunk_size}")
+
+    logger.info(f"checkpoint_save_interval: {checkpoint_save_interval}")
 
     ########
     # 7b. Resume from checkpoint (if requested)
@@ -879,7 +905,14 @@ if __name__ == "__main__":
     if 'value_total_params' in model_info:
         logger.info(f"Value model: {config.model.value_model or config.model.name} | "
                     f"params: {model_info['value_total_params']:,} total, {model_info['value_trainable_params']:,} trainable")
-    logger.info(f"Weight sync: {weight_sync_method} | checkpoint_save_interval: {checkpoint_save_interval}")
+
+
+    logger.info(f"Weight sync: {weight_sync_method}")
+    logger.info(f"Weight sync: NCCL (port={nccl_port}, world_size={nccl_world_size})")
+    logger.info(f"ESS sync threshold: {ess_sync_threshold}, fixed_sync_interval: {fixed_sync_interval}, max_lag: {max_lag}")
+    logger.info(f"Overlap mode: max_lag={overlap_max_lag}, chunk_size={chunk_size}")
+    logger.info(f"checkpoint_save_interval: {checkpoint_save_interval}")
+
 
     if args.resume_from:
         logger.info(f"Resuming from: {args.resume_from} (epoch {start_epoch+1}/{number_of_epochs})")
