@@ -95,7 +95,7 @@ def load_models_and_tokenizer(model_name, model_dtype, ref_model_name,trust_remo
     model_dtype = safe_string_to_torch_dtype(model_dtype)
 
     # 1. model and its config initialization
-    model_config = AutoConfig.from_pretrained(model_name)
+    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     model = AutoModelForCausalLM.from_pretrained(model_name,
                                                 dtype=model_dtype,
                                                 trust_remote_code=trust_remote_code,
@@ -105,12 +105,12 @@ def load_models_and_tokenizer(model_name, model_dtype, ref_model_name,trust_remo
     if ref_model_name is None:
         ref_model_name = model_name
 
-    ref_model_config = AutoConfig.from_pretrained(ref_model_name)
+    ref_model_config = AutoConfig.from_pretrained(ref_model_name, trust_remote_code=trust_remote_code)
     ref_model = AutoModelForCausalLM.from_pretrained(ref_model_name,
-                                                        dtype=model_dtype,
-                                                        trust_remote_code=trust_remote_code,
-                                                        config=ref_model_config,
-                                                        attn_implementation=None if attn_impl == '' else attn_impl)
+                                                     dtype=model_dtype,
+                                                     trust_remote_code=trust_remote_code,
+                                                     config=ref_model_config,
+                                                     attn_implementation=None if attn_impl == '' else attn_impl)
 
     # 3. Tokenizer initialization
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
@@ -128,6 +128,11 @@ def load_models_and_tokenizer(model_name, model_dtype, ref_model_name,trust_remo
         else:
             # fallback to eos token id
             tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Sync pad_token_id into model config so exported checkpoints are consistent
+    # as vllm and similar read pad_token_id from config.json, not tokenizer
+    if model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
 
     return model, ref_model, tokenizer
 
@@ -247,12 +252,31 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
-                                                 model_dtype=config.model.dtype,
-                                                 ref_model_name=config.model.ref_model,
-                                                 trust_remote_code=config.model.trust_remote_code,
-                                                 attn_impl=config.model.attn_implementation,
-                                                 rank=rank)
+    # Initialize distributed backend early so deepspeed.zero.Init() can partition
+    # parameters at creation time
+    if not torch.distributed.is_initialized():
+        deepspeed.init_distributed()
+
+    is_zero3 = config.deepspeed.zero_optimization.get("stage", 0) == 3
+    if is_zero3:
+        # stage 3 partitions parameters at creation to avoid every rank loading the full
+        # model into cpu ram which causes oom for large models on multi-gpu nodes.
+        # for stages 0/1/2, every rank must hold the full model parameters.
+        ds_config_dict = config.deepspeed.model_dump()
+        with deepspeed.zero.Init(config_dict_or_path=ds_config_dict):
+            model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
+                                                                    model_dtype=config.model.dtype,
+                                                                    ref_model_name=config.model.ref_model,
+                                                                    trust_remote_code=config.model.trust_remote_code,
+                                                                    attn_impl=config.model.attn_implementation,
+                                                                    rank=rank)
+    else:
+        model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
+                                                                model_dtype=config.model.dtype,
+                                                                ref_model_name=config.model.ref_model,
+                                                                trust_remote_code=config.model.trust_remote_code,
+                                                                attn_impl=config.model.attn_implementation,
+                                                                rank=rank)
 
     # apply PEFT module if enabled
     if config.peft.use_peft:
@@ -302,6 +326,15 @@ if __name__ == "__main__":
                                           world_size=world_size,
                                           rank=rank)
 
+    # ZeRO-3 uses all-gather collectives inside every forward pass, sized for
+    # train_micro_batch_size_per_gpu. A larger val batch can OOM because
+    # activation memory exceeds what DeepSpeed budgeted.
+    if is_zero3 and config.train.val_batch_size_per_gpu > config.train.train_batch_size_per_gpu:
+        logger.warning(f"val_batch_size_per_gpu ({config.train.val_batch_size_per_gpu}) > "
+                       f"train_batch_size_per_gpu ({config.train.train_batch_size_per_gpu}) with ZeRO stage 3. "
+                       f"This may cause OOM during validation. Consider setting val_batch_size_per_gpu <= "
+                       f"train_batch_size_per_gpu.")
+
     ########
     # 7. Intitate the learning algorithm (e.g., ppo)
     ########
@@ -337,10 +370,14 @@ if __name__ == "__main__":
     start_epoch = 0
     global_step = 0
     if args.resume_from:
+        zero_stage = config.deepspeed.zero_optimization.get("stage", 0)
         start_epoch, global_step = resume_from_checkpoint(resume_path=args.resume_from,
                                                           model_engine=model_engine,
                                                           world_size=world_size,
-                                                          logger=logger)
+                                                          logger=logger,
+                                                          zero_stage=zero_stage,
+                                                          model_dtype=config.model.dtype,
+                                                          use_peft=config.peft.use_peft)
 
     experiment_dir = os.path.join(config.run.checkpoint_dir, config.run.experiment_id)
     cleanup_incomplete_checkpoints(experiment_dir=experiment_dir, rank=rank, logger=logger)
@@ -509,7 +546,9 @@ if __name__ == "__main__":
                                      rank=rank,
                                      world_size=world_size,
                                      logger=logger,
-                                     label="cl")
+                                     label="cl",
+                                     zero_stage=config.deepspeed.zero_optimization.get("stage", 0),
+                                     model_dtype=config.model.dtype)
 
     total_training_time = time.time() - training_start_time
     logger.info(f"Training completed successfully! Total time: {total_training_time:.2f}s ({total_training_time/3600:.2f}h)")
