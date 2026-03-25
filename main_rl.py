@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 import ray
 import time
 import shutil
+from dataclasses import dataclass
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
@@ -25,7 +26,7 @@ from misc.setup_rl import load_tokenizer, save_checkpoint, load_checkpoint_for_r
 import misc.rollout_stats as rollout_stats
 
 Algorithm_Registry = {# supported algorithms
-                      'sgrpo': ('algs.SGRPO.sgrpo', 'SGRPO'),
+                      'grpo':  ('algs.GRPO.grpo', 'GRPO'),
                       'cispo': ('algs.CISPO.cispo', 'CISPO'),
                       'p3o':   ('algs.P3O.p3o', 'P3O'),
                       'ppo':   ('algs.PPO.ppo', 'PPO'),
@@ -86,7 +87,7 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                     "PYTHONHASHSEED": str(params.run.seed),
                     }
 
-        # NCCL env vars for multi-node clusters
+        # NCCL env vars
         if params.run.nccl_socket_ifname:
             ray_vars["NCCL_SOCKET_IFNAME"] = params.run.nccl_socket_ifname
         if params.run.nccl_ib_hca:
@@ -329,7 +330,6 @@ def collect_rollouts(dataloader,
     # Batches needed = ceil(25 / 24) = 2 batches
     # Total Prompts = 2 * 24 = 48 prompts (rounded up to batch boundary)
     # Total completions in replay buffer = 48 prompts * 3 n_samples = 144
-
     batch_size = dataloader.batch_sampler.local_batch_size
     num_batches_per_epoch = len(dataloader)
     total_prompts = num_batches_per_epoch * batch_size
@@ -438,11 +438,9 @@ def run_training_step(engines, shard_refs, logger, train_step_timeout):
                                         logger=logger)
 
     # Dynamically aggregate all metric keys across engines.
-    # This works for both sgrpo (policy-only) and ppo (policy + value metrics).
     # metrics_list: clipfrac, approx_kl, loss_ent, loss_pi, loss_total, kl_ref
     # if value network, add: v_loss
     # loss_total includes: loss_pi + ent_coef * loss_ent
-
     all_keys = set()
     for m in metrics_list:
         all_keys.update(m.keys())
@@ -626,7 +624,16 @@ class ChunkFuture:
     dispatch_time: float
     chunk_idx: int
 
-def dispatch_one_chunk(dataloader_iter, rollout_engines, epoch, policy_version, chunk_size, chunk_idx):
+def chunk_is_ready(chunk):
+    '''
+        Non-blocking check to see if all futures chunks completed
+        we use ray.wait with timeout=0 so this is essentially free.
+    '''
+    all_refs = [ref for batch_futures in chunk.futures for ref in batch_futures]
+    ready, _ = ray.wait(all_refs, num_returns=len(all_refs), timeout=0)
+    return len(ready) == len(all_refs)
+
+def dispatch_one_chunk(dataloader_iter, rollout_engines, epoch, policy_version, chunk_size, chunk_idx, logger):
     '''
         Dispatch exactly one chunk (given chunk_size) of generation to rollout engines.
         Only ONE chunk should be in-flight at a time. This keeps each actor's
@@ -637,9 +644,10 @@ def dispatch_one_chunk(dataloader_iter, rollout_engines, epoch, policy_version, 
 
     for _ in range(chunk_size):
         try:
-            # Pull up to chunk_size batches from dataloader_iter and calls
-            # generate.remote() on each engine. it returns a ChunkFuture, or None when
-            # the iterator is exhausted.
+            # Pull up to chunk_size batches from dataloader_iter and call generate on each engine.
+            # it returns a ChunkFuture, or none when is exhausted.
+            # since dataloader_iter is an iterator, it remembers its position.
+            # So the next call to dispatch_one_chunk picks up where the last one left off.
             rollout_batch = next(dataloader_iter)
 
         except StopIteration as e:
@@ -684,6 +692,388 @@ def aggregate_chunk_stats(chunk_stats_list, generation_time, wall_time):
     result = rollout_stats.summarize(acc, rollout_time=generation_time)
     result["rollout_time_with_overlap"] = wall_time
     return result
+
+def run_epoch_sync(epoch, training_engines, rollout_engines, rollout_dataloader,
+                   replay_buffer, policy_version, rollout_policy_version, global_step,
+                   n_samples, train_batch_size, steps_per_epoch, seed,
+                   rollout_timeout, train_step_timeout, tracker, logger):
+    '''
+        Sequential epoch: [collect_rollouts] -> [prepare_training_batches] -> [train]]
+    '''
+    # 1. Reset replay buffer
+    replay_buffer.reset()
+
+    # 2. all engines must finish before we proceed. collect_rollouts is blocking call.
+    logger.info(f"[Epoch {epoch+1}] Starting rollout generation...")
+    rollout_dataloader.batch_sampler.set_epoch(epoch)
+    rollout_metrics = collect_rollouts(dataloader=rollout_dataloader,
+                                       rollout_engines=rollout_engines,
+                                       epoch=epoch,
+                                       policy_version=policy_version,
+                                       replay_buffer=replay_buffer,
+                                       n_samples=n_samples,
+                                       logger=logger,
+                                       rollout_timeout=rollout_timeout)
+
+    # 3. Prepare training batches
+    logger.info(f"[Epoch {epoch+1}] Replay buffer has {len(replay_buffer)} samples")
+    train_start_time = time.time()
+    num_engines      = len(training_engines)
+    # shuffles the replay buffer globally and creates training batches
+    train_batches_padded = prepare_training_batches(replay_buffer=replay_buffer,
+                                                    batch_size=train_batch_size,
+                                                    num_engines=num_engines,
+                                                    seed=seed,
+                                                    epoch=epoch)
+    samples_per_engine = len(replay_buffer) // num_engines
+    micro_per_engine   = len(train_batches_padded) // num_engines
+    logger.info(f"[Epoch {epoch+1}] Training: "
+                f"{len(replay_buffer)} replay samples / {num_engines} training engines "
+                f"= {samples_per_engine} samples/engine / bsz={train_batch_size} "
+                f"= {micro_per_engine} micro-batches/engine, "
+                f"{steps_per_epoch} pass(es) over replay buffer")
+
+    # while each engine gets same micro-batches per step, we shuffle them inside train_step of each engine
+    shard_refs = shard_and_put(train_batches_padded, num_engines=num_engines)
+
+    # 4. Training loop
+    epoch_metrics = {}
+    for step in range(steps_per_epoch):
+        train_metrics = run_training_step(engines=training_engines,
+                                          shard_refs=shard_refs,
+                                          logger=logger,
+                                          train_step_timeout=train_step_timeout)
+        # collect the metrics
+        for k, v in train_metrics.items():
+            epoch_metrics.setdefault(k, []).append(v)
+
+        global_step += 1
+        if step % 10 == 0:
+            metric_str = ", ".join(f"{k}={v:.4f}" for k, v in train_metrics.items())
+            logger.info(f"[Epoch {epoch+1}][Step {step+1}/{steps_per_epoch}] {metric_str}")
+
+        if tracker:
+            tracker.log_metrics({f"train/{k}": v for k, v in train_metrics.items()}, step=global_step)
+
+    # 5. Post-training
+    policy_version += 1
+
+    return {'rollout_metrics': rollout_metrics,
+            'epoch_metrics': epoch_metrics,
+            'global_step': global_step,
+            'policy_version': policy_version,
+            'rollout_policy_version': rollout_policy_version,
+            'train_step_count': steps_per_epoch,
+            'train_time': time.time() - train_start_time,
+            'sync_performed': False}
+
+def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataloader,
+                      replay_buffer, policy_version, rollout_policy_version, global_step,
+                      train_batch_size, steps_per_epoch, seed, chunk_size, max_lag,
+                      ess_sync_threshold, fixed_sync_interval, is_last_epoch,
+                      rollout_timeout, train_step_timeout, sync_timeout,
+                      tracker, logger):
+    '''
+        Overlap epoch: interleaved chunk generation + training with ESS-driven NCCL sync.
+        Generation is dispatched one chunk at a time, only one chunk is ever in an engine's
+        FIFO mailbox. Between chunks the engines are genuinely idle, creating real windows
+        for NCCL weight sync. Training starts as soon as the first chunk arrives.
+    '''
+    epoch_start_time = time.time()
+    num_engines = len(training_engines)
+
+    # 1. Buffer is already clean and no need to reset here..
+    # 2. Setup chunked generation
+    rollout_dataloader.batch_sampler.set_epoch(epoch)
+    generation_start_time = time.time()
+    data_policy_version   = rollout_policy_version
+    dataloader_iter       = iter(rollout_dataloader)
+
+    total_batches = len(rollout_dataloader)
+    total_chunks  = (total_batches + chunk_size - 1) // chunk_size
+
+    chunk_stats_list = []
+    chunk_idx = 0
+    epoch_metrics = {}
+    sync_triggered_this_epoch = False
+    train_step_count = 0
+    training_done = False
+    ess_break = False
+    shard_refs = None
+    shard_buffer_size = 0
+    shard_rebuild_count = 0
+    train_start_time = time.time()
+
+    # Dispatch first chunk, training can't overlap yet as there is no data.
+    pending_chunk = dispatch_one_chunk(dataloader_iter=dataloader_iter,
+                                       rollout_engines=rollout_engines,
+                                       epoch=epoch,
+                                       policy_version=rollout_policy_version,
+                                       chunk_size=chunk_size,
+                                       chunk_idx=chunk_idx,
+                                       logger=logger)
+    chunk_idx += 1
+
+    logger.info(f"[Epoch {epoch+1}] On-demand generation: "
+                f"~{total_chunks} chunks (chunk_size={chunk_size}), "
+                f"policy v{rollout_policy_version}")
+
+    # 3. Interleaved generate-train loop. Each iteration:
+    #   3.1. Run training steps while the pending chunk generates
+    #   3.2. Finalize the chunk. This blocks until engines finish, merges results into buffer
+    #   3.3. Rebuild training shards if the buffer grew as new data from finalized chunk.
+    #   3.4. If ESS triggered, NCCL sync is attempted at chunk boundary (engines are idle
+    #         with empty FIFO mailboxes so the collective executes immediately)
+    #   3.5. Dispatch next chunk or stop if ESS ended training early.
+    total_overlap_train_sec = 0.0
+    total_overlap_gen_wait_sec = 0.0
+    while pending_chunk is not None:
+        # 3.1 Run as many training steps as fit while the chunk is in-flight.
+        # When generation is slower than training this fills idle time
+        # with useful work instead of blocking at finalize_chunk.
+        iter_train_start = time.time()
+        # shard_refs is None until the first chunk is finalized and the buffer
+        # has enough samples to build training batches (>= train_batch_size).
+        if not training_done and shard_refs is not None:
+            while train_step_count < steps_per_epoch:
+                train_metrics = run_training_step(engines=training_engines,
+                                                  shard_refs=shard_refs,
+                                                  logger=logger,
+                                                  train_step_timeout=train_step_timeout)
+                for k, v in train_metrics.items():
+                    epoch_metrics.setdefault(k, []).append(v)
+                global_step += 1
+                train_step_count += 1
+
+                if train_step_count % 10 == 0 or train_step_count == 1:
+                    metric_str = ", ".join(f"{k}={v:.4f}" for k, v in train_metrics.items())
+                    logger.info(f"[Epoch {epoch+1}][Step {train_step_count}/{steps_per_epoch}] "
+                                f"{metric_str}")
+
+                if tracker:
+                    tracker.log_metrics({f"train/{k}": v for k, v in train_metrics.items()},
+                                       step=global_step)
+
+                # ESS-driven early stop
+                ess = train_metrics.get('ess_factor', None)
+                if not sync_triggered_this_epoch:
+                    if ess is not None and ess < ess_sync_threshold:
+                        logger.info(f"[Epoch {epoch+1}][Step {train_step_count}] "
+                                    f"ESS={ess:.4f} < {ess_sync_threshold}, ending training early "
+                                    f"({steps_per_epoch - train_step_count} steps skipped)")
+                        training_done = True
+                        ess_break     = True
+
+                    elif ess is None and fixed_sync_interval and \
+                         train_step_count % fixed_sync_interval == 0:
+                        logger.info(f"[Epoch {epoch+1}][Step {train_step_count}] "
+                                    f"Fixed interval sync, ending training early")
+                        training_done = True
+                        ess_break     = True
+
+                if tracker and ess is not None:
+                    tracker.log_metrics({"nccl/ess_factor": ess,
+                                         "nccl/sync_triggered": 1 if sync_triggered_this_epoch else 0,
+                                        }, step=global_step)
+
+                if train_step_count >= steps_per_epoch:
+                    training_done = True
+
+                # Stop training either when training is done (ESS/steps exhausted), or
+                # when the chunk finished generating, as there is no point holding up finalization
+                # before dispatching the next chunk.
+                if training_done or chunk_is_ready(pending_chunk):
+                    break
+
+        # 3.2 Finalize current chunk
+        iter_train_sec = time.time() - iter_train_start
+        total_overlap_train_sec += iter_train_sec
+        gen_wait_start = time.time()
+        cs = finalize_chunk(chunk=pending_chunk,
+                            replay_buffer=replay_buffer,
+                            logger=logger,
+                            rollout_timeout=rollout_timeout)
+        total_overlap_gen_wait_sec += time.time() - gen_wait_start
+        chunk_stats_list.append(cs)
+        logger.info(f"[Epoch {epoch+1}] Chunk {pending_chunk.chunk_idx + 1}/{total_chunks} finalized, "
+                    f"replay buffer: {len(replay_buffer)} samples")
+
+        # Rebuild training shards when new data arrives. The size check
+        # (len != shard_buffer_size) avoids redundant rebuilds when a chunk
+        # added zero usable samples, e.g., all sequences were truncated or zero-length.
+        if len(replay_buffer) >= train_batch_size and len(replay_buffer) != shard_buffer_size:
+            train_batches_padded = prepare_training_batches(replay_buffer=replay_buffer,
+                                                            batch_size=train_batch_size,
+                                                            num_engines=num_engines,
+                                                            seed=seed,
+                                                            epoch=epoch * total_chunks + shard_rebuild_count)
+            shard_refs = shard_and_put(train_batches_padded, num_engines=num_engines)
+            shard_buffer_size    = len(replay_buffer)
+            shard_rebuild_count += 1
+            samples_per_engine   = len(replay_buffer) // num_engines
+            micro_per_engine     = len(train_batches_padded) // num_engines
+            logger.info(f"[Epoch {epoch+1}] Training shards {'rebuilt' if shard_rebuild_count > 1 else 'prepared'}: "
+                        f"{len(replay_buffer)} replay samples / {num_engines} engines "
+                        f"= {samples_per_engine} samples/engine / bs={train_batch_size} "
+                        f"= {micro_per_engine} micro-batches/engine, "
+                        f"{steps_per_epoch} pass(es)")
+
+        # 3.4 NCCL sync opportunity. After finalize_chunk, all rollout engine
+        # actors have empty FIFO mailboxes, i.e., no pending generate calls, so the
+        # NCCL collective executes immediately without queuing behind other work.
+        # We only sync once per epoch, as further training would just go stale again.
+        if ess_break and not sync_triggered_this_epoch and not is_last_epoch:
+            try:
+                logger.info(f"[Epoch {epoch+1}] NCCL sync at chunk boundary "
+                            f"(v{rollout_policy_version} -> v{policy_version})")
+                sync_weights_nccl(training_engines=training_engines,
+                                  rollout_engines=rollout_engines,
+                                  version=policy_version,
+                                  logger=logger,
+                                  sync_timeout=sync_timeout)
+                rollout_policy_version = policy_version
+                sync_triggered_this_epoch = True
+
+            except Exception as e:
+                # The fallback chain only kicks in at the end-of-epoch boundary.
+                logger.warning(f"[Epoch {epoch+1}] NCCL sync at chunk boundary failed: {e}")
+
+        # 3.5 Dispatch next chunk or stop.
+        if ess_break:
+            # Training ended early due to ESS or fixed interval. Stop generating
+            # as continuing would fill the buffer with data that won't be trained on
+            # this epoch and would be evicted or reset in post-training cleanup.
+            pending_chunk = None
+
+        else:
+            pending_chunk = dispatch_one_chunk(dataloader_iter=dataloader_iter,
+                                               rollout_engines=rollout_engines,
+                                               epoch=epoch,
+                                               policy_version=rollout_policy_version,
+                                               chunk_size=chunk_size,
+                                               chunk_idx=chunk_idx,
+                                               logger=logger)
+            chunk_idx += 1
+
+    # 4. Bulk training: finish remaining steps after all chunks are finalized.
+    # This runs when generation completes faster than training (e.g., small
+    # prompts, few chunks). The interleaved loop above consumed as many steps
+    # as it could; this block handles the remainder up to steps_per_epoch.
+    if not training_done and len(replay_buffer) >= train_batch_size:
+        if shard_refs is None or len(replay_buffer) != shard_buffer_size:
+            train_batches_padded = prepare_training_batches(replay_buffer=replay_buffer,
+                                                            batch_size=train_batch_size,
+                                                            num_engines=num_engines,
+                                                            seed=seed,
+                                                            epoch=epoch * total_chunks + shard_rebuild_count)
+
+            shard_refs = shard_and_put(train_batches_padded, num_engines=num_engines)
+            shard_buffer_size    = len(replay_buffer)
+            shard_rebuild_count += 1
+            samples_per_engine   = len(replay_buffer) // num_engines
+            micro_per_engine     = len(train_batches_padded) // num_engines
+            logger.info(f"[Epoch {epoch+1}] Bulk training shards {'rebuilt' if shard_rebuild_count > 1 else 'prepared'}: "
+                        f"{len(replay_buffer)} replay samples / {num_engines} engines "
+                        f"= {samples_per_engine} samples/engine / bs={train_batch_size} "
+                        f"= {micro_per_engine} micro-batches/engine, "
+                        f"{steps_per_epoch} pass(es)")
+
+        # run training steps
+        while train_step_count < steps_per_epoch:
+            train_metrics = run_training_step(training_engines, shard_refs,
+                                               logger=logger,
+                                               train_step_timeout=train_step_timeout)
+            for k, v in train_metrics.items():
+                epoch_metrics.setdefault(k, []).append(v)
+            global_step += 1
+            train_step_count += 1
+
+            if train_step_count % 10 == 0 or train_step_count == 1:
+                metric_str = ", ".join(f"{k}={v:.4f}" for k, v in train_metrics.items())
+                logger.info(f"[Epoch {epoch+1}][Step {train_step_count}/{steps_per_epoch}] "
+                            f"{metric_str}")
+
+            if tracker:
+                tracker.log_metrics({f"train/{k}": v for k, v in train_metrics.items()},
+                                   step=global_step)
+
+            # ESS check in bulk mode, as all chunks finalized, engines idle
+            ess = train_metrics.get('ess_factor', None)
+            should_break = False
+
+            if not sync_triggered_this_epoch:
+                if ess is not None and ess < ess_sync_threshold:
+                    logger.info(f"[Epoch {epoch+1}][Step {train_step_count}] "
+                                f"ESS={ess:.4f} < {ess_sync_threshold}, ending training early")
+                    should_break = True
+
+                elif ess is None and fixed_sync_interval and \
+                     train_step_count % fixed_sync_interval == 0:
+                    should_break = True
+
+                if should_break:
+                    try:
+                        sync_weights_nccl(training_engines=training_engines,
+                                          rollout_engines=rollout_engines,
+                                          version=policy_version,
+                                          logger=logger,
+                                          sync_timeout=sync_timeout)
+                        rollout_policy_version = policy_version
+                        sync_triggered_this_epoch = True
+                    except Exception as e:
+                        logger.warning(f"[Epoch {epoch+1}] Inline NCCL sync failed: {e}")
+
+            if tracker and ess is not None:
+                tracker.log_metrics({"nccl/ess_factor": ess,
+                                     "nccl/sync_triggered": 1 if sync_triggered_this_epoch else 0,
+                                    }, step=global_step)
+
+            if should_break:
+                break
+
+    # 5. Post-training bookkeeping.
+    # Only bump policy_version if at least one training step ran. Otherwise
+    # sync/eviction logic sees a version change with no actual weight update,
+    # causing unnecessary syncs or incorrect staleness estimates.
+    if train_step_count > 0:
+        policy_version += 1
+
+    if max_lag > 0:
+        evicted = replay_buffer.evict_stale(policy_version - max_lag)
+        if evicted > 0:
+            logger.info(f"[Epoch {epoch+1}] Post-training eviction: {evicted} stale samples removed, "
+                        f"{len(replay_buffer)} retained for next epoch")
+    else:
+        # the replay buffer can only data from one policy. this would be strict-on-policy.
+        replay_buffer.reset()
+
+    # 6. Aggregate rollout stats
+    generation_time = time.time() - generation_start_time
+    if chunk_stats_list:
+        rollout_metrics = aggregate_chunk_stats(chunk_stats_list=chunk_stats_list,
+                                               generation_time=generation_time,
+                                               wall_time=time.time() - epoch_start_time)
+    else:
+        logger.warning(f"[Epoch {epoch+1}] No chunks were finalized — dataloader may be empty")
+        rollout_metrics = rollout_stats.summarize(rollout_stats.new_accumulator(), rollout_time=generation_time)
+        rollout_metrics["rollout_time_with_overlap"] = time.time() - epoch_start_time
+
+    # 7. Overlap efficiency metrics
+    interleaved_total = total_overlap_train_sec + total_overlap_gen_wait_sec
+    overlap_ratio = total_overlap_train_sec / interleaved_total if interleaved_total > 0 else 0.0
+
+    return {'rollout_metrics': rollout_metrics,
+            'epoch_metrics': epoch_metrics,
+            'global_step': global_step,
+            'policy_version': policy_version,
+            'rollout_policy_version': rollout_policy_version,
+            'train_step_count': train_step_count,
+            'train_time': time.time() - train_start_time,
+            'sync_performed': sync_triggered_this_epoch,
+            'data_policy_version': data_policy_version,
+            'overlap_train_sec': total_overlap_train_sec,
+            'overlap_gen_wait_sec': total_overlap_gen_wait_sec,
+            'overlap_ratio': overlap_ratio}
 
 if __name__ == "__main__":
     # parse arguments
@@ -793,26 +1183,26 @@ if __name__ == "__main__":
     logger.info(f"Created {num_rollout_engines} rollout engines with TP={config.rollout.tensor_parallel_size}")
 
     ########
-    # 5. Initialize weight sync group
+    # 6. Initialize weight sync group
     ########
     weight_sync_method = config.run.weight_sync_method
 
-    if config.run.weight_sync_method == "nccl":
+    if weight_sync_method == "nccl":
         nccl_port = config.run.nccl_sync_port if config.run.nccl_sync_port else config.run.ray_master_port + 100
         nccl_world_size, nccl_gname = init_nccl_weight_sync(training_engines=training_engines,
                                                             rollout_engines=rollout_engines,
                                                             master_addr=master_addr,
                                                             nccl_port=nccl_port,
-                                                            tp_size=tp_size,
+                                                            tp_size=int(config.rollout.tensor_parallel_size),
                                                             logger=logger,
                                                             init_timeout=config.run.init_timeout)
         logger.info(f"Weight sync: NCCL (port={nccl_port}, world_size={nccl_world_size}) with NCCL group name {nccl_gname}")
 
     else:
-        logger.info(f"Weight sync method is {config.run.weight_sync_method}")
+        logger.info(f"Weight sync method is {weight_sync_method}")
 
     ########
-    # 6. load the rollout dataloader
+    # 7. load the rollout dataloader
     ########
     logger.info(f"Loading rollout dataloader from {config.data.train_files_path}")
     rollout_dataloader = create_rollout_dataloader(params=config,
@@ -830,7 +1220,7 @@ if __name__ == "__main__":
     logger.info(f"Replay buffer initialized (max_seq_len={config.data.max_seq_len})")
 
     ########
-    # 7. Some variables initialization
+    # 8. Some variables initialization
     ########
     number_of_epochs = config.train.total_number_of_epochs
     steps_per_epoch  = config.train.train_steps_per_epoch
@@ -850,7 +1240,7 @@ if __name__ == "__main__":
     chunk_size = config.overlap.chunk_size
 
     ########
-    # 8. Resume from checkpoint if requested and clean up incomplete checkpoint directories
+    # 9. Resume from checkpoint if requested and clean up incomplete checkpoint directories
     ########
     start_epoch = 0
     global_step = 0
@@ -859,7 +1249,7 @@ if __name__ == "__main__":
 
     if args.resume_from:
         start_epoch, policy_version, global_step = load_checkpoint_for_resume(resume_path=args.resume_from,
-                                                                              training_engines=training_engine,
+                                                                              training_engines=training_engines,
                                                                               rollout_engines=rollout_engines,
                                                                               weight_sync_method=weight_sync_method,
                                                                               logger=logger,
@@ -882,7 +1272,7 @@ if __name__ == "__main__":
                 shutil.rmtree(ckpt_path, ignore_errors=True)
 
     ########
-    # 9. General logging printout before training-loop
+    # 10. General logging printout before training-loop
     ########
     model_info       = ray.get(training_engines[0].get_model_info.remote())
     total_params     = model_info['total_params']
@@ -905,17 +1295,19 @@ if __name__ == "__main__":
         logger.info(f"Value model: {config.model.value_model or config.model.name} | "
                     f"params: {model_info['value_total_params']:,} total, {model_info['value_trainable_params']:,} trainable")
 
+    logger.info(f"Weight sync method: {weight_sync_method}")
     if overlap_enabled:
-        logger.info(f"ESS sync threshold: {ess_sync_threshold}, fixed_sync_interval: {fixed_sync_interval}, max_lag: {max_lag}")
-        logger.info(f"Overlap mode: max_lag={overlap_max_lag}, chunk_size={chunk_size}")
+        logger.info(f"Overlap mode: max_lag={overlap_max_lag}, chunk_size={chunk_size}, "
+                    f"ess_sync_threshold={ess_sync_threshold}, fixed_sync_interval={fixed_sync_interval}")
 
     logger.info(f"checkpoint_save_interval: {checkpoint_save_interval}")
     if args.resume_from:
         logger.info(f"Resuming from: {args.resume_from} (epoch {start_epoch+1}/{number_of_epochs})")
 
     logger.info("=" * 50)
+
     ########
-    # 10. Training loop for both sync and async depending on the config
+    # 11. Training and rollout loop
     ########
     entire_training_start_time = time.time()
 
@@ -923,32 +1315,55 @@ if __name__ == "__main__":
         epoch_start_time = time.time()
         is_last_epoch = (epoch == number_of_epochs - 1)
 
-        ################
-        # a. Evict stale samples by resetting buffer
-        ################
-        if overlap_enabled and overlap_max_lag > 0:
-            evicted = replay_buffer.evict_stale(policy_version - overlap_max_lag)
-            if evicted > 0:
-                logger.info(f"[Epoch {epoch+1}] Evicted {evicted} stale samples "
-                            f"(older than policy v{policy_version - overlap_max_lag}), "
-                            f"{len(replay_buffer)} retained")
+        # Run epoch
+        if overlap_enabled:
+            result = run_epoch_overlap(epoch=epoch,
+                                       training_engines=training_engines,
+                                       rollout_engines=rollout_engines,
+                                       rollout_dataloader=rollout_dataloader,
+                                       replay_buffer=replay_buffer,
+                                       policy_version=policy_version,
+                                       rollout_policy_version=rollout_policy_version,
+                                       global_step=global_step,
+                                       train_batch_size=config.train.train_batch_size_per_gpu,
+                                       steps_per_epoch=steps_per_epoch,
+                                       seed=config.run.seed,
+                                       chunk_size=chunk_size,
+                                       max_lag=overlap_max_lag,
+                                       ess_sync_threshold=ess_sync_threshold,
+                                       fixed_sync_interval=fixed_sync_interval,
+                                       is_last_epoch=is_last_epoch,
+                                       rollout_timeout=rollout_timeout,
+                                       train_step_timeout=train_step_timeout,
+                                       sync_timeout=sync_timeout,
+                                       tracker=tracker,
+                                       logger=logger)
+
         else:
-            replay_buffer.reset()
+            result = run_epoch_sync(epoch=epoch,
+                                    training_engines=training_engines,
+                                    rollout_engines=rollout_engines,
+                                    rollout_dataloader=rollout_dataloader,
+                                    replay_buffer=replay_buffer,
+                                    policy_version=policy_version,
+                                    rollout_policy_version=rollout_policy_version,
+                                    global_step=global_step,
+                                    n_samples=config.rollout.n_samples,
+                                    train_batch_size=config.train.train_batch_size_per_gpu,
+                                    steps_per_epoch=steps_per_epoch,
+                                    seed=config.run.seed,
+                                    rollout_timeout=rollout_timeout,
+                                    train_step_timeout=train_step_timeout,
+                                    tracker=tracker,
+                                    logger=logger)
 
-        ################
-        # 1. Collect rollouts
-        ################
-        logger.info(f"[Epoch {epoch+1}/{number_of_epochs}] Starting rollout generation...")
-        rollout_dataloader.batch_sampler.set_epoch(epoch)
-        rollout_metrics = collect_rollouts(dataloader=rollout_dataloader,
-                                            rollout_engines=rollout_engines,
-                                            epoch=epoch,
-                                            policy_version=policy_version,
-                                            replay_buffer=replay_buffer,
-                                            n_samples=config.rollout.n_samples,
-                                            logger=logger,
-                                            rollout_timeout=rollout_timeout)
+        # Unpack result
+        global_step            = result['global_step']
+        policy_version         = result['policy_version']
+        rollout_metrics        = result['rollout_metrics']
+        rollout_policy_version = result['rollout_policy_version']
 
+        # Log rollout metrics
         time_str = f"time={rollout_metrics['rollout_time']:.2f}s"
         if 'rollout_time_with_overlap' in rollout_metrics:
             time_str += f" (wall_time={rollout_metrics['rollout_time_with_overlap']:.2f}s)"
@@ -967,128 +1382,110 @@ if __name__ == "__main__":
                     f"unique_response_ratio={rollout_metrics['unique_response_ratio']:.4f}, "
                     f"{time_str}, tps={rollout_metrics['tokens_per_sec']:.2f}")
 
-        # Log rollout metrics immediately so they appear in WandB/MLflow
-        # before training starts (avoids visual lag in dashboards)
         if tracker:
-            rollout_log = {"rollout/" + k:v for k,v in rollout_metrics.items()}
+            rollout_log = {"rollout/" + k: v for k, v in rollout_metrics.items()}
+            if overlap_enabled:
+                rollout_log["rollout/policy_lag"] = policy_version - result.get('data_policy_version', policy_version)
             tracker.log_metrics(rollout_log, step=global_step)
 
-        ################
-        # 2. Prepare training batches
-        ################
-        logger.info(f"[Epoch {epoch+1}] Replay buffer has {len(replay_buffer)} samples")
-        train_start_time = time.time()
+        # Log training summary
+        epoch_avg = {k: np.mean(v) for k, v in result['epoch_metrics'].items()}
 
-        # All ranks/gpus should get EQUAL number of batches
-        # to prevent deepspeed hang so we pad the batches which are not
-        # divisible by num_train_engines
-        train_batches_padded = prepare_training_batches(replay_buffer=replay_buffer,
-                                                        batch_size=config.train.train_batch_size_per_gpu,
-                                                        num_engines=len(training_engines),
-                                                        seed=config.run.seed,
-                                                        epoch=epoch)
-        samples_per_engine = len(replay_buffer) // len(training_engines)
-        micro_per_engine = len(train_batches_padded) // len(training_engines)
-        logger.info(f"[Epoch {epoch+1}] Training: "
-                    f"{len(replay_buffer)} replay samples / {len(training_engine)} training engines "
-                    f"= {samples_per_engine} samples/engine / bs={config.train.train_batch_size_per_gpu} "
-                    f"= {micro_per_engine} micro-batches/engine, "
-                    f"{steps_per_epoch} pass(es) over replay buffer")
-
-        # Pre-shard and store in Ray object store once.
-        # Avoids re-serializing the same data on every step (batches are
-        # reused unchanged across all steps_per_epoch iterations).
-        shard_refs = shard_and_put(train_batches_padded, num_engines=len(training_engine))
-
-        ################
-        # 3. Training loop
-        ################
-        epoch_metrics = {}
-        for step in range(steps_per_epoch):
-            train_metrics = run_training_step(training_engines, shard_refs,
-                                                logger=logger,
-                                                train_step_timeout=train_step_timeout)
-
-            # Epoch average of average across all training engines (dynamic keys)
-            for k, v in train_metrics.items():
-                epoch_metrics.setdefault(k, []).append(v)
-            global_step += 1
-
-            # Log progress
-            if step % 10 == 0:
-                metric_str = ", ".join(f"{k}={v:.4f}" for k, v in train_metrics.items())
-                logger.info(f"[Epoch {epoch+1}][Step {step+1}/{steps_per_epoch}] {metric_str}")
-
-            # Log to experiment tracker every step
-            if tracker:
-                tracker.log_metrics({f"train/{k}": v for k, v in train_metrics.items()},
-                                   step=global_step)
-
-        policy_version += 1
-        if config.train.alg_name.lower() in Algorithm_Registry.keys():
-            replay_buffer.reset()
-
-        ################
-        # 4. Log epoch summary
-        ################
-        train_time = time.time() - train_start_time
-        epoch_time = time.time() - epoch_start_time
-
-        epoch_avg = {k: np.mean(v) for k, v in epoch_metrics.items()}
-
-        # Fetch lr and gpu memory from rank 0 engine
         train_stats = ray.get(training_engines[0].get_training_stats.remote())
         current_lr = train_stats.get('lr', 0.0)
         gpu_mem_gb = train_stats.get('gpu_peak_mem_gb', 0.0)
 
-        logger.info(f"[Epoch {epoch+1}] Training complete: time={train_time:.2f}s, "
+        logger.info(f"[Epoch {epoch+1}] Training complete: {result['train_step_count']} steps, "
+                    f"time={result['train_time']:.2f}s, "
                     f"avg_loss={epoch_avg.get('loss_total', 0.0):.4f}, "
                     f"avg_kl_ref={epoch_avg.get('kl_ref', 0.0):.4f}, "
                     f"avg_approx_kl={epoch_avg.get('approx_kl', 0.0):.6f}, "
                     f"lr={current_lr:.2e}, gpu_peak_mem={gpu_mem_gb:.2f}GB")
 
         if tracker:
-            tracker.log_metrics({"train/epoch_time_sec": train_time,
+            tracker.log_metrics({"train/epoch_time_sec": result['train_time'],
                                  "train/lr": current_lr,
                                  "train/gpu_peak_mem_gb": gpu_mem_gb,
                                 }, step=global_step)
 
-        ################
-        # 5. Sync weights to rollout engines
-        ################
-        sync_attempted = False
-        sync_success = False
+        # Log overlap efficiency metrics
+        if overlap_enabled:
+            o_train = result['overlap_train_sec']
+            o_wait = result['overlap_gen_wait_sec']
+            o_ratio = result['overlap_ratio']
+            logger.info(f"[Epoch {epoch+1}] Overlap: interleaved_train={o_train:.2f}s, "
+                        f"gen_wait={o_wait:.2f}s, ratio={o_ratio:.2%}")
+            if tracker:
+                tracker.log_metrics({"overlap/interleaved_train_sec": o_train,
+                                     "overlap/gen_wait_sec": o_wait,
+                                     "overlap/ratio": o_ratio,
+                                    }, step=global_step)
 
-        if not is_last_epoch and weight_sync_method == "direct":
-            sync_attempted = True
-            logger.info(f"[Epoch {epoch+1}] Syncing weights directly to rollout engines "
-                        f"(v{rollout_policy_version} -> v{policy_version})...")
+        # End-of-epoch weight sync
+        sync_success = result['sync_performed']
 
-            try:
-                sync_success = sync_weights_direct(training_engines=training_engines,
-                                                   rollout_engines=rollout_engines,
-                                                   version=policy_version,
-                                                   logger=logger,
-                                                   sync_timeout=sync_timeout)
-            except Exception as e:
-                logger.warning(f"[Epoch {epoch+1}] Direct sync raised {e}, falling back to disk")
-                sync_success = False
+        if not sync_success and not is_last_epoch:
+            if weight_sync_method == "nccl":
+                # NCCL sync if lag exceeds max_lag, with direct fallback
+                lag = policy_version - rollout_policy_version
+                if lag >= overlap_max_lag:
+                    logger.info(f"[Epoch {epoch+1}] End-of-epoch NCCL sync "
+                                f"(v{rollout_policy_version} -> v{policy_version})...")
+                    try:
+                        sync_weights_nccl(training_engines=training_engines,
+                                          rollout_engines=rollout_engines,
+                                          version=policy_version,
+                                          logger=logger,
+                                          sync_timeout=sync_timeout)
+                        rollout_policy_version = policy_version
+                        sync_success = True
 
-            if sync_success:
-                rollout_policy_version = policy_version
-                logger.info(f"[Epoch {epoch+1}] Direct sync successful")
+                    except Exception as e:
+                        logger.warning(f"[Epoch {epoch+1}] NCCL sync failed: {e}, falling back to direct")
+                        try:
+                            sync_success = sync_weights_direct(training_engines=training_engines,
+                                                               rollout_engines=rollout_engines,
+                                                               version=policy_version,
+                                                               logger=logger,
+                                                               sync_timeout=sync_timeout)
+                            if sync_success:
+                                rollout_policy_version = policy_version
 
-        ################
-        # 6. Save checkpoint
-        ################
+                        except Exception as e2:
+                            logger.error(f"[Epoch {epoch+1}] Direct fallback also failed: {e2}")
+                else:
+                    logger.info(f"[Epoch {epoch+1}] Skipping weight sync (lag={lag}, max_lag={overlap_max_lag})")
+
+            elif weight_sync_method == "direct":
+                logger.info(f"[Epoch {epoch+1}] Syncing weights directly to rollout engines "
+                            f"(v{rollout_policy_version} -> v{policy_version})...")
+
+                try:
+                    sync_success = sync_weights_direct(training_engines=training_engines,
+                                                       rollout_engines=rollout_engines,
+                                                       version=policy_version,
+                                                       logger=logger,
+                                                       sync_timeout=sync_timeout)
+                except Exception as e:
+                    logger.warning(f"[Epoch {epoch+1}] Direct sync raised {e}, falling back to disk")
+                    sync_success = False
+
+                if sync_success:
+                    rollout_policy_version = policy_version
+                    logger.info(f"[Epoch {epoch+1}] Direct sync successful")
+
+        # Save checkpoint
         should_save_disk = (checkpoint_save_interval > 0 and
                            ((epoch + 1) % checkpoint_save_interval == 0 or is_last_epoch))
 
         # save to disk when:
         # 1. using disk-based sync (always need disk save for rollout refresh).
-        # 2. direct sync was attempted but failed.
+        # 2. all sync methods failed (need disk as last resort for rollout refresh).
         # 3. periodic/final checkpoint save.
-        need_disk_for_rollout = (weight_sync_method == "disk" and not is_last_epoch) or (sync_attempted and not sync_success)
+        no_sync_succeeded = not result['sync_performed'] and not sync_success
+        need_disk_for_rollout = (weight_sync_method == "disk" and not is_last_epoch) or \
+                                (no_sync_succeeded and weight_sync_method in ("nccl", "direct", "disk") and not is_last_epoch)
+
         if need_disk_for_rollout or should_save_disk or is_last_epoch:
             model_path = save_checkpoint(epoch=epoch,
                                          version=policy_version,
@@ -1102,9 +1499,7 @@ if __name__ == "__main__":
                                          save_timeout=save_timeout)
             logger.info(f"[Epoch {epoch+1}] Saved disk checkpoint at {model_path}")
 
-        ################
-        # 8. Disk-based rollout refresh
-        ################
+        # Disk-based rollout refresh
         if need_disk_for_rollout and not is_last_epoch:
             logger.info(f"[Epoch {epoch+1}] Refreshing rollout engines with new policy (version {policy_version})...")
             refresh_rollout_engine(rollout_engines=rollout_engines,
@@ -1115,18 +1510,43 @@ if __name__ == "__main__":
             rollout_policy_version = policy_version
             logger.info(f"[Epoch {epoch+1}] Rollout engines refreshed")
 
+        # NCCL sync metrics
+        if tracker and overlap_enabled:
+            tracker.log_metrics({"nccl/policy_version": policy_version,
+                                 "nccl/rollout_policy_version": rollout_policy_version,
+                                 "nccl/policy_lag": policy_version - rollout_policy_version,
+                                 "nccl/sync_success": 1 if sync_success else 0,
+                                }, step=global_step)
+
+        epoch_time = time.time() - epoch_start_time
         logger.info(f"[Epoch {epoch+1}] Complete! Total epoch time: {epoch_time:.2f}s")
         logger.info("=" * 50)
 
-    # End experiment tracker run
+    ########
+    # 12. Cleanup
+    ########
     if tracker:
         tracker.finish()
 
     entire_training_time = time.time() - entire_training_start_time
     logger.info(f"Training completed successfully! Total time: {entire_training_time:.2f}s ({entire_training_time/3600:.2f}h)")
 
-    # Clean up nccl process groups before ray tears down actors.
-    # All engines must call destroy_process_group concurrently. it's collective.
+    # Tear down NCCL weight sync groups if they were initialized
+    if weight_sync_method == "nccl":
+        logger.info("[Cleanup] Closing NCCL weight sync groups...")
+        try:
+            ray.get(training_engines[0].close_weight_nccl_group.remote())
+
+        except Exception as e:
+            logger.warning(f"[Cleanup] Failed to close training NCCL group: {e}")
+
+        for eng in rollout_engines:
+            try:
+                ray.get(eng.close_nccl_group.remote())
+            except Exception:
+                pass
+
+    # Clean up process groups before ray tears down actors.
     shutdown_futures = [engine.shutdown.remote() for engine in training_engines]
     try:
         ray.get(shutdown_futures, timeout=30)
