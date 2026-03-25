@@ -250,33 +250,27 @@ if __name__ == "__main__":
     checkpoint_save_interval = config.run.checkpoint_save_interval if config.run.checkpoint_save_interval is not None else 1
 
     ########
+    # 3. Initialize distributed backend early.
+    ########
+    # nccl topology discovery on multi-gpu nodes especially with InfiniBand can take time.
+    # Initializing here lets nccl establish connections while model loading runs on CPU,
+    # preventing hangs inside deepspeed.initialize().
+    if config.run.nccl_socket_ifname:
+        os.environ["NCCL_SOCKET_IFNAME"] = config.run.nccl_socket_ifname
+
+    if config.run.nccl_ib_hca:
+        os.environ["NCCL_IB_HCA"] = config.run.nccl_ib_hca
+    deepspeed.init_distributed()
+
+    ########
     # 4. load model or previous checkpoints
     ########
-    # Initialize distributed backend early so deepspeed.zero.Init() can partition
-    # parameters at creation time
-    if not torch.distributed.is_initialized():
-        deepspeed.init_distributed()
-
-    is_zero3 = config.deepspeed.zero_optimization.get("stage", 0) == 3
-    if is_zero3:
-        # stage 3 partitions parameters at creation to avoid every rank loading the full
-        # model into cpu ram which causes oom for large models on multi-gpu nodes.
-        # for stages 0/1/2, every rank must hold the full model parameters.
-        ds_config_dict = config.deepspeed.model_dump()
-        with deepspeed.zero.Init(config_dict_or_path=ds_config_dict):
-            model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
-                                                                    model_dtype=config.model.dtype,
-                                                                    ref_model_name=config.model.ref_model,
-                                                                    trust_remote_code=config.model.trust_remote_code,
-                                                                    attn_impl=config.model.attn_implementation,
-                                                                    rank=rank)
-    else:
-        model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
-                                                                model_dtype=config.model.dtype,
-                                                                ref_model_name=config.model.ref_model,
-                                                                trust_remote_code=config.model.trust_remote_code,
-                                                                attn_impl=config.model.attn_implementation,
-                                                                rank=rank)
+    model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
+                                                            model_dtype=config.model.dtype,
+                                                            ref_model_name=config.model.ref_model,
+                                                            trust_remote_code=config.model.trust_remote_code,
+                                                            attn_impl=config.model.attn_implementation,
+                                                            rank=rank)
 
     # apply PEFT module if enabled
     if config.peft.use_peft:
@@ -290,7 +284,7 @@ if __name__ == "__main__":
         num_trainable = sum(1 for p in model.parameters() if p.requires_grad)
         assert num_trainable > 0, "PEFT produced zero trainable parameters. Check peft.lora_target_modules"
     ########
-    # 5. Setup trainiing and inference engines
+    # 5. Setup training and inference engines
     ########
     if config.model.gradient_checkpointing:
         logger.info("Gradient checkpointing enabled")
@@ -308,6 +302,12 @@ if __name__ == "__main__":
                                                                        deepspeed_ref_config=config.deepspeed_ref,
                                                                        model=model,
                                                                        ref_model=ref_model)
+    is_zero3 = config.deepspeed.zero_optimization.get("stage", 0) == 3
+    engine_ga_steps_value = getattr(model_engine, "gradient_accumulation_steps")
+    ga_steps = int(engine_ga_steps_value() if callable(engine_ga_steps_value) else engine_ga_steps_value)
+    if ga_steps != config.train.gradient_accumulation_steps:
+        raise RuntimeError(f"DeepSpeed gradient_accumulation_steps ({ga_steps}) does not match config "
+                           f"({config.train.gradient_accumulation_steps}).")
 
     ########
     # 6. Build env or data loader
@@ -326,17 +326,20 @@ if __name__ == "__main__":
                                           world_size=world_size,
                                           rank=rank)
 
-    # ZeRO-3 uses all-gather collectives inside every forward pass, sized for
-    # train_micro_batch_size_per_gpu. A larger val batch can OOM because
-    # activation memory exceeds what DeepSpeed budgeted.
+    # With ZeRO-3, model parameters are partitioned across GPUs and only gathered temporarily
+    # into gpu memory during a forward/backward pass. Peak memory scales with batch size.
+    # During training, ds pre-allocates memory for train_batch_size_per_gpu.
+    # A larger val batch gathers the same parameters but processes more samples simultaneously,
+    # requiring more activation memory which can cause oom.
     if is_zero3 and config.train.val_batch_size_per_gpu > config.train.train_batch_size_per_gpu:
         logger.warning(f"val_batch_size_per_gpu ({config.train.val_batch_size_per_gpu}) > "
                        f"train_batch_size_per_gpu ({config.train.train_batch_size_per_gpu}) with ZeRO stage 3. "
-                       f"This may cause OOM during validation. Consider setting val_batch_size_per_gpu <= "
-                       f"train_batch_size_per_gpu.")
+                       f"This may cause OOM during validation. The warning is just a heads-up and this won't always OOM. "
+                       f"Consider setting val_batch_size_per_gpu <= train_batch_size_per_gpu.")
+
 
     ########
-    # 7. Intitate the learning algorithm (e.g., ppo)
+    # 7. Initiate the learning algorithm
     ########
     alg_class = load_algorithm(config.train.alg_name, Algorithm_Registry)
     alg = alg_class(model_engine=model_engine,
@@ -346,26 +349,26 @@ if __name__ == "__main__":
                     beta=config.train.cl_beta)
 
     ########
-    # 8. Training and evaluation loop
+    # 8. Variable initialization
     ########
     if rank == 0:
         print("Starting training...")
 
     total_number_of_train_samples = len(train_dataloader.dataset)
     micro_batches_per_epoch = config.train.micro_batches_per_epoch
-    optimizer_steps_per_epoch = micro_batches_per_epoch // config.train.gradient_accumulation_steps
+    optimizer_steps_per_epoch = micro_batches_per_epoch // ga_steps
 
     # if micro_batches_per_epoch is not divisible by gradient_accumulation_steps
-    if micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
-        remainder = micro_batches_per_epoch % config.train.gradient_accumulation_steps
+    if micro_batches_per_epoch % ga_steps != 0:
+        remainder = micro_batches_per_epoch % ga_steps
         # raising error to enforce correctness
         raise ValueError(f"micro_batches_per_epoch ({micro_batches_per_epoch}) MUST be divisible by "
-                         f"gradient_accumulation_steps ({config.train.gradient_accumulation_steps}) to ensure "
+                         f"gradient_accumulation_steps ({ga_steps}) to ensure "
                          "all gradients are applied within the epoch boundaries. "
                          f"Adjust configuration. Remainder: {remainder}")
 
     ########
-    # 8a. Resume from checkpoint
+    # 9. Resume from checkpoint
     ########
     start_epoch = 0
     global_step = 0
@@ -390,9 +393,9 @@ if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info(f"Starting training: {config.train.total_number_of_epochs} epochs")
     logger.info(f"Train set: {len(train_dataloader.dataset)} samples | micro_batches/epoch={micro_batches_per_epoch} | "
-                f"optimizer_steps/epoch={optimizer_steps_per_epoch} | grad_accum={config.train.gradient_accumulation_steps}")
+                f"optimizer_steps/epoch={optimizer_steps_per_epoch} | grad_accum={ga_steps}")
     logger.info(f"batch_size_per_gpu={config.train.train_batch_size_per_gpu} | "
-                f"global_batch_size={config.train.train_batch_size_per_gpu * config.train.gradient_accumulation_steps * world_size}")
+                f"global_batch_size={config.train.train_batch_size_per_gpu * ga_steps * world_size}")
     if config.peft.use_peft:
         logger.info(f"Model: {config.model.name} | PEFT: {config.peft.peft_type} | "
                     f"params: {total_params:,} total, {trainable_params:,} peft ({100*trainable_params/total_params:.2f}%), "
@@ -407,6 +410,9 @@ if __name__ == "__main__":
         logger.info(f"Resuming from: {args.resume_from} (epoch {start_epoch + 1}/{config.train.total_number_of_epochs})")
     logger.info("=" * 50)
 
+    ########
+    # 10. Training and evaluation loop
+    ########
     # Sync before starting
     # Ensure all nodes have loaded the model and data before anyone starts iterating
     if torch.distributed.is_initialized():
@@ -420,10 +426,10 @@ if __name__ == "__main__":
         # Ensure gradients are zeroed at the start of epoch to prevent any bleeding from previous epoch
         # if accumulation steps were not perfectly aligned (though we enforce alignment above).
         model_engine.train()
-        model_engine.optimizer.zero_grad()
+        model_engine.zero_grad()
 
         ########
-        # 8.1 Training loop
+        # 11. Training loop
         ########
         if rank == 0:
             progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{config.train.total_number_of_epochs}", disable=(rank != 0))
@@ -469,7 +475,9 @@ if __name__ == "__main__":
                         "train/lr": current_lr,
                     }, step=global_step)
 
-        # Sync before validation to ensure consistent state
+        ########
+        # 12. Sync before validation to ensure consistent state
+        ########
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -487,7 +495,7 @@ if __name__ == "__main__":
         gc.collect()
 
         ########
-        # 8.2 Validation loop
+        # 13. Validation loop
         ########
         # DPO eval_step returns per-batch metrics (loss, chosen_rewards, rejected_rewards, reward_accuracies).
         # We accumulate and average across batches and GPUs.
@@ -527,7 +535,7 @@ if __name__ == "__main__":
                 tracker.log_metrics({f"val/{k}": v for k, v in global_avgs.items()}, step=global_step)
 
         ########
-        # 8.3 Save checkpoint
+        # 14. Save checkpoint
         ########
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -557,7 +565,10 @@ if __name__ == "__main__":
     if tracker:
         tracker.finish()
 
-    # Clean shutdown: release NCCL communicators and process group resources
+    ########
+    # 15. Clean shutdown
+    ########
+    # release NCCL communicators and process group resources
     # to prevent orphaned processes and hangs on exit in multi-node setups.
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
