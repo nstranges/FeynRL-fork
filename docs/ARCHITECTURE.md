@@ -22,15 +22,30 @@ Trajectory generation is powered by **vLLM**, which provides:
 - **Dynamic Loading**: Support for directly updating policy weights during training.
 
 ### 🔄 Weight Synchronization
-FeynRL supports two methods for syncing weights from the training engine to the rollout workers:
-1. **Direct Sync**: Weights are gathered from training engines and pushed to rollout workers via Ray's shared-memory object store, avoiding disk I/O entirely.
-2. **Disk Sync**: Weights are saved as a checkpoint to disk, and rollout workers reload from the saved path. This also serves as an automatic fallback if direct sync fails.
+FeynRL supports three methods for syncing weights from the training engine to the rollout workers, with an automatic fallback chain (NCCL to direct to disk):
+1. **NCCL Broadcast** (fastest): Training rank 0 broadcasts weights directly to all rollout engine TP workers over a dedicated NCCL process group. Zero-copy, no serialization overhead. Requires all participants to be idle (no pending Ray tasks in their mailboxes).
+2. **Direct Sync**: Weights are gathered from training engines via DeepSpeed's ZeRO gather and pushed to rollout workers through Ray's shared-memory object store. No disk I/O, but involves serialization.
+3. **Disk Sync**: Weights are saved as a checkpoint to disk, and rollout workers reload from the saved path. Slowest, but always available as a last-resort fallback.
+
+If NCCL sync fails, FeynRL automatically falls back to direct sync. If direct sync also fails, it falls back to disk. This ensures rollout engines always receive updated weights.
 
 ### 🔁 Training↔Rollout Scheduling
 FeynRL supports two execution modes that control how rollout generation and training are scheduled:
 
-1. **Synchronous**: Each epoch generates rollouts, trains on them, syncs weights, and repeats. Simple, fully "on-policy", and easy to debug. Training and rollout workers are scheduled sequentially on separate GPUs.
-2. **Overlap (async prefetch)**: When enabled, the next epoch's rollouts are scheduled *during* the current training step, running concurrently on separate GPUs. A configurable maximum lag controls how many policy versions the rollout engine can fall behind before a weight sync is forced. This improves GPU utilization by reducing idle time, at the cost of slightly staler rollout data.
+1. **Synchronous** (`main_rl.py: run_epoch_sync`): Each epoch generates all rollouts (blocking), trains on them, syncs weights, and repeats. Fully on-policy, simple to debug, and the right choice when data freshness matters more than throughput.
+
+2. **Overlap** (`main_rl.py: run_epoch_overlap`): Generation and training run concurrently on separate GPUs within the same epoch. This mode significantly reduces GPU idle time and improves throughput. It works as follows:
+
+   - **Chunk-based dispatch**: The dataloader is consumed in small chunks (configurable `chunk_size`). Only one chunk is ever in-flight at a time, keeping each rollout engine's FIFO mailbox shallow so NCCL sync can execute immediately between chunks.
+   - **Interleaved training**: While a chunk generates on the rollout engines, the driver runs as many training steps as fit on the training engines using already-collected data. When the chunk finishes (or training is done), the driver finalizes the chunk, adds results to the replay buffer, and dispatches the next chunk.
+   - **ESS-driven weight sync**: An Effective Sample Size (ESS) factor, computed from importance weights inside the training step, monitors how much the current policy has diverged from the rollout policy. When ESS drops below a configurable threshold (`ess_sync_threshold`), training stops early and an NCCL weight sync is triggered at the chunk boundary while engines are idle. This is an **adaptive** approach: unlike fixed sync intervals used in other frameworks, ESS responds to the actual divergence between the training and rollout policies, so syncs happen exactly when they are needed rather than on a rigid schedule. When the policy changes slowly, syncs are infrequent and training proceeds uninterrupted; when the policy shifts quickly, syncs happen sooner to keep rollout data fresh. A fixed sync interval can also be used as a fallback when ESS is not available.
+   - **Staleness control**: A configurable `max_lag` controls how many policy versions the rollout data can lag behind. The replay buffer retains samples from recent policies and evicts stale ones, enabling mild off-policy reuse without unbounded staleness.
+   - **Fallback chain**: Weight sync uses NCCL broadcast (fastest), falling back to direct transfer via Ray object store, then to disk-based checkpoint reload if needed. This ensures rollout engines always receive updated weights regardless of the cluster environment.
+   - **Bulk training**: If generation finishes before all training steps are consumed (e.g., small prompts, few chunks), the remaining steps run in a bulk training phase after all chunks are finalized.
+
+   **When to use each mode:**
+   - Use **overlap mode** when generation is the bottleneck (large models, long sequences) and you want to fill training GPU idle time with useful work.
+   - Use **sync mode** when you need strict on-policy data, are debugging, or when training and generation take roughly the same time (overlap provides little benefit in that case).
 
 ## 🧩 Modularity & Extensibility
 

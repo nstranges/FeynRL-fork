@@ -54,9 +54,7 @@ If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 1
 | `rollout_gpus` | GPUs for vLLM rollout engines (also used in eval) | Integer ≥ 1 | `2`, `4`, `7` |
 | `ray_address` | Ray cluster address |`"auto"` if multi-node, `null` if single-node | `"auto"`  |
 | `ray_master_port` | Port for torch distributed rendezvous | Integer \| `null` | `29500` |
-| `overlap_enabled` | Enable async overlap of rollout and training |  `True`, `False` | `True` |
-| `overlap_max_lag` | Max policy versions rollout can lag behind | Integer ≥ 1 | `1`, `2`, `3` |
-| `weight_sync_method` | Weight sync method (default: `"direct"`) | `"direct"` \| `"disk"` | `"direct"` |
+| `weight_sync_method` | Weight sync method. `"nccl"` is required when overlap is enabled. | `"direct"` \| `"disk"` \| `"nccl"` | `"direct"` |
 | `nccl_sync_port` | Port for NCCL weight sync rendezvous (default: `ray_master_port + 100`) | Integer \| `null` | `29600` |
 
 #### RL Timeouts (seconds)
@@ -68,6 +66,20 @@ If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 1
 | `train_step_timeout` | Single training step | Seconds (Integer ≥ 0) | `1200` |
 | `save_timeout` | Checkpoint save |  Seconds (Integer ≥ 0) | `1800` |
 | `sync_timeout` | Weight sync operations | Seconds (Integer ≥ 0) | `1800` |
+
+---
+
+## `overlap` — Overlap Engine (RL only)
+
+Controls interleaved rollout generation and training within a single epoch. When enabled, `weight_sync_method` must be `"nccl"`. See the [Architecture Overview](../docs/ARCHITECTURE.md#-trainingrollout-scheduling) for how these parameters interact.
+
+| Parameter | Description | Type / Constraint | Examples |
+|:---|:---|:---|:---|
+| `enabled` | Enable overlap of rollout and training | Boolean | `False` |
+| `max_lag` | Max policy versions rollout data can lag behind. The replay buffer evicts samples older than this. | Integer ≥ 1 | `1`, `2`, `3` |
+| `chunk_size` | Dataloader batches per generation chunk. One chunk in-flight at a time; smaller = more frequent NCCL sync windows. `1` = max overlap, fastest ESS response. `>1` = fewer round-trips, coarser sync. | Integer ≥ 1 | `1`, `2`, `4` |
+| `ess_sync_threshold` | ESS below this triggers weight sync. Lower = more tolerance for off-policy data. | Float in (0.0, 1.0] | `0.5`, `0.8` |
+| `fixed_sync_interval` | Static sync interval in training steps, used when ESS is not available. `null` = disabled (ESS-driven only). | Integer ≥ 1 \| `null` | `1`, `3`, `null` |
 
 ---
 

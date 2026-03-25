@@ -55,13 +55,13 @@ For a more detailed breakdown, see the **[Architecture Overview](docs/ARCHITECTU
 - 🖥️ **Distributed training**: Multi-GPU and multi-node via DeepSpeed (ZeRO Stage 1/2/3)
 - 🎲 **Rollouts / inference**: vLLM-powered rollout engines with tensor parallelism
 - 🛰️ **Orchestration**: Ray for scheduling training and rollout workers across nodes
-- 🔀 **Training↔rollout scheduling**: Sync and Async modes to further improve throughput
-- 🔄 **Weight sync**: Fast in-memory transfer with disk fallback
+- 🔀 **Training↔rollout scheduling**: Sync and overlap (async) modes; the overlap engine interleaves chunk-based generation with training, using ESS-driven NCCL weight sync to keep rollout data fresh while significantly reducing GPU idle time
+- 🔄 **Weight sync**: NCCL broadcast (fastest), direct in-memory transfer via Ray object store, and disk-based checkpoint reload, with automatic fallback chain (NCCL to direct to disk)
 - 🧷 **Parameter-efficient fine-tuning**: LoRA via PEFT
 - 📈 **Experiment tracking**: MLflow and Weights & Biases support
 - 🏅 **Evaluation**: Standalone eval pipeline with vLLM engines
 
-For RL, Ray orchestrates the full training loop: it schedules DeepSpeed training workers and vLLM rollout workers across nodes, and coordinates periodic weight synchronization between them via in-memory transfer (with a disk-based fallback). Training and rollout can run synchronously (generate, then train, then sync) or asynchronously (overlap generation with training to reduce GPU idle time, with a configurable staleness bound). SFT and DPO are simpler as they only need a single model and no rollout workers, so they run directly on DeepSpeed without Ray. All paradigms support full fine-tuning and LoRA, and plug into mixed-dataset sampling, experiment tracking, and standalone evaluation without changing the pipeline.
+For RL, Ray orchestrates the full training loop: it schedules DeepSpeed training workers and vLLM rollout workers across nodes, and coordinates weight synchronization between them. In **sync mode**, each epoch generates all rollouts, trains on them, syncs weights, and repeats. In **overlap mode**, generation is dispatched one chunk at a time while training runs concurrently on already-collected data, significantly reducing GPU idle time. An ESS (Effective Sample Size) metric monitors policy divergence and triggers NCCL weight sync at chunk boundaries when the rollout engines are idle, keeping data fresh without stalling the pipeline. Weight sync uses a three-tier fallback chain: NCCL broadcast (fastest, zero-copy), direct transfer via Ray object store, and disk-based checkpoint reload. SFT and DPO are simpler as they only need a single model and no rollout workers, so they run directly on DeepSpeed without Ray. All paradigms support full fine-tuning and LoRA, and plug into mixed-dataset sampling, experiment tracking, and standalone evaluation without changing the pipeline.
 
 ## 📢 News
 

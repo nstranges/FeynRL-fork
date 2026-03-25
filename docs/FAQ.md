@@ -17,9 +17,15 @@ That's a fair point that not overlapping rollout and training can leave some GPU
 
 1. **On-policy methods are sensitive to data freshness.** Most practical RL post-training recipes for large models are effectively on-policy (or close to it) and rely on mechanisms like PPO-style clipping to stay stable when the policy changes. If a rollout engine keeps generating while the policy is being updated, a growing fraction of those samples can become off-policy. Once the divergence is large enough, clipping tends to reduce the update signal, and many samples may contribute less useful gradient. This doesn't mean continuous generation is always wrong, it's a trade-off, and the right choice depends on the setting.
 
-2. **The limiting factor is usually algorithm reliability, not raw rollout speed.** In practice, the hard part of RL for large models isn’t only that generation is expensive, it’s the underlying algorithmic limitations. If the underlying method isn’t reliably improving the policy when it should, increasing rollout throughput often just increases complexity (queues, buffering, off-policy correction, synchronization) without improving outcomes.
+2. **The limiting factor is usually algorithm reliability, not raw rollout speed.** In practice, the hard part of RL for large models isn't only that generation is expensive, it's the underlying algorithmic limitations. If the underlying method isn't reliably improving the policy when it should, increasing rollout throughput often just increases complexity (queues, buffering, off-policy correction, synchronization) without improving outcomes.
 
-This does not imply that system throughput is unimportant or can be ignored. It emphasizes that RL itself has many fundamental challenges, and system optimization pays off most once the algorithm is in a healthy place. That said, we actively develop ways to improve system throughput and plan to adopt proven patterns from other works as they mature, as long as they align with the design goals of this repo.
+This does not imply that system throughput is unimportant or can be ignored. It emphasizes that RL itself has many fundamental challenges, and system optimization pays off most once the algorithm is in a healthy place.
+
+That said, FeynRL includes an **overlap engine** that provides a practical middle ground: it interleaves chunk-based generation with training within the same epoch, significantly reducing GPU idle time while keeping data freshness under control via ESS-driven weight sync. See the next question for details.
+
+## How does the overlap engine work, and when should I use it?
+
+The overlap engine (`run_epoch_overlap` in `main_rl.py`) interleaves rollout generation and training within a single epoch, dispatching generation in small chunks while training runs concurrently on already-collected data. It uses ESS (Effective Sample Size) to adaptively trigger weight syncs only when the policy has diverged enough, rather than on a fixed schedule. For a full description of the mechanisms (chunk-based dispatch, ESS-driven sync, staleness control, fallback chain) and guidance on when to use each mode, see the [Architecture Overview](./ARCHITECTURE.md#-trainingrollout-scheduling).
 
 ## Other frameworks include many system improvements. Why don't you include them?
 
