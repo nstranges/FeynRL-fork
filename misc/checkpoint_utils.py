@@ -154,7 +154,7 @@ def barrier_with_error_check(succeeded, device, label):
                            f"to prevent deadlock")
 
 
-def resume_from_checkpoint(resume_path, model_engine, world_size, logger, zero_stage=None, model_dtype=None, use_peft=None):
+def resume_from_checkpoint(resume_path, model_engine, world_size, logger, zero_stage=None, model_dtype=None, use_peft=None, ref_model_name=None):
     '''
         Resume training from a previously saved checkpoint.
         Validates the checkpoint, loads ds engine state (weights + optimizer +
@@ -214,6 +214,16 @@ def resume_from_checkpoint(resume_path, model_engine, world_size, logger, zero_s
     elif use_peft is not None and 'use_peft' not in training_state:
         logger.warning("[Resume] Checkpoint has no use_peft metadata, skipping PEFT validation.")
 
+    # Validate ref model matches
+    if ref_model_name is not None and 'ref_model_name' in training_state:
+        saved_ref = training_state['ref_model_name']
+        if saved_ref is not None and saved_ref != ref_model_name:
+            raise ValueError(f"Checkpoint was saved with ref_model={saved_ref} but current config uses "
+                             f"ref_model={ref_model_name}. ref model must be the same across resume.")
+
+    elif ref_model_name is not None and 'ref_model_name' not in training_state:
+        logger.warning("[Resume] Checkpoint has no ref_model_name metadata, skipping ref model validation.")
+
     logger.info(f"[Resume] Loading checkpoint from {resume_path} "
                 f"(completed epoch {saved_epoch + 1}, global_step={global_step})")
 
@@ -244,7 +254,7 @@ def resume_from_checkpoint(resume_path, model_engine, world_size, logger, zero_s
     return start_epoch, global_step
 
 
-def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_path, peft_config, rank, world_size, logger, label, zero_stage=None, model_dtype=None):
+def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_path, peft_config, rank, world_size, logger, label, zero_stage=None, model_dtype=None, ref_model_name=None):
     '''
         Save a full training checkpoint: HF-compatible weights, model config,
         generation config, tokenizer, DeepSpeed engine state (optimizer/scheduler/RNG),
@@ -343,7 +353,8 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
                           'zero_stage': zero_stage,
                           'model_dtype': model_dtype,
                           'use_peft': peft_config.use_peft,
-                          'peft_type': getattr(peft_config, 'peft_type', None) if peft_config.use_peft else None}
+                          'peft_type': getattr(peft_config, 'peft_type', None) if peft_config.use_peft else None,
+                          'ref_model_name': ref_model_name}
 
         state_file = os.path.join(model_path, "training_state.json")
         with open(state_file, "w") as f:
