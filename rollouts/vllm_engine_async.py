@@ -1,6 +1,7 @@
 import os
 import sys
 import torch
+import torch.distributed
 import gc
 import ray
 from vllm import SamplingParams
@@ -12,6 +13,7 @@ import threading
 # local imports
 from misc.utils import set_random_seeds
 from misc.metrics import compute_pass_metrics
+from misc.nccl_utils import create_nccl_process_group
 
 @ray.remote
 class VLLMRolloutEngineAsync:
@@ -148,28 +150,31 @@ class VLLMRolloutEngineAsync:
             engine_kwargs["max_model_len"] = self.max_model_len
 
         if self.batch_invariant:
-            # vLLM batch invariance requires FlashAttention backend.
-            # We still keep a compatibility fallback below for older vLLM versions.
+            # vllm batch invariance requires FlashAttention backend.
+            # We still keep a compatibility fallback below for older vllm versions.
             engine_kwargs["attention_backend"] = "FLASH_ATTN"
 
-        # Try AsyncLLMEngine (vLLM >= 0.7), fall back to AsyncLLM for newer versions.
-        # Wrap in create_async_engine so the attention_backend fallback
-        # can catch TypeError from either path (AsyncLLMEngine or AsyncLLM).
-        self.create_async_engine(engine_kwargs)
+        # Create engine inside the running event loop. vllm's AsyncLLM.__init__
+        # checks asyncio.get_running_loop() and skips its output handler setup
+        # if no loop is found. Without the output handler, collective_rpc responses
+        # from the EngineCore are never read back, causing hangs.
+        self.run_async(self.create_engine_on_loop(engine_kwargs))
 
     def create_async_engine(self, engine_kwargs):
         try:
             try:
+                # Prefer AsyncLLM (vllm 0.15+)
+                from vllm import AsyncLLM
+                self.async_engine = AsyncLLM(**engine_kwargs)
+                self.log(f"Loaded AsyncLLM from {self.model_path}")
+
+            except ImportError:
+                # AsyncLLMEngine is a legacy wrapper whose collective_rpc may not work correctly.
                 from vllm import AsyncLLMEngine
                 from vllm.engine.arg_utils import AsyncEngineArgs
                 args = AsyncEngineArgs(**engine_kwargs)
                 self.async_engine = AsyncLLMEngine.from_engine_args(args)
                 self.log(f"Loaded AsyncLLMEngine from {self.model_path}")
-
-            except ImportError:
-                from vllm import AsyncLLM
-                self.async_engine = AsyncLLM(**engine_kwargs)
-                self.log(f"Loaded AsyncLLM from {self.model_path}")
 
         except TypeError as e:
             # Compatibility fallback: some vLLM versions do not expose
@@ -178,19 +183,29 @@ class VLLMRolloutEngineAsync:
                 engine_kwargs.pop("attention_backend", None)
                 self.log("attention_backend unsupported in this vLLM version; retrying without it.")
                 try:
+                    from vllm import AsyncLLM
+                    self.async_engine = AsyncLLM(**engine_kwargs)
+                    self.log(f"Loaded AsyncLLM from {self.model_path} (fallback mode)")
+
+                except ImportError:
                     from vllm import AsyncLLMEngine
                     from vllm.engine.arg_utils import AsyncEngineArgs
                     args = AsyncEngineArgs(**engine_kwargs)
                     self.async_engine = AsyncLLMEngine.from_engine_args(args)
                     self.log(f"Loaded AsyncLLMEngine from {self.model_path} (fallback mode)")
-                
-                except ImportError:
-                    from vllm import AsyncLLM
-                    self.async_engine = AsyncLLM(**engine_kwargs)
-                    self.log(f"Loaded AsyncLLM from {self.model_path} (fallback mode)")
 
             else:
                 raise
+
+    async def create_engine_on_loop(self, engine_kwargs):
+        '''
+            Async wrapper so the engine is created while an event loop is running.
+            vllm's AsyncLLM.__init__ calls asyncio.get_running_loop() and only
+            starts its output handler, which reads ZMQ responses from the
+            EngineCore, if a loop is detected. By running inside a coroutine
+            on our background loop, the check succeeds and the handler starts.
+        '''
+        self.create_async_engine(engine_kwargs)
 
     def run_async(self, coro):
         '''
@@ -582,10 +597,11 @@ class VLLMRolloutEngineAsync:
         async def generate_one(request_id, prompt_data):
             prompt_token_ids = prompt_data['prompt_token_ids']
             final_output = None
-            async for output in self.async_engine.generate(prompt=None,
+            # vllm v1 (AsyncLLM) takes token IDs via the prompt parameter as a dict.
+            # The old prompt_token_ids keyword was removed in the v1 API.
+            async for output in self.async_engine.generate(prompt={"prompt_token_ids": prompt_token_ids},
                                                            sampling_params=sampling_params,
-                                                           request_id=str(request_id),
-                                                           prompt_token_ids=prompt_token_ids):
+                                                           request_id=str(request_id)):
                 final_output = output
             return final_output
 
@@ -615,7 +631,7 @@ class VLLMRolloutEngineAsync:
         del state_dict
         self.log(f"Updating weights directly to version {version}")
         try:
-            results = self.async_engine.collective_rpc("update_weights", args=(shm_path,))
+            results = self.run_async(self.async_engine.collective_rpc("update_weights", args=(shm_path,)))
 
         finally:
             os.remove(shm_path)  
@@ -650,53 +666,188 @@ class VLLMRolloutEngineAsync:
         self.log(f"Weights updated to version {version}")
         return True
 
-    def init_nccl_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds):
+    def ping(self):
         '''
-            Initialize NCCL weight sync group on all tp workers via collective_rpc.
-            collective_rpc broadcasts to all tp workers simultaneously.
-            Each worker computes its own rank as rank_offset + tp_rank internally.
+            Lightweight readiness check. Returns True if the actor can process calls.
         '''
-        results = self.async_engine.collective_rpc( "init_weight_nccl_group",
-                                                   args=(master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds)
-                                                  )
-        self.log(f"NCCL weight sync group initialized (rank_offset={rank_offset}, tp={self.tensor_parallel_size})")
-        return all(r for r in results if r is not None)
+        return True
+
+    def init_nccl_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds, backend="gloo"):
+        '''
+            Initialize weight sync group.
+            For TP=1: creates the group directly in the Ray actor process. This avoids
+            routing the blocking broadcast through collective_rpc → EngineCore,
+            which can hang when the EngineCore's ZMQ message loop is not responsive
+            after generation.
+            For TP>1: delegates to EngineCore workers via collective_rpc so each TP
+            worker gets its own rank.
+            backend: "gloo" (default, CPU-based) or "nccl" (GPU-based).
+        '''
+        if self.tensor_parallel_size == 1:
+            # TP=1: create group directly in the Ray actor process.
+            torch.cuda.set_device(0)
+
+            # PyTorch 2.7+ requires a default process group before creating custom
+            # groups (_new_process_group_helper calls _get_default_group().rank()).
+            # The Ray actor process doesn't use torch.distributed otherwise, so
+            # initialize a lightweight gloo group with an in-memory HashStore.
+            if not torch.distributed.is_initialized():
+                store = torch.distributed.HashStore()
+                torch.distributed.init_process_group(backend="gloo", store=store, rank=0, world_size=1)
+
+            self._nccl_in_actor = True
+            self.weight_sync_rank = rank_offset
+            self.weight_sync_group = create_nccl_process_group(init_method=f"tcp://{master_addr}:{master_port}",
+                                                                rank=rank_offset,
+                                                                world_size=world_size,
+                                                                group_name=group_name,
+                                                                timeout_seconds=timeout_seconds,
+                                                                backend=backend)
+            return True
+
+        else:
+            # TP>1: each TP worker needs its own rank in the group.
+            # Uses the same backend as TP=1 (gloo by default).
+            self._nccl_in_actor = False
+            results = self.run_async(self.async_engine.collective_rpc("init_weight_nccl_group",
+                                     args=(master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds, backend)))
+            return all(r for r in results if r is not None)
+
+    def receive_all_weights_nccl(self, param_metadata, barrier=None):
+        '''
+            Receive ALL weight tensors via NCCL broadcast in a single method call.
+            This avoids firing 340 separate .remote() calls per engine.
+            The engine stays inside this method for the entire weight sync,
+            calling NCCL broadcast for each param in lockstep with the sender.
+            param_metadata: list of (name, dtype_str, shape) tuples from
+                            gather_weights_for_nccl on training rank 0.
+            barrier: optional NCCLBarrier actor handle. If provided, the engine
+                     signals readiness before entering the NCCL loop, so the
+                     driver knows when it's safe to start the training broadcast.
+        '''
+        if getattr(self, '_nccl_in_actor', False):
+            dtype_map = { "torch.float16": torch.float16,
+                          "torch.bfloat16": torch.bfloat16,
+                          "torch.float32": torch.float32}
+
+            if not hasattr(self, '_nccl_state_dict'):
+                self._nccl_state_dict = {}
+
+            num_params = len(param_metadata)
+
+            # Signal the barrier so the driver knows this engine is ready
+            # before entering the broadcast loop.
+            if barrier is not None:
+                ray.get(barrier.signal_ready.remote())
+
+            for i, (name, dtype_str, shape) in enumerate(param_metadata):
+                target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
+                buffer = torch.empty(tuple(shape), dtype=target_dtype)
+                torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
+                self._nccl_state_dict[name] = buffer
+                del buffer
+            return num_params
+
+        else:
+            # TP>1: fall back to per-param collective_rpc calls
+            num_params = len(param_metadata)
+
+            # Signal the barrier so the driver knows this engine is ready
+            # before entering the broadcast loop (same as TP=1 path above).
+            # Without this, the driver never fires nccl_broadcast_gathered
+            # and all TP workers hang waiting for the sender.
+            if barrier is not None:
+                ray.get(barrier.signal_ready.remote())
+
+            self._nccl_tp_params_received = 0
+            for i, (name, dtype_str, shape) in enumerate(param_metadata):
+                is_last = (i == num_params - 1)
+                self.run_async(self.async_engine.collective_rpc(
+                    "update_weights_nccl",
+                    args=(name, dtype_str, tuple(shape), is_last)))
+                self._nccl_tp_params_received += 1
+            return num_params
 
     def update_weights_nccl(self, param_name, dtype_str, shape, empty_cache=False):
         '''
-            Receive a single weight tensor via NCCL broadcast on all TP workers.
-            Weight sync call order based on main_rl_nccl.py:
-            1. init_nccl_group       -->   once at startup
-            2. update_weights_nccl   -->   every iteration, once per parameter
-            3. finalize_weight_nccl  -->   once after all parameters are received
-            4. generate              -->   produce rollouts with updated weights
-            Steps 2-4 repeat each iteration.
-            5. close_nccl_group      -->   once at shutdown
-            update_weights_direct is the alternative to steps 2-3 (used by main_rl.py,
-            the non-NCCL driver). The two paths are never mixed in the same run.
+            Receive a single weight tensor via NCCL broadcast.
+            For TP=1: receives directly in the Ray actor process and accumulates
+            in _nccl_state_dict. The accumulated dict is loaded into vLLM in bulk
+            during finalize_weight_nccl via update_weights_direct. This avoids the
+            collective_rpc -> EngineCore path for the blocking NCCL broadcast.
+            For TP>1: delegates to EngineCore workers via collective_rpc.
         '''
-        results = self.async_engine.collective_rpc("update_weights_nccl", 
-                                                   args=(param_name, dtype_str, tuple(shape), empty_cache))
-        return results
+        if getattr(self, '_nccl_in_actor', False):
+            # TP=1: receive directly in the Ray actor process.
+            dtype_map = {"torch.float16": torch.float16,
+                         "torch.bfloat16": torch.bfloat16,
+                         "torch.float32": torch.float32}
+            target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
+            buffer = torch.empty(tuple(shape), dtype=target_dtype)
+            torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
+
+            # Accumulate for bulk loading in finalize_weight_nccl.
+            if not hasattr(self, '_nccl_state_dict'):
+                self._nccl_state_dict = {}
+            self._nccl_state_dict[param_name] = buffer
+            del buffer
+            return [1]
+
+        else:
+            # TP>1: delegate to EngineCore workers.
+            results = self.run_async(self.async_engine.collective_rpc(
+                "update_weights_nccl",
+                args=(param_name, dtype_str, tuple(shape), empty_cache)))
+            return results
 
     def finalize_weight_nccl(self, version):
         '''
-            Update loaded_version after all NCCL parameters have been received.
-            Must be called after the last update_weights_nccl to keep version
-            tracking consistent with update_weights_direct and refresh_model.
+            After all NCCL parameters have been received, load them into vLLM.
+            For TP=1 (actor-side NCCL): loads the accumulated _nccl_state_dict
+            into vllm via the existing update_weights_direct path (pickle to
+            /dev/shm → collective_rpc("update_weights")).
+            For TP>1: weights were already loaded per-parameter in EngineCore,
+            so just update the version.
         '''
+        if getattr(self, '_nccl_in_actor', False) and \
+           hasattr(self, '_nccl_state_dict') and self._nccl_state_dict:
+            num_params = len(self._nccl_state_dict)
+            print(f"[VLLMEngineAsync][Engine {self.engine_id}] finalize_weight_nccl: "
+                  f"loading {num_params} params via update_weights_direct", flush=True)
+            success = self.update_weights_direct(self._nccl_state_dict, version)
+            self._nccl_state_dict = {}
+            return success
+
+        # TP>1: weights were loaded per-parameter in receive_all_weights_nccl.
+        # Verify that all parameters were received before updating the version.
+        expected = getattr(self, '_nccl_tp_params_received', 0)
+        if expected <= 0:
+            print(f"[VLLMEngineAsync][Engine {self.engine_id}] finalize_weight_nccl: "
+                  f"WARNING: no params received via NCCL for version {version}, "
+                  f"not updating loaded_version", flush=True)
+            return False
+
+        self._nccl_tp_params_received = 0
         self.loaded_version = version
-        self.log(f"NCCL weight sync finalized to version {version}")
+        self.log(f"NCCL weight sync finalized to version {version} ({expected} params)")
         return True
 
     def close_nccl_group(self):
         '''
-            Destroy the NCCL weight sync group on all TP workers.
+            Destroy the custom NCCL weight sync group.
         '''
-        try:
-            self.async_engine.collective_rpc("close_weight_nccl_group")
-        except Exception:
-            pass
+        if getattr(self, '_nccl_in_actor', False):
+            if hasattr(self, 'weight_sync_group') and self.weight_sync_group is not None:
+                try:
+                    torch.distributed.destroy_process_group(self.weight_sync_group)
+                except Exception:
+                    pass
+                self.weight_sync_group = None
+        else:
+            try:
+                self.run_async(self.async_engine.collective_rpc("close_weight_nccl_group"))
+            except Exception:
+                pass
 
     def refresh_model(self, model_path: str, version: int) -> bool:
         '''
