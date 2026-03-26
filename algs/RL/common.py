@@ -326,6 +326,9 @@ class COMMON:
             Clean up distributed state. Call before the ray actor is torn down
             to release nccl resources and prevent stale connections on restart.
         '''
+        # Destroy the custom weight sync group first before tearing down the default process group.
+        self.close_weight_nccl_group()
+
         if torch.distributed.is_initialized():
             try:
                 torch.distributed.destroy_process_group()
@@ -677,13 +680,14 @@ class COMMON:
 
         return state_dict
 
-    def init_weight_nccl_group(self, master_addr, master_port, rank, world_size, group_name, timeout_seconds):
+    def init_weight_nccl_group(self, master_addr, master_port, rank, world_size, group_name, timeout_seconds, backend="gloo"):
         '''
-            Initialize a custom NCCL process group for weight broadcast.
+            Initialize a custom process group for weight broadcast.
             Called only on training rank 0, concurrently with all vllm rollout
-            workers, as NCCL rendezvous requires all participants to call in together.
+            workers, as rendezvous requires all participants to call in together.
             Other training ranks are not part of this group as they only participate
-            in broadcast_weights_nccl for the ZeRO-3 gather collective.
+            in broadcast_weights_nccl for the zero-3 gather collective.
+            backend: "gloo" (default, CPU-based, robust) or "nccl" (GPU-based).
         '''
         torch.cuda.set_device(self.policy_engine.device)
         self.weight_sync_group = create_nccl_process_group(init_method=f"tcp://{master_addr}:{master_port}",
@@ -691,57 +695,62 @@ class COMMON:
                                                            world_size=world_size,
                                                            group_name=group_name,
                                                            timeout_seconds=timeout_seconds,
-                                                            )
+                                                           backend=backend)
 
         return True
 
-    def broadcast_weights_nccl(self, rollout_engines):
+    def gather_weights_for_nccl(self):
         '''
-            Broadcast policy weights to vllm rollout engines via NCCL.
-            Must be called on ALL training ranks (gather_params_for_save is collective).
-            Only rank 0 actually broadcasts and schedules vllm side receives.
-            Protocol per parameter:
-              1. All ranks gather the parameter (ZeRO-3 collective).
-              2. Rank 0 schedules update_weights_nccl.remote() on rollout engines
-                 (starts vllms workers listening for broadcast).
-              3. Rank 0 broadcasts the parameter via NCCL.
-              4. NCCL synchronizes sender and receivers automatically.
-
-            Returns list of rollout engine Ray ObjectRefs only from rank 0.
+            Phase 1 of NCCL weight sync: gather the ZeRO-3 state dict.
+            Must be called on ALL training ranks. Rank 0 stores the gathered state dict
+            and returns param metadata [(name, dtype_str, shape), ...]. Other ranks return [].
         '''
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         device = self.policy_engine.device
         torch.cuda.set_device(device)
 
-        # Gather full state_dict. it is collective so all ranks must call this.
         state_dict = self.gather_state_dict()
 
-        all_refs = []
         if rank == 0 and state_dict:
-            param_names = list(state_dict.keys())
-            num_params = len(param_names)
-            start = time.time()
+            self._pending_nccl_state_dict = state_dict
+            metadata = [(name, str(param.dtype), tuple(param.shape)) for name, param in state_dict.items()]
 
-            for i, name in enumerate(param_names):
-                param = state_dict[name]
-                is_last = (i == num_params - 1)
-                shape = tuple(param.shape)
-                dtype_str = str(param.dtype)
+            print(f"[Alg:{self.alg_name}][Rank 0] Gathered {len(metadata)} params for NCCL broadcast", flush=True)
+            return metadata
 
-                # Schedule vllm workers to start listening for broadcast
-                refs = [eng.update_weights_nccl.remote(name, dtype_str, shape, is_last) for eng in rollout_engines]
-                all_refs.extend(refs)
+        return []
 
-                # Move to gpu and broadcast
-                param_gpu = param.to(device)
-                torch.distributed.broadcast(param_gpu, src=0, group=self.weight_sync_group)
-                del param_gpu
+    def nccl_broadcast_gathered(self):
+        '''
+            Phase 2 of weight sync, training rank 0 only: broadcast all
+            gathered params. Rollout engine receives must already be
+            scheduled by the driver so they enter broadcast in lockstep.
+            Works with both Gloo (cpu tensors) and NCCL (gpu tensors) backends.
+        '''
+        state_dict = getattr(self, '_pending_nccl_state_dict', None)
+        if not state_dict:
+            return 0
 
-            elapsed = time.time() - start
-            print(f"[Alg:{self.alg_name}][Rank 0] NCCL broadcast {num_params} params in {elapsed:.2f}s")
+        device = self.policy_engine.device
+        torch.cuda.set_device(device)
 
-        del state_dict
-        return all_refs
+        param_names = list(state_dict.keys())
+        num_params = len(param_names)
+        start = time.time()
+
+        for i, name in enumerate(param_names):
+            param = state_dict[name]
+            # Broadcast on cpu. Gloo handles cpu tensors natively,
+            # and the state dict from zero-3 gather is already on cpu.
+            param_cpu = param.cpu() if param.is_cuda else param.contiguous()
+            torch.distributed.broadcast(param_cpu, src=0, group=self.weight_sync_group)
+            del param_cpu
+
+        elapsed = time.time() - start
+        print(f"[Alg:{self.alg_name}][Rank 0] Weight broadcast {num_params} params in {elapsed:.2f}s", flush=True)
+
+        del self._pending_nccl_state_dict
+        return num_params
 
     def close_weight_nccl_group(self):
         '''
