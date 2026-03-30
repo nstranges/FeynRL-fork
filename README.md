@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  Lightweight, modular, and scalable framework for post-training and fine-tuning large models.
+  Algorithm-first post-training framework for large models.
 </p>
 
 <p align="center">
@@ -19,71 +19,79 @@
   <em>"What I cannot create, I do not understand."</em> — Richard Feynman
 </p>
 
-**FeynRL** (pronounced "FineRL") is a lightweight, modular framework for **post-training and fine-tuning** large models, including supervised fine-tuning (SFT), preference learning (e.g., DPO), and reinforcement learning (e.g., PPO, GRPO). It’s built for researchers and engineers who want a **clean, robust and scalable** distributed training stack without sacrificing readability and hackability.
+**FeynRL** (pronounced "FineRL") is an **algorithm-first** framework for **post-training and fine-tuning** large models. It supports supervised fine-tuning (SFT), preference learning (e.g., DPO), and reinforcement learning (e.g., PPO, GRPO, CISPO, P3O), and is built for researchers and engineers who want to understand, modify, and develop new methods without fighting the infrastructure.
+
+The main goal of FeynRL is simple: make new algorithms easy to implement, easy to debug, and still possible to train at scale. The codebase is designed so that **algorithmic logic stays local** and **systems logic stays explicit**, which makes the framework easier to reason about, easier to extend, and more reliable to debug.
 
 ### 💡 Why use FeynRL?
 
-FeynRL is a good fit if you want to iterate quickly without losing clarity and control.
+FeynRL is a good fit if your goal is not only to run an existing recipe, but to **build and test new post-training methods**.
 
-- 🧩 **Easy to extend**
-Most changes stay local, so you can add new ideas without reshaping the stack.
-- 🔧 **One workflow across post training**
-SFT, DPO, and RL share the same setup, making comparisons simpler.
-- 🚀 **Works at any run size**
-Use the same pipeline for a single GPU debug run or a multi node job.
+- **Algorithm-first design** — Most method changes stay local: you can add new objectives, rewards, baselines, or update rules without reshaping the full stack.
+
+- **Clear separation of concerns** — Algorithm code stays algorithmic, and systems code stays systems. That keeps the codebase easier to understand, test, and extend.
+
+- **One framework across post-training** — SFT, DPO, and RL share the same workflow and configuration system, making comparisons easier and reducing duplicated infrastructure.
+
+- **Scales beyond toy settings** — Use the same framework for local single-GPU debugging or large multi-node distributed runs.
+
+FeynRL may not be the best fit if your main priority is the largest built-in feature surface out of the box, or if you mainly want a framework already optimized around a narrow workflow and do not expect to modify it much.
 
 ### 🎯 Why We Built This
 
-There are several great open source frameworks for training and post training large models. Many are powerful, but as they scale in scope, they can become harder to modify and come with steep learning curves, often requiring you to understand tightly coupled components before you can make changes with confidence. As a result, adapting them to a new research idea or a new setup can be slow, error prone, and frustrating. That complexity can also hurt reliability: when a framework has many moving parts and evolves quickly, failures become harder to diagnose, and subtle bugs can hide in layers of abstraction.
+There are already several strong open-source frameworks for post-training large models. Many are powerful and feature-rich, but they are often optimized around a narrower set of methods or execution patterns, and can become hard to modify once you want to try something new.
 
-FeynRL is designed to reduce that friction: a **lightweight, modular, scalable** framework that keeps algorithm logic clear and keeps systems concerns explicit. The core design principle is **separation of concerns**: algorithm code stays algorithmic, and systems code stays systems, so components remain easier to understand, test, and extend. In distributed training, some systems details inevitably surface, but FeynRL aims to keep those interfaces as explicit and clean as possible so components remain easy to understand, test, and debug.
+FeynRL was built to make a different trade-off. Instead of optimizing first for the largest feature surface, it optimizes first for **clarity, locality of change, and algorithm development**. The codebase is structured so that algorithmic ideas are easy to implement and reason about, while the distributed systems layer remains explicit rather than hidden behind heavy abstractions. In practice, implementing a new algorithm typically means writing a single file with its own loss and update logic, not threading changes through the orchestration, rollout, and data layers.
 
-This is the first public release, so expect rough edges. Our goal is to keep FeynRL **simple, efficient, and predictable**. We're open-sourcing it to provide a framework that's easy to reason about, and to build it alongside the community that will stress-test it, extend it, and improve it.
+The framework is designed for scale from the start. It supports large-scale training with DeepSpeed, Ray, and vLLM, including sync and async execution modes, adaptive weight synchronization, and multi-node runs. The goal is to make it possible to do both: **move fast on algorithms and still run realistic experiments at scale**.
 
+This is the first public release, so expect rough edges. We are open-sourcing FeynRL not just as a library, but as a foundation for building new post-training methods with the community.
 
-## 🏗️ Overview
+## ✅ What's Included
 
-FeynRL is built around three core principles:
-
-- ⚡ **Efficiency**: Designed for training models with billions of parameters, using DeepSpeed for distributed training, vLLM for fast inference, and Ray for orchestration at scale.
-- 🧩 **Modularity**: Clear separation between training engines, rollout generation, and data handling, so it’s easy to swap components and experiment safely.
-- 🧠 **Algorithm-first**: Designed to accelerate research with a simple, hackable codebase that keeps the focus on the algorithms.
-
-For a more detailed breakdown, see the **[Architecture Overview](docs/ARCHITECTURE.md)**.
-
-### ✅ What’s Included
+For a detailed breakdown of the architecture, see the **[Architecture Overview](docs/ARCHITECTURE.md)**.
 
 - 🧪 **Training paradigms**: RL (PPO, GRPO, CISPO, P3O), preference-based learning (DPO), and supervised fine-tuning (SFT)
 - 🖥️ **Distributed training**: Multi-GPU and multi-node via DeepSpeed (ZeRO Stage 1/2/3)
 - 🎲 **Rollouts / inference**: vLLM-powered rollout engines with tensor parallelism
 - 🛰️ **Orchestration**: Ray for scheduling training and rollout workers across nodes
-- 🔀 **Training↔rollout scheduling**: Sync and overlap (async) modes; the overlap engine interleaves chunk-based generation with training, using ESS-driven NCCL weight sync to keep rollout data fresh while significantly reducing GPU idle time
+- 🔀 **Training-rollout scheduling**: Sync and overlap (async) modes; the overlap engine interleaves chunk-based generation with training, using ESS-driven NCCL weight sync to keep rollout data fresh while significantly reducing GPU idle time
 - 🔄 **Weight sync**: NCCL broadcast (fastest), direct in-memory transfer via Ray object store, and disk-based checkpoint reload, with automatic fallback chain (NCCL to direct to disk)
 - 🧷 **Parameter-efficient fine-tuning**: LoRA via PEFT
+- 🔢 **Mixed-dataset sampling**: Configurable multi-dataset sampling with ratios within a single training run
 - 📈 **Experiment tracking**: MLflow and Weights & Biases support
 - 🏅 **Evaluation**: Standalone eval pipeline with vLLM engines
 
-For RL, Ray orchestrates the full training loop: it schedules DeepSpeed training workers and vLLM rollout workers across nodes, and coordinates weight synchronization between them. In **sync mode**, each epoch generates all rollouts, trains on them, syncs weights, and repeats. In **overlap mode**, generation is dispatched one chunk at a time while training runs concurrently on already-collected data, significantly reducing GPU idle time. An ESS (Effective Sample Size) metric monitors policy divergence and triggers NCCL weight sync at chunk boundaries when the rollout engines are idle, keeping data fresh without stalling the pipeline. Weight sync uses a three-tier fallback chain: NCCL broadcast (fastest, zero-copy), direct transfer via Ray object store, and disk-based checkpoint reload. SFT and DPO are simpler as they only need a single model and no rollout workers, so they run directly on DeepSpeed without Ray. All paradigms support full fine-tuning and LoRA, and plug into mixed-dataset sampling, experiment tracking, and standalone evaluation without changing the pipeline.
+For RL, Ray orchestrates the full training loop: it schedules DeepSpeed training workers and vLLM rollout workers across nodes, and coordinates weight synchronization between them. In **sync mode**, each epoch generates all rollouts, trains on them, syncs weights, and repeats. In **overlap mode**, generation is dispatched one chunk at a time while training runs concurrently on already-collected data, significantly reducing GPU idle time. An ESS (Effective Sample Size) metric monitors policy divergence and triggers weight sync at chunk boundaries when the rollout engines are idle, keeping data fresh without stalling the pipeline. Weight sync uses a three-tier fallback chain: NCCL broadcast, direct transfer via Ray object store, and disk-based checkpoint reload. SFT and DPO are simpler because they only require a single model and no rollout workers, so they run directly on DeepSpeed without Ray. All paradigms support full fine-tuning and LoRA, and plug into mixed-dataset sampling, experiment tracking, and standalone evaluation without changing the overall workflow.
+
+## 🗂️ Codebase at a glance
+
+The repository is organized so that algorithmic changes usually stay local:
+
+- `algs/` — Algorithm and optimization logic. Each algorithm (PPO, GRPO, CISPO, P3O, DPO, SFT) has its own module with a README documenting the math and pseudocode.
+- `rollouts/` — Rollout generation, vLLM engine wrappers, weight sync, and replay buffer.
+- `rewards/` — Pluggable reward functions (GSM8K, math verification, and custom).
+- `data_feeds/` — Data loading, sampling, and mixed-dataset support.
+- `data_prep/` — Dataset preparation scripts.
+- `configs/` — YAML configs for RL, SFT, DPO, and evaluation, with full [parameter reference](configs/README.md).
+- `unit_tests/` — Unit and integration tests.
 
 ## 📢 News
 
-- ![Date](https://img.shields.io/badge/2026--03--03-purple) 🎉  We're excited to publicly release FeynRL as a preview! Some features and documentation are still evolving. We welcome feedback, bug reports, and contributions as we continue to build this together.
+- ![Date](https://img.shields.io/badge/2026--03--03-purple) We're excited to publicly release FeynRL as a preview! Some features and documentation are still evolving. We welcome feedback, bug reports, and contributions as we continue to build this together.
 
-## How to Use FeynRL
+## 📖 How to Use FeynRL
 
-🛠️ **[Installation & Setup](docs/INSTALL.md)**
-Read the guide to configure your environment and dependencies.
+**[Installation & Setup](docs/INSTALL.md)** — Configure your environment and dependencies.
 
-🚀 **[Usage & Examples](docs/HOWTO.md)**
-Learn how to launch jobs and run experiments.
+**[Usage & Examples](docs/HOWTO.md)** — Learn how to launch jobs and run experiments.
 
-⚙️ **[Configuration Reference](configs/README.md)**
-Full parameter guide for RL, SFT, DPO, and evaluation configs.
+**[Configuration Reference](configs/README.md)** — Full parameter guide for RL, SFT, DPO, and evaluation configs.
 
-## Contributing
+## 🤝 Contributing
 
 Contributions are welcome! Please see our **[Contributing Guidelines](CONTRIBUTING.md)** for details on how to get involved.
 
-## FAQ
+## ❓ FAQ
 
 Check out the [FAQ](docs/FAQ.md) for common questions and answers.
