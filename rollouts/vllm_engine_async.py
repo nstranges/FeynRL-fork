@@ -672,45 +672,55 @@ class VLLMRolloutEngineAsync:
         '''
         return True
 
-    def init_nccl_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds, backend="gloo"):
+    def init_nccl_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds, backend):
         '''
             Initialize weight sync group.
-            For TP=1: creates the group directly in the Ray actor process. This avoids
-            routing the blocking broadcast through collective_rpc → EngineCore,
-            which can hang when the EngineCore's ZMQ message loop is not responsive
-            after generation.
-            For TP>1: delegates to EngineCore workers via collective_rpc so each TP
-            worker gets its own rank.
-            backend: "gloo" (default, CPU-based) or "nccl" (GPU-based).
+            For TP=1 + gloo: creates the group directly in the Ray actor process.
+                This avoids routing the blocking broadcast through collective_rpc ->
+                EngineCore, which can hang when the EngineCore's ZMQ message loop
+                is not responsive after generation.
+            For TP=1 + nccl: delegates to EngineCore via collective_rpc because
+                vllm V1's EngineCore subprocess owns the GPU CUDA context. Creating
+                an NCCL communicator in the Ray actor process (parent) while the
+                EngineCore subprocess holds the GPU causes the broadcast to deadlock.
+            For TP>1: always delegates to EngineCore workers via collective_rpc so
+                each TP worker gets its own rank.
         '''
-        if self.tensor_parallel_size == 1:
-            # TP=1: create group directly in the Ray actor process.
+        if self.tensor_parallel_size == 1 and backend == "gloo":
+            # TP=1 + gloo: create group directly in the Ray actor process.
             torch.cuda.set_device(0)
 
             # PyTorch 2.7+ requires a default process group before creating custom
-            # groups (_new_process_group_helper calls _get_default_group().rank()).
-            # The Ray actor process doesn't use torch.distributed otherwise, so
-            # initialize a lightweight gloo group with an in-memory HashStore.
+            # groups as _new_process_group_helper calls _get_default_group().rank().
+            # The ray actor process doesn't use torch.distributed otherwise, so
+            # initialize a lightweight gloo group with an in-memory store.
             if not torch.distributed.is_initialized():
                 store = torch.distributed.HashStore()
                 torch.distributed.init_process_group(backend="gloo", store=store, rank=0, world_size=1)
 
             self._nccl_in_actor = True
             self.weight_sync_rank = rank_offset
+            self.weight_sync_backend = backend
             self.weight_sync_group = create_nccl_process_group(init_method=f"tcp://{master_addr}:{master_port}",
                                                                 rank=rank_offset,
                                                                 world_size=world_size,
                                                                 group_name=group_name,
                                                                 timeout_seconds=timeout_seconds,
                                                                 backend=backend)
+            self.log(f"Rollout weight sync initialized in actor process (backend={backend}, mechanism=torch.distributed)")
             return True
 
         else:
-            # TP>1: each TP worker needs its own rank in the group.
-            # Uses the same backend as TP=1 (gloo by default).
+            # TP>1 or nccl backend: delegate to EngineCore workers via collective_rpc.
+            # For nccl backend with TP=1, the EngineCore subprocess owns the GPU's
+            # cuda context, so the nccl communicator must be created there.
             self._nccl_in_actor = False
+            self.weight_sync_backend = backend
             results = self.run_async(self.async_engine.collective_rpc("init_weight_nccl_group",
                                      args=(master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds, backend)))
+
+            mechanism = "PyNcclCommunicator" if backend == "nccl" else "torch.distributed"
+            self.log(f"Rollout weight sync initialized in EngineCore subprocess (backend={backend}, mechanism={mechanism})")
             return all(r for r in results if r is not None)
 
     def receive_all_weights_nccl(self, param_metadata, barrier=None):
@@ -734,6 +744,8 @@ class VLLMRolloutEngineAsync:
                 self._nccl_state_dict = {}
 
             num_params = len(param_metadata)
+            backend = self.weight_sync_backend
+            buf_device = "cuda" if backend == "nccl" else "cpu"
 
             # Signal the barrier so the driver knows this engine is ready
             # before entering the broadcast loop.
@@ -742,30 +754,32 @@ class VLLMRolloutEngineAsync:
 
             for i, (name, dtype_str, shape) in enumerate(param_metadata):
                 target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
-                buffer = torch.empty(tuple(shape), dtype=target_dtype)
+                buffer = torch.empty(tuple(shape), dtype=target_dtype, device=buf_device)
                 torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
-                self._nccl_state_dict[name] = buffer
+                # Move to CPU for later loading via update_weights_direct
+                self._nccl_state_dict[name] = buffer.cpu() if buffer.is_cuda else buffer
                 del buffer
             return num_params
 
         else:
-            # TP>1: fall back to per-param collective_rpc calls
+            # TP>1 or nccl backend: receive all params in a single collective_rpc call.
+            # This runs the entire NCCL broadcast loop inside the EngineCore subprocess
+            # where the CUDA context lives. Using a single call avoids the per-param
+            # collective_rpc round-trip that can deadlock when ZMQ message delivery
+            # serializes the NCCL collectives across 398+ params.
             num_params = len(param_metadata)
 
             # Signal the barrier so the driver knows this engine is ready
-            # before entering the broadcast loop (same as TP=1 path above).
-            # Without this, the driver never fires nccl_broadcast_gathered
-            # and all TP workers hang waiting for the sender.
+            # before entering the broadcast loop.
             if barrier is not None:
                 ray.get(barrier.signal_ready.remote())
 
-            self._nccl_tp_params_received = 0
-            for i, (name, dtype_str, shape) in enumerate(param_metadata):
-                is_last = (i == num_params - 1)
-                self.run_async(self.async_engine.collective_rpc(
-                    "update_weights_nccl",
-                    args=(name, dtype_str, tuple(shape), is_last)))
-                self._nccl_tp_params_received += 1
+            # Convert tuples to ensure serializable metadata
+            serializable_metadata = [(name, dtype_str, tuple(shape)) for name, dtype_str, shape in param_metadata]
+            results = self.run_async(self.async_engine.collective_rpc("receive_all_weights_nccl",
+                                                                      args=(serializable_metadata,)))
+
+            self._nccl_tp_params_received = results[0] if results else 0
             return num_params
 
     def update_weights_nccl(self, param_name, dtype_str, shape, empty_cache=False):
@@ -783,13 +797,15 @@ class VLLMRolloutEngineAsync:
                          "torch.bfloat16": torch.bfloat16,
                          "torch.float32": torch.float32}
             target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
-            buffer = torch.empty(tuple(shape), dtype=target_dtype)
+            buf_device = "cuda" if self.weight_sync_backend == "nccl" else "cpu"
+            buffer = torch.empty(tuple(shape), dtype=target_dtype, device=buf_device)
             torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
 
             # Accumulate for bulk loading in finalize_weight_nccl.
+            # Move to CPU since update_weights_direct expects CPU tensors.
             if not hasattr(self, '_nccl_state_dict'):
                 self._nccl_state_dict = {}
-            self._nccl_state_dict[param_name] = buffer
+            self._nccl_state_dict[param_name] = buffer.cpu() if buffer.is_cuda else buffer
             del buffer
             return [1]
 
@@ -803,11 +819,11 @@ class VLLMRolloutEngineAsync:
     def finalize_weight_nccl(self, version):
         '''
             After all NCCL parameters have been received, load them into vLLM.
-            For TP=1 (actor-side NCCL): loads the accumulated _nccl_state_dict
+            For TP=1 + gloo (actor-side): loads the accumulated _nccl_state_dict
             into vllm via the existing update_weights_direct path (pickle to
             /dev/shm → collective_rpc("update_weights")).
-            For TP>1: weights were already loaded per-parameter in EngineCore,
-            so just update the version.
+            For TP>1 or nccl backend: weights were already loaded per-parameter
+            in EngineCore via load_weights, so just update the version.
         '''
         if getattr(self, '_nccl_in_actor', False) and \
            hasattr(self, '_nccl_state_dict') and self._nccl_state_dict:
