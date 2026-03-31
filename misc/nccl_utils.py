@@ -34,6 +34,14 @@ def create_nccl_process_group(init_method, rank, world_size, group_name, timeout
     # Namespace the store so keys don't collide with ds/vllm groups
     store = PrefixStore(prefix=group_name, store=store)
 
+    # nccl backend requires ProcessGroupNCCL.Options for proper GPU communicator init
+    # across separate Ray actor processes.
+    pg_options = None
+    if str(backend) == "nccl":
+        from torch.distributed.distributed_c10d import ProcessGroupNCCL
+        pg_options = ProcessGroupNCCL.Options()
+        pg_options.is_high_priority_stream = False
+
     # Create the group without overwriting the default process group.
     # PyTorch 2.7+ renamed: world_size→group_size, rank→group_rank, ranks→global_ranks_in_group
     pg, _ = _new_process_group_helper(group_size=world_size,
@@ -43,6 +51,7 @@ def create_nccl_process_group(init_method, rank, world_size, group_name, timeout
                                       store=store,
                                       group_name=group_name,
                                       timeout=timeout,
+                                      backend_options=pg_options,
                                       )
 
     # Register rank mapping so torch.distributed.broadcast(..., group=pg) can
