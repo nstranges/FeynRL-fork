@@ -680,23 +680,44 @@ class COMMON:
 
         return state_dict
 
-    def init_weight_nccl_group(self, master_addr, master_port, rank, world_size, group_name, timeout_seconds, backend="gloo"):
+    def init_weight_nccl_group(self, master_addr, master_port, rank, world_size, group_name, timeout_seconds, backend):
         '''
-            Initialize a custom process group for weight broadcast.
+            Initialize a process group for weight broadcast.
             Called only on training rank 0, concurrently with all vllm rollout
             workers, as rendezvous requires all participants to call in together.
             Other training ranks are not part of this group as they only participate
             in broadcast_weights_nccl for the zero-3 gather collective.
-            backend: "gloo" (default, CPU-based, robust) or "nccl" (GPU-based).
+            For gloo: we use create_nccl_process_group which is torch.distributed internals.
+            For nccl: we use vllm's StatelessProcessGroup + PyNcclCommunicator so both
+                trainer and vLLM EngineCore workers share the same nccl communicator
+                bootstrapped via the same TCP store and nccl ID exchange protocol.
         '''
         torch.cuda.set_device(self.policy_engine.device)
-        self.weight_sync_group = create_nccl_process_group(init_method=f"tcp://{master_addr}:{master_port}",
-                                                           rank=rank,
-                                                           world_size=world_size,
-                                                           group_name=group_name,
-                                                           timeout_seconds=timeout_seconds,
-                                                           backend=backend)
+        self.weight_sync_backend = backend
 
+        if backend == "nccl":
+            from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+            from vllm.distributed.utils import StatelessProcessGroup
+
+            pg = StatelessProcessGroup.create(host=master_addr,
+                                              port=master_port,
+                                              rank=rank,
+                                              world_size=world_size)
+            device = self.policy_engine.device
+            self.weight_sync_pynccl = PyNcclCommunicator(pg, device=device)
+            self.weight_sync_group = None
+
+        else:
+            self.weight_sync_group = create_nccl_process_group(init_method=f"tcp://{master_addr}:{master_port}",
+                                                              rank=rank,
+                                                              world_size=world_size,
+                                                              group_name=group_name,
+                                                              timeout_seconds=timeout_seconds,
+                                                              backend=backend)
+            self.weight_sync_pynccl = None
+
+        mechanism = "PyNcclCommunicator" if backend == "nccl" else "torch.distributed"
+        print(f"[Alg:{self.alg_name}] Training weight sync initialized (backend={backend}, mechanism={mechanism}, rank={rank}, world_size={world_size})", flush=True)
         return True
 
     def gather_weights_for_nccl(self):
@@ -725,7 +746,8 @@ class COMMON:
             Phase 2 of weight sync, training rank 0 only: broadcast all
             gathered params. Rollout engine receives must already be
             scheduled by the driver so they enter broadcast in lockstep.
-            Works with both Gloo (cpu tensors) and NCCL (gpu tensors) backends.
+            For gloo: uses torch.distributed.broadcast with CPU tensors.
+            For nccl: uses PyNcclCommunicator.broadcast with GPU tensors.
         '''
         state_dict = getattr(self, '_pending_nccl_state_dict', None)
         if not state_dict:
@@ -738,13 +760,23 @@ class COMMON:
         num_params = len(param_names)
         start = time.time()
 
+        backend = self.weight_sync_backend
+        use_pynccl = (backend == "nccl")
+
         for i, name in enumerate(param_names):
             param = state_dict[name]
-            # Broadcast on cpu. Gloo handles cpu tensors natively,
-            # and the state dict from zero-3 gather is already on cpu.
-            param_cpu = param.cpu() if param.is_cuda else param.contiguous()
-            torch.distributed.broadcast(param_cpu, src=0, group=self.weight_sync_group)
-            del param_cpu
+            if use_pynccl:
+                send_buf = param.to(device=device, non_blocking=True) if not param.is_cuda else param.contiguous()
+                self.weight_sync_pynccl.broadcast(send_buf, src=0, stream=torch.cuda.current_stream())
+
+            else:
+                send_buf = param.cpu() if param.is_cuda else param.contiguous()
+                torch.distributed.broadcast(send_buf, src=0, group=self.weight_sync_group)
+            del send_buf
+
+        # Ensure all NCCL broadcasts complete before releasing state dict
+        if use_pynccl:
+            torch.cuda.synchronize()
 
         elapsed = time.time() - start
         print(f"[Alg:{self.alg_name}][Rank 0] Weight broadcast {num_params} params in {elapsed:.2f}s", flush=True)
@@ -754,14 +786,17 @@ class COMMON:
 
     def close_weight_nccl_group(self):
         '''
-            Destroy the custom NCCL weight sync group. Called during shutdown.
+            Destroy the weight sync group. Called during shutdown.
         '''
+        if hasattr(self, 'weight_sync_pynccl') and self.weight_sync_pynccl is not None:
+            del self.weight_sync_pynccl
+            self.weight_sync_pynccl = None
+
         if hasattr(self, 'weight_sync_group') and self.weight_sync_group is not None:
             try:
                 torch.distributed.destroy_process_group(self.weight_sync_group)
             except Exception:
                 pass
-
             self.weight_sync_group = None
 
     def barrier_with_error_check(self, succeeded: bool):
