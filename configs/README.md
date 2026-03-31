@@ -56,6 +56,7 @@ If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 1
 | `ray_master_port` | Port for torch distributed rendezvous | Integer \| `null` | `29500` |
 | `weight_sync_method` | Weight sync method. `"nccl"` is required when overlap is enabled. | `"direct"` \| `"disk"` \| `"nccl"` | `"direct"` |
 | `nccl_sync_port` | Port for NCCL weight sync rendezvous (default: `ray_master_port + 100`) | Integer \| `null` | `29600` |
+| `nccl_sync_backend` | Backend for weight sync broadcast. `"nccl"` uses GPU-to-GPU transfer via vLLM's PyNcclCommunicator (fast, recommended for full-model sync). `"gloo"` uses CPU-based transfer via torch.distributed (robust fallback). | `"nccl"` \| `"gloo"` | `"nccl"` |
 
 #### RL Timeouts (seconds)
 
@@ -71,7 +72,7 @@ If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 1
 
 ## `overlap` — Overlap Engine (RL only)
 
-Controls interleaved rollout generation and training within a single epoch. When enabled, `weight_sync_method` must be `"nccl"`. See the [Architecture Overview](../docs/ARCHITECTURE.md#-trainingrollout-scheduling) for how these parameters interact.
+Controls interleaved rollout generation and training within a single epoch. When enabled, `weight_sync_method` must be `"nccl"`. The overlap engine uses mid-training chunk cycling: when an in-flight generation chunk finishes during training, it is finalized immediately and the next chunk is dispatched, keeping rollout GPUs busy throughout training. See the [Architecture Overview](../docs/ARCHITECTURE.md#-trainingrollout-scheduling) for how these parameters interact.
 
 | Parameter | Description | Type / Constraint | Examples |
 |:---|:---|:---|:---|
