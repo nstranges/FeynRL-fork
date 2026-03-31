@@ -25,6 +25,8 @@ run:
   nccl_ib_hca: null
   # Port for NCCL weight sync rendezvous (default: ray_master_port + 100)
   nccl_sync_port: null
+  # Backend for NCCL weight sync: "nccl" for gpu-to-gpu (fastes), "gloo" for cpu-based.
+  nccl_sync_backend: "nccl"
 
   # Timeout settings (seconds) for ray.get() calls
   # need to be updated based on a specific setup

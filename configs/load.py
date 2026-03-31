@@ -41,6 +41,9 @@ class Run(BaseModel):
     nccl_ib_hca: str | None = None
     # Port for NCCL weight sync rendezvous (default: ray_master_port + 100)
     nccl_sync_port: int | None = None
+    # Backend for the NCCL weight sync process group.
+    # nccl for GPU-to-GPU broadcast (fast), gloo for CPU-based broadcast (robust).
+    nccl_sync_backend: str | None = None
 
     # Timeout (seconds) for ray.get() calls to prevent indefinite hangs.
     # None means use the default for each category.
@@ -674,6 +677,11 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if weight_sync_method == "nccl" and not overlap_enabled:
                 raise ValueError("weight_sync_method 'nccl' requires overlap.enabled=True "
                                  "(sync rollout engine does not support NCCL)")
+
+            if weight_sync_method == "nccl":
+                nccl_backend = config.run.nccl_sync_backend
+                if nccl_backend not in ("nccl", "gloo"):
+                    raise ValueError(f"nccl_sync_backend must be 'nccl' or 'gloo', got {nccl_backend!r}")
 
             max_tokens = config.rollout.max_tokens
             max_seq_len = config.data.max_seq_len
