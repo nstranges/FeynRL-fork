@@ -422,6 +422,21 @@ class VLLMRolloutEngine:
                 batch_prompt_reward_sum = 0.0
                 batch_best_of_k_reward_sum = 0.0
                 batch_reward_std_sum = 0.0
+
+                # If the reward function exposes a batch interface, score all
+                # (prompt, response) pairs in one call so the reward function
+                # can submit all work to its process pool before blocking.
+                # This lets e.g. math_verify run 8 verifications concurrently
+                # instead of sequentially submitting and waiting one at a time.
+                all_pairs = [(pd, resp) for pd, data_item in zip(prompts, generated_outputs)
+                             for resp in data_item.outputs]
+                if hasattr(self.reward_func, 'batch'):
+                    all_rewards = self.score_responses_batch(all_pairs)
+
+                else:
+                    all_rewards = [self.score_response(p, r) for p, r in all_pairs]
+                reward_idx = 0
+
                 for prompt_data, data in zip(prompts, generated_outputs):
                     group_samples = []
                     group_stats   = {'rewards': [], 'lengths': [], 'correct_threshold': []}
@@ -453,9 +468,8 @@ class VLLMRolloutEngine:
                         rewards       = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
                         pred_rewards  = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
-                        # Score every response (including empty) so reward_func can see them,
-                        # but only responses > 0 contribute to group stats and normalization.
-                        rewards_resp, is_per_token, correct_threshold = self.score_response(prompt_data, response)
+                        rewards_resp, is_per_token, correct_threshold = all_rewards[reward_idx]
+                        reward_idx += 1
                         rewards[prompt_len:] = rewards_resp
                         # correct_threshold must be collected from all responses, including empty
                         # correct_threshold is required in pass@k calculation
@@ -599,6 +613,30 @@ class VLLMRolloutEngine:
             raise ValueError(f"score_response must return len={len(response.token_ids)} rewards, got {rewards.numel()}")
 
         return rewards, is_per_token, correct_threshold
+
+    def score_responses_batch(self, pairs: List[tuple]) -> List[tuple]:
+        '''
+            Score all (prompt, response) pairs in one batch call.
+            The reward function's .batch method handles concurrency internally
+            (e.g. ProcessPoolExecutor with spawn context for math_verify).
+        '''
+        with torch.no_grad():
+            raw_results = self.reward_func.batch(pairs)
+
+        validated = []
+        for (rewards, is_per_token, correct_threshold), (_, response) in zip(raw_results, pairs):
+            if isinstance(rewards, torch.Tensor):
+                rewards = rewards.to(dtype=torch.float32, device='cpu')
+
+            else:
+                rewards = torch.tensor(rewards, dtype=torch.float32, device='cpu')
+
+            if rewards.numel() != len(response.token_ids):
+                raise ValueError(f"score_responses_batch must return len={len(response.token_ids)} rewards, got {rewards.numel()}")
+
+            validated.append((rewards, is_per_token, correct_threshold))
+
+        return validated
 
     def normalize_rewards(self,
                           samples: List[Dict[str, Any]],
