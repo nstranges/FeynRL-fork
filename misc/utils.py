@@ -2,6 +2,7 @@ import torch
 import os
 import random
 import importlib
+import time
 import numpy as np
 import ray
 from ray.exceptions import GetTimeoutError, RayActorError, RayTaskError
@@ -153,7 +154,7 @@ def load_algorithm(alg_name: str, registry: dict):
 def ray_get_with_timeout(refs, timeout, description, logger):
     '''
         Wrapper around ray.get() that adds a timeout and clear error reporting.
-        This helps to convert silent infinite hangs into actionable errors.
+        This provides periodic logging for long-running operations.
 
         Args:
             refs: ObjectRef or list of ObjectRefs to wait on.
@@ -162,7 +163,35 @@ def ray_get_with_timeout(refs, timeout, description, logger):
             logger: logger instance.
     '''
     try:
-        return ray.get(refs, timeout=timeout)
+        if timeout is None:
+            return ray.get(refs)
+
+        start_time = time.time()
+        deadline = start_time + timeout
+        poll_interval = 60.0  # Log every 60 seconds
+
+        # Ensure refs is a list for ray.wait
+        is_single = not isinstance(refs, list)
+        wait_refs = [refs] if is_single else list(refs)
+
+        unready = wait_refs
+        while unready:
+            now = time.time()
+            if now >= deadline:
+                raise GetTimeoutError()
+
+            current_timeout = min(poll_interval, deadline - now)
+            ready, unready = ray.wait(unready, num_returns=len(unready), timeout=current_timeout)
+
+            if unready:
+                elapsed = int(time.time() - start_time)
+                total = len(wait_refs)
+                done = total - len(unready)
+                logger.info(f"[Heartbeat] {description}: {done}/{total} done, "
+                            f"{len(unready)} pending (elapsed {elapsed}s, timeout {timeout}s)")
+
+        # All ready, this will return immediately
+        return ray.get(refs)
 
     except GetTimeoutError as e:
         logger.error(f"[Timeout] {description} did not complete within {timeout}s")

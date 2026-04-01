@@ -566,6 +566,8 @@ class PPO(COMMON):
                     if ga_remainder != 0 and step >= (num_micro - ga_remainder):
                         pi_loss = pi_loss * (ga_steps / ga_remainder)
 
+            pi_loss = self.sanitize_loss(pi_loss, engine_id, step, num_micro)
+
             self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
 
             # backward pass
@@ -602,6 +604,8 @@ class PPO(COMMON):
                 else:
                     if ga_remainder != 0 and step >= (num_micro - ga_remainder):
                         v_loss = v_loss * (ga_steps / ga_remainder)
+
+            v_loss = self.sanitize_loss(v_loss, engine_id, step, num_micro)
 
             self.value_engine.set_gradient_accumulation_boundary(is_boundary)
 

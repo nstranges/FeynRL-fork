@@ -296,6 +296,8 @@ class GRPO(COMMON):
                     if ga_remainder != 0 and step >= (num_micro - ga_remainder):
                         pi_loss = pi_loss * (ga_pi / ga_remainder)
 
+            pi_loss = self.sanitize_loss(pi_loss, engine_id, step, num_micro)
+
             # For DeepSpeed, we must coordinate is_boundary with the backward pass.
             self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
 
