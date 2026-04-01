@@ -421,11 +421,20 @@ def shard_and_put(batches, num_engines):
        Returns a list of ObjectRefs, one per engine.
     '''
     shard_refs = []
+    shard_sizes = []
     for eid in range(num_engines):
         # engine 0 gets [0, 2, 4, ...], engine 1 gets [1, 3, 5, ...]
         shard = batches[eid::num_engines]
         assert len(shard) > 0, f"Engine {eid} has empty shard. This will cause DeepSpeed hang"
+        shard_sizes.append(len(shard))
         shard_refs.append(ray.put(shard))
+
+    if len(set(shard_sizes)) > 1:
+        print(f"[shard_and_put] SHARD SIZE MISMATCH: {shard_sizes}. "
+              f"This WILL cause a ZeRO-3 collective deadlock!", flush=True)
+    else:
+        print(f"[shard_and_put] {num_engines} shards, {shard_sizes[0]} micro-batches each "
+              f"(total={len(batches)})", flush=True)
 
     return shard_refs
 
@@ -436,6 +445,7 @@ def run_training_step(engines, shard_refs, logger, train_step_timeout):
        Ray auto-resolves ObjectRefs passed to .remote(), so the engine receives the actual data.
     '''
     step_start = time.time()
+
     futures = []
     for eid, engine in enumerate(engines):
         futures.append(engine.train_step.remote(engine_id=eid, micro_batches=shard_refs[eid]))
@@ -534,6 +544,32 @@ def refresh_rollout_engine(rollout_engines, updated_policy_path, version, logger
                          timeout=sync_timeout,
                          description=f"refresh rollout engines from disk (v{version})",
                          logger=logger)
+
+def reinit_nccl_weight_sync_group(training_engines, rollout_engines, master_addr, nccl_port, tp_size, logger, init_timeout, backend):
+    '''
+        Close existing NCCL weight sync groups and re-initialize.
+        Safe to call even if no group exists yet. Used after resume or
+        disk-fallback refresh that may destroy EngineCore workers.
+    '''
+    # Close old groups (no-ops if not initialized)
+    try:
+        ray.get(training_engines[0].close_weight_nccl_group.remote())
+    except Exception:
+        pass
+    for eng in rollout_engines:
+        try:
+            ray.get(eng.close_nccl_group.remote())
+        except Exception:
+            pass
+
+    return init_nccl_weight_sync(training_engines=training_engines,
+                                 rollout_engines=rollout_engines,
+                                 master_addr=master_addr,
+                                 nccl_port=nccl_port,
+                                 tp_size=tp_size,
+                                 logger=logger,
+                                 init_timeout=init_timeout,
+                                 backend=backend)
 
 def init_nccl_weight_sync(training_engines, rollout_engines, master_addr, nccl_port, tp_size, logger, init_timeout, backend):
     '''
@@ -1528,22 +1564,15 @@ if __name__ == "__main__":
     logger.info(f"Created {num_rollout_engines} rollout engines with TP={config.rollout.tensor_parallel_size}")
 
     ########
-    # 6. Initialize weight sync group
+    # 6. Weight sync method (NCCL group initialized after resume in section 9b)
     ########
     weight_sync_method = config.run.weight_sync_method
+    nccl_port = None
+    nccl_sync_backend = None
 
     if weight_sync_method == "nccl":
         nccl_port = config.run.nccl_sync_port if config.run.nccl_sync_port else config.run.ray_master_port + 100
         nccl_sync_backend = config.run.nccl_sync_backend
-        nccl_world_size, nccl_gname = init_nccl_weight_sync(training_engines=training_engines,
-                                                            rollout_engines=rollout_engines,
-                                                            master_addr=master_addr,
-                                                            nccl_port=nccl_port,
-                                                            tp_size=int(config.rollout.tensor_parallel_size),
-                                                            logger=logger,
-                                                            init_timeout=config.run.init_timeout,
-                                                            backend=nccl_sync_backend)
-        logger.info(f"Weight sync: NCCL (port={nccl_port}, world_size={nccl_world_size}) with NCCL group name {nccl_gname}")
 
     else:
         logger.info(f"Weight sync method is {weight_sync_method}")
@@ -1606,6 +1635,20 @@ if __name__ == "__main__":
                                                                               refresh_fn=refresh_rollout_engine)
         rollout_policy_version = policy_version
         logger.info(f"Resuming from epoch {start_epoch+1}, policy_version={policy_version}, global_step={global_step}")
+
+    ########
+    # 9b. Initialize NCCL weight sync group (after resume, so engines are fresh)
+    ########
+    if weight_sync_method == "nccl":
+        nccl_world_size, nccl_gname = reinit_nccl_weight_sync_group(training_engines=training_engines,
+                                                                    rollout_engines=rollout_engines,
+                                                                    master_addr=master_addr,
+                                                                    nccl_port=nccl_port,
+                                                                    tp_size=int(config.rollout.tensor_parallel_size),
+                                                                    logger=logger,
+                                                                    init_timeout=config.run.init_timeout,
+                                                                    backend=nccl_sync_backend)
+        logger.info(f"Weight sync: NCCL (port={nccl_port}, world_size={nccl_world_size}) with NCCL group name {nccl_gname}")
 
     # Clean up incomplete checkpoint directories from previous crashed runs.
     # Only directories missing the CHECKPOINT_COMPLETE marker are removed.
@@ -1797,6 +1840,8 @@ if __name__ == "__main__":
                                              timeout=sync_timeout,
                                              description=f"finalize weight sync v{policy_version}",
                                              logger=logger)
+                        # already waited, prevent double-wait at line below
+                        nccl_finalize_refs = None
 
                         rollout_policy_version = policy_version
                         sync_success = True
@@ -1907,6 +1952,19 @@ if __name__ == "__main__":
                                    sync_timeout=sync_timeout)
             rollout_policy_version = policy_version
             logger.info(f"[Epoch {epoch+1}] Rollout engines refreshed")
+
+            # Refresh destroys EngineCore workers, invalidating NCCL groups.
+            # Re-initialize so subsequent NCCL syncs don't hang.
+            if weight_sync_method == "nccl":
+                logger.info(f"[Epoch {epoch+1}] Re-initializing NCCL weight sync group after engine refresh...")
+                reinit_nccl_weight_sync_group(training_engines=training_engines,
+                                              rollout_engines=rollout_engines,
+                                              master_addr=master_addr,
+                                              nccl_port=nccl_port,
+                                              tp_size=int(config.rollout.tensor_parallel_size),
+                                              logger=logger,
+                                              init_timeout=config.run.init_timeout,
+                                              backend=nccl_sync_backend)
 
         # NCCL sync metrics
         if tracker and overlap_enabled:
