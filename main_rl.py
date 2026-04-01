@@ -435,15 +435,18 @@ def run_training_step(engines, shard_refs, logger, train_step_timeout):
        shard_refs: list of Ray ObjectRefs (one per engine), created by shard_and_put().
        Ray auto-resolves ObjectRefs passed to .remote(), so the engine receives the actual data.
     '''
+    step_start = time.time()
     futures = []
     for eid, engine in enumerate(engines):
         futures.append(engine.train_step.remote(engine_id=eid, micro_batches=shard_refs[eid]))
 
+    logger.info(f"[run_training_step] Dispatched to {len(engines)} engines, waiting for results...")
     # Gather training metrics from all engines
     metrics_list = ray_get_with_timeout(refs=futures,
                                         timeout=train_step_timeout,
                                         description="training step",
                                         logger=logger)
+    logger.info(f"[run_training_step] All engines returned in {time.time() - step_start:.1f}s")
 
     # Dynamically aggregate all metric keys across engines.
     # metrics_list: clipfrac, approx_kl, loss_ent, loss_pi, loss_total, kl_ref
@@ -1076,6 +1079,9 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                     training_done = True
 
                 if training_done:
+                    logger.info(f"[Epoch {epoch+1}] Training done after step {train_step_count}, "
+                                f"pending_chunk={'yes' if pending_chunk is not None else 'no'}, "
+                                f"ess_break={ess_break}")
                     break
 
                 # Mid-training chunk cycling: if the in-flight chunk finished
@@ -1110,6 +1116,9 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
 
         # 3.1a Drain-mode training: when steps_per_epoch is exhausted but chunks
         # remain, keep training on the growing replay buffer instead of idling.
+        logger.info(f"[Epoch {epoch+1}] Post-training: training_done={training_done}, ess_break={ess_break}, "
+                    f"shard_refs={'yes' if shard_refs is not None else 'no'}, "
+                    f"pending_chunk={'yes (idx=' + str(pending_chunk.chunk_idx) + ')' if pending_chunk is not None else 'no'}")
         # Runs whether the chunk is ready or not — trains on existing shards while
         # waiting, and cycles chunks as they finish (same pattern as main training).
         # ESS/fixed_sync can still trigger ess_break to stop and force a sync.
@@ -1216,10 +1225,15 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
             iter_train_sec = time.time() - iter_train_start
             total_overlap_interleaved_sec += iter_train_sec
             gen_wait_start = time.time()
+            is_ready = chunk_is_ready(pending_chunk)
+            logger.info(f"[Epoch {epoch+1}] Step 3.2: finalizing chunk {pending_chunk.chunk_idx}, "
+                        f"ready={is_ready}, dispatched {time.time() - pending_chunk.dispatch_time:.1f}s ago")
             cs = finalize_chunk(chunk=pending_chunk,
                                 replay_buffer=replay_buffer,
                                 logger=logger,
                                 rollout_timeout=rollout_timeout)
+            logger.info(f"[Epoch {epoch+1}] Step 3.2: finalize_chunk returned after "
+                        f"{time.time() - gen_wait_start:.1f}s")
 
             total_overlap_gen_wait_sec += time.time() - gen_wait_start
             chunk_stats_list.append(cs)
