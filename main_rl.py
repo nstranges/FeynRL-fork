@@ -12,6 +12,7 @@ import ray
 import time
 import shutil
 from dataclasses import dataclass
+import concurrent.futures
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
@@ -531,10 +532,10 @@ def refresh_rollout_engine(rollout_engines, updated_policy_path, version, logger
                          description=f"refresh rollout engines from disk (v{version})",
                          logger=logger)
 
-def init_nccl_weight_sync(training_engines, rollout_engines, master_addr, nccl_port, tp_size, logger, init_timeout):
+def init_nccl_weight_sync(training_engines, rollout_engines, master_addr, nccl_port, tp_size, logger, init_timeout, backend):
     '''
         Initialize the NCCL weight sync group across training rank 0 and
-        all vLLM TP workers. All participants must call into the NCCL
+        all vllm tp workers. All participants must call into the NCCL
         rendezvous concurrently.
         Rank assignment:
           rank 0: training engine rank 0
@@ -542,14 +543,15 @@ def init_nccl_weight_sync(training_engines, rollout_engines, master_addr, nccl_p
           rank tp+1..2*tp: rollout engine 1, TP workers 0..tp-1
           ....
         world_size = 1 + num_rollout_engines * tp_size
+        backend: "nccl" for gpu-to-gpu broadcast, gloo for cpu-based.
     '''
     num_rollout_engines = len(rollout_engines)
     world_size = 1 + num_rollout_engines * tp_size
     group_name = "feynrl_weight_sync"
 
-    logger.info(f"[NCCL] Initializing weight sync group: world_size={world_size}, "
+    logger.info(f"[init_nccl_weight_sync - main] Initializing weight sync group: world_size={world_size}, "
                 f"port={nccl_port}, training_rank=0, "
-                f"{num_rollout_engines} rollout engines x TP={tp_size}")
+                f"{num_rollout_engines} rollout engines x TP={tp_size}, backend={backend}")
 
     # All participants must call rendezvous concurrently.
     # Training rank 0 gets rank=0.
@@ -560,7 +562,7 @@ def init_nccl_weight_sync(training_engines, rollout_engines, master_addr, nccl_p
                                                                     world_size=world_size,
                                                                     group_name=group_name,
                                                                     timeout_seconds=init_timeout,
-                                                                    backend="gloo"))
+                                                                    backend=backend))
 
     # Each rollout engine gets rank_offset = 1 + engine_idx * tp_size,
     # and its TP workers compute their own ranks internally.
@@ -572,34 +574,36 @@ def init_nccl_weight_sync(training_engines, rollout_engines, master_addr, nccl_p
                                                     world_size=world_size,
                                                     group_name=group_name,
                                                     timeout_seconds=init_timeout,
-                                                    backend="gloo"))
+                                                    backend=backend))
     # no need to return results, just waiting for all to finish
     ray_get_with_timeout(refs=futures,
                         timeout=init_timeout,
                         description="NCCL weight sync group initialization at main",
                         logger=logger)
-    logger.info(f"[WeightSync] Weight sync group initialized (world_size={world_size}, backend=gloo)")
+    logger.info(f"[WeightSync] Weight sync group initialized (world_size={world_size}, backend={backend})")
 
     return world_size, group_name
 
-def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_timeout):
+def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_timeout, use_barrier=True):
     '''
         Broadcast weights from training engines to rollout engines via NCCL.
-        It is done in three phases:
+        Three phases:
           1. Gather: all training ranks participate in zero-3 collective gather.
-             Rank 0 returns param metadata to the driver; others return [].
-          2. Barrier + Broadcast: fire receive on all rollout engines, wait for
-             each to signal readiness via NCCLBarrier (from inside the method),
-             then fire training broadcast. This guarantees all participants are
-             in the NCCL collective before the sender enters.
+          2. Broadcast: fire receive on all rollout engines, then fire training broadcast.
+             When use_barrier=True: poll NCCLBarrier to ensure all engines are
+             ready before broadcasting. Use when engines are known to be idle.
+             When use_barrier=False: skip barrier, rely on NCCL's implicit synchronization.
+             Use when engines may be busy generating (non-blocking sync). The receive RPCs
+             queue in Ray's actor mailbox behind any in-flight generate calls, and NCCL
+             broadcast blocks until all participants enter.
           3. Finalize: rollout engines load received weights into vLLM.
         Must only be called when ALL training engines are idle.
     '''
     start_time = time.time()
-    logger.info(f"[NCCL] Broadcasting weights v{version} to rollout engines...")
+    mode = "blocking" if use_barrier else "non-blocking"
+    logger.info(f"[sync_weights_nccl] Starting {mode} weight sync v{version} to {len(rollout_engines)} rollout engines...")
 
     # Phase 1: Gather state dict on all training ranks.
-    # Rank 0 stores the state dict and returns [(name, dtype_str, shape), ...].
     gather_futures = [engine.gather_weights_for_nccl.remote() for engine in training_engines]
     gather_results = ray_get_with_timeout(refs=gather_futures,
                                           timeout=sync_timeout,
@@ -613,63 +617,103 @@ def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_t
             break
 
     if not param_metadata:
-        logger.warning("[NCCL] No parameters gathered; skipping broadcast")
-        return True
+        logger.warning("[sync_weights_nccl] Phase 1: no parameters gathered; skipping broadcast")
+        return True, []
 
     num_params = len(param_metadata)
     num_engines = len(rollout_engines)
 
-    # Phase 2a: Create barrier and fire receive on all engines.
-    # Each engine signals the barrier from INSIDE receive_all_weights_nccl
-    # BEFORE entering the NCCL broadcast loop.
-    barrier = NCCLBarrier.remote(expected=num_engines)
-    logger.info(f"[Sync-NCCL] Dispatching receive ({num_params} params) to {num_engines} engines...")
-    rollout_refs = [eng.receive_all_weights_nccl.remote(param_metadata, barrier)
-                    for eng in rollout_engines]
+    # Phase 2a: Fire receive on all engines.
+    if use_barrier:
+        barrier = NCCLBarrier.remote(expected=num_engines)
+        logger.info(f"[sync_weights_nccl] Phase 2a: dispatching receive ({num_params} params) to {num_engines} engines (with barrier)...")
+        rollout_refs = [eng.receive_all_weights_nccl.remote(param_metadata, barrier)
+                        for eng in rollout_engines]
 
-    # Phase 2b: Poll barrier until ALL engines have signaled ready.
-    # This replaces the unreliable time.sleep(5). Each engine signals from
-    # inside the method, so when count == num_engines, all engines are
-    # guaranteed to be about to enter (or already inside) the NCCL loop.
-    # Use sync_timeout (configurable) instead of a hardcoded value.
-    barrier_timeout = min(sync_timeout, 300)
-    barrier_deadline = time.time() + barrier_timeout
-    while time.time() < barrier_deadline:
-        count = ray.get(barrier.get_count.remote())
-        if count >= num_engines:
-            break
-        time.sleep(0.5)
+        # Phase 2b: Poll barrier until ALL engines have signaled ready.
+        barrier_timeout = min(sync_timeout, 300)
+        barrier_poll_timeout = 10
+        barrier_deadline = time.time() + barrier_timeout
+        # Poll the barrier actor until all engines have signaled ready.
+        # 0.5s sleep prevents busy-spinning on the remote call while adding
+        # negligible latency (at most one extra poll interval after the last
+        # engine checks in). This scales to multi-GPU / multi-node clusters
+        # because we're only querying a single counter on one Ray actor and
+        # cluster size affects how long we wait, not how often we poll.
+        while time.time() < barrier_deadline:
+            try:
+                count = ray.get(barrier.get_count.remote(), timeout=barrier_poll_timeout)
+            except Exception:
+                count = 0
+            if count >= num_engines:
+                break
+            time.sleep(0.5)
+
+        else:
+            try:
+                count = ray.get(barrier.get_count.remote(), timeout=barrier_poll_timeout)
+            except Exception:
+                count = 0
+
+            if count < num_engines:
+                raise TimeoutError(f"[sync_weights_nccl] Phase 2b: only {count}/{num_engines} engines signaled ready "
+                                   f"within {barrier_timeout}s. Check engine logs for errors.")
+
+        logger.info(f"[sync_weights_nccl] Phase 2b: all {num_engines} engines ready, firing training broadcast...")
 
     else:
-        count = ray.get(barrier.get_count.remote())
-        if count < num_engines:
-            raise TimeoutError(f"[Sync-NCCL] Only {count}/{num_engines} engines signaled ready "
-                               f"within {barrier_timeout}s. Check engine logs for errors.")
+        # Non-blocking: no barrier. RPCs queue behind any in-flight generate calls.
+        # NCCL broadcast is the implicit synchronization point.
+        logger.info(f"[sync_weights_nccl] Phase 2a: dispatching receive ({num_params} params) to {num_engines} engines (no barrier)...")
+        rollout_refs = [eng.receive_all_weights_nccl.remote(param_metadata, None)
+                        for eng in rollout_engines]
 
-    logger.info(f"[Sync-NCCL] All {num_engines} engines confirmed ready via barrier, "
-                f"firing training broadcast...")
-
-    # Phase 2c: Fire training broadcast. All engines are now inside
-    # receive_all_weights_nccl and waiting on the first NCCL broadcast.
+    # Phase 2c: Fire training broadcast and wait for all broadcasts to complete.
     broadcast_ref = training_engines[0].nccl_broadcast_gathered.remote()
-
-    # Wait for all NCCL broadcasts to complete.
     all_refs = rollout_refs + [broadcast_ref]
-    ray_get_with_timeout(refs=all_refs,
-                         timeout=sync_timeout,
-                         description=f"NCCL broadcast v{version}",
-                         logger=logger)
 
-    # Phase 3: Finalize — load received weights into vLLM model.
+    try:
+        ray_get_with_timeout(refs=all_refs,
+                             timeout=sync_timeout,
+                             description=f"NCCL broadcast v{version}",
+                             logger=logger)
+    except Exception as e:
+        # If broadcast times out or fails, rollout engines may be stuck in
+        # torch.distributed.broadcast / PyNcclCommunicator.broadcast with no
+        # cancellation API. The engines will remain blocked until all participants
+        # enter the collective (or NCCL's internal watchdog kills the process).
+        # Subsequent Ray calls to these engines will queue behind the stuck broadcast.
+        # Recovery requires restarting the stuck actors.
+        logger.error(f"[sync_weights_nccl] NCCL broadcast v{version} failed or timed out: {e}. "
+                     f"Rollout engines may be stuck in NCCL collective. "
+                     f"If training hangs after this, restart the job.")
+        raise
+
+    # Phase 3: Finalize — fire but don't block.
     finalize_refs = [eng.finalize_weight_nccl.remote(version) for eng in rollout_engines]
-    ray_get_with_timeout(refs=finalize_refs,
-                         timeout=sync_timeout,
-                         description=f"finalize weight sync v{version}",
-                         logger=logger)
 
     elapsed = time.time() - start_time
-    logger.info(f"[Sync-NCCL] Weight broadcast v{version} complete in {elapsed:.2f}s")
-    return True
+    logger.info(f"[sync_weights_nccl] Broadcast complete in {elapsed:.2f}s, finalize dispatched ({mode})")
+    return True, finalize_refs
+
+# Background thread executor for non-blocking weight sync.
+# Single thread ensures syncs are serialized, no two syncs racing.
+sync_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="weight_sync")
+
+def sync_weights_nccl_async(training_engines, rollout_engines, version, logger, sync_timeout):
+    '''
+        Non-blocking wrapper: submits sync_weights_nccl (without barrier) to a background
+        thread so the driver can dispatch generation concurrently. Returns a Future whose
+        result is (success, finalize_refs).
+    '''
+    future = sync_executor.submit(sync_weights_nccl,
+                                  training_engines,
+                                  rollout_engines,
+                                  version,
+                                  logger,
+                                  sync_timeout,
+                                  use_barrier=False)
+    return future
 
 @dataclass
 class ChunkFuture:
@@ -824,17 +868,86 @@ def run_epoch_sync(epoch, training_engines, rollout_engines, rollout_dataloader,
             'train_time': time.time() - train_start_time,
             'sync_performed': False}
 
+def try_rebuild_shards(replay_buffer, train_batch_size, num_engines, seed,
+                       epoch, shard_buffer_size, shard_rebuild_count,
+                       min_new_samples=0, force=False):
+    '''
+        Rebuild training shards if the replay buffer grew enough.
+        force=True always rebuilds which is used at loop boundaries.
+        min_new_samples: minimum number of new samples since last rebuild to trigger.
+                        Use train_batch_size * num_engines so each engine gets at least
+                        one new micro-batch from the rebuild.
+        Returns (shard_refs, new_shard_buffer_size, new_shard_rebuild_count, batches) or None if skipped.
+    '''
+    buf_len = len(replay_buffer)
+    if buf_len < train_batch_size:
+        return None
+
+    if not force and (buf_len - shard_buffer_size) < min_new_samples:
+        return None
+
+    batches = prepare_training_batches(replay_buffer=replay_buffer,
+                                       batch_size=train_batch_size,
+                                       num_engines=num_engines,
+                                       seed=seed,
+                                       epoch=epoch + shard_rebuild_count)
+    refs = shard_and_put(batches, num_engines=num_engines)
+    return refs, buf_len, shard_rebuild_count + 1, batches
+
+def cycle_chunk(pending_chunk, replay_buffer, dataloader_iter, rollout_engines,
+                epoch, rollout_policy_version, chunk_size, chunk_idx,
+                chunk_stats_list, logger, rollout_timeout):
+    '''
+        Finalize pending chunk, append stats, dispatch next chunk.
+        Returns (new_pending_chunk, new_chunk_idx).
+    '''
+    cs = finalize_chunk(chunk=pending_chunk,
+                        replay_buffer=replay_buffer,
+                        logger=logger,
+                        rollout_timeout=rollout_timeout)
+    chunk_stats_list.append(cs)
+
+    next_chunk = dispatch_one_chunk(dataloader_iter=dataloader_iter,
+                                    rollout_engines=rollout_engines,
+                                    epoch=epoch,
+                                    policy_version=rollout_policy_version,
+                                    chunk_size=chunk_size,
+                                    chunk_idx=chunk_idx,
+                                    logger=logger)
+    new_idx = chunk_idx + 1 if next_chunk is not None else chunk_idx
+    return next_chunk, new_idx
+
+def check_ess_sync(train_metrics, train_step_count, ess_sync_threshold,
+                    fixed_sync_interval, sync_triggered_this_epoch):
+    '''
+        Check if ESS or fixed_sync_interval triggers a sync.
+        Returns (should_stop, ess_value).
+    '''
+    ess = train_metrics.get('ess_factor', None)
+    if not sync_triggered_this_epoch:
+        if ess is not None and ess < ess_sync_threshold:
+            return True, ess
+
+        if fixed_sync_interval and train_step_count % fixed_sync_interval == 0:
+            return True, ess
+
+    return False, ess
+
 def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataloader,
                       replay_buffer, policy_version, rollout_policy_version, global_step,
                       train_batch_size, steps_per_epoch, seed, chunk_size, max_lag,
                       ess_sync_threshold, fixed_sync_interval, is_last_epoch,
                       rollout_timeout, train_step_timeout, sync_timeout,
-                      tracker, logger):
+                      tracker, logger, pre_dispatched_chunk=None):
     '''
-        Overlap epoch: interleaved chunk generation + training with ESS-driven NCCL sync.
-        Generation is dispatched one chunk at a time, only one chunk is ever in an engine's
-        FIFO mailbox. Between chunks the engines are genuinely idle, creating real windows
-        for NCCL weight sync. Training starts as soon as the first chunk arrives.
+        Double-buffered overlap epoch: training and generation run concurrently.
+        Training mode: training runs while the pending chunk generates on rollout engines.
+                       Training is not interrupted by chunk readiness (no chunk_is_ready exit).
+        Drain mode:    when training is done but chunks remain, the NEXT chunk is pre-dispatched
+                       before finalizing the current one, so rollout engines generate during
+                       the finalize wait (true double-buffering).
+        NCCL sync:     when ESS or fixed_sync_interval triggers, no lookahead is dispatched,
+                       engines are idle after finalize, and sync executes immediately.
     '''
     epoch_start_time = time.time()
     num_engines = len(training_engines)
@@ -859,44 +972,74 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
     shard_refs = None
     shard_buffer_size = 0
     shard_rebuild_count = 0
+    # Minimum new samples before rebuilding shards mid-training/drain.
+    # One batch per engine ensures each engine gets at least one new micro-batch
+    # from the rebuild. Set to 0 to rebuild on every chunk.
+    shard_rebuild_min_samples = train_batch_size * num_engines
+    # Drain training counters. drain_epoch_limit caps total drain steps across the
+    # entire epoch (not per outer-loop iteration) to prevent excessive off-policy training.
+    drain_steps_this_epoch = 0
+    drain_epoch_limit = steps_per_epoch * 2
     train_start_time = time.time()
 
     # Dispatch first chunk, training can't overlap yet as there is no data.
-    pending_chunk = dispatch_one_chunk(dataloader_iter=dataloader_iter,
-                                       rollout_engines=rollout_engines,
-                                       epoch=epoch,
-                                       policy_version=rollout_policy_version,
-                                       chunk_size=chunk_size,
-                                       chunk_idx=chunk_idx,
-                                       logger=logger)
-    chunk_idx += 1
+    # If the previous epoch pre-dispatched a chunk during checkpoint save,
+    # reuse it instead of dispatching a new one.
+    if pre_dispatched_chunk is not None:
+        pending_chunk = pre_dispatched_chunk
+        chunk_idx += 1
+        # Advance the dataloader past the batch(es) already consumed by early dispatch.
+        # The pre-dispatched chunk used chunk_size batches from a separate iterator
+        # on the same epoch, so we skip the same number here to avoid duplicates.
+        for _ in range(chunk_size):
+            try:
+                next(dataloader_iter)
 
-    logger.info(f"[Epoch {epoch+1}] On-demand generation: "
+            except StopIteration:
+                break
+        logger.info(f"[Epoch {epoch+1}] Reusing pre-dispatched chunk from previous epoch")
+
+    else:
+        pending_chunk = dispatch_one_chunk(dataloader_iter=dataloader_iter,
+                                           rollout_engines=rollout_engines,
+                                           epoch=epoch,
+                                           policy_version=rollout_policy_version,
+                                           chunk_size=chunk_size,
+                                           chunk_idx=chunk_idx,
+                                           logger=logger)
+        chunk_idx += 1
+
+    logger.info(f"[Epoch {epoch+1}] Double-buffered generation: "
                 f"~{total_chunks} chunks (chunk_size={chunk_size}), "
                 f"policy v{rollout_policy_version}")
 
-    # 3. Interleaved generate-train loop. Each iteration:
-    #   3.1. Run training steps while the pending chunk generates
-    #   3.2. Finalize the chunk. This blocks until engines finish, merges results into buffer
-    #   3.3. Rebuild training shards if the buffer grew as new data from finalized chunk.
-    #   3.4. If ESS triggered, NCCL sync is attempted at chunk boundary (engines are idle
-    #         with empty FIFO mailboxes so the collective executes immediately)
-    #   3.5. Dispatch next chunk or stop if ESS ended training early.
-    total_overlap_train_sec = 0.0
+    # 3. Double-buffered generate-train loop. Each iteration:
+    #   3.1.  Run training steps while the pending chunk generates (no chunk_is_ready exit).
+    #   3.1b. If training is done, pre-dispatch the NEXT chunk before finalizing the current
+    #         one, drain mode double-buffering: engines generate during finalize wait.
+    #   3.2.  Finalize the chunk. Blocks until engines finish, merges results into buffer.
+    #   3.3.  Rebuild training shards if the buffer grew from finalized chunk data.
+    #   3.4.  If ESS triggered, NCCL sync at chunk boundary, engines are idle since no
+    #         lookahead was dispatched when ess_break is True.
+    #   3.5.  Advance pending: use lookahead (drain) or dispatch new chunk (training mode).
+    # Overlap efficiency metrics. interleaved_sec includes training + drain + overhead
+    # (shard rebuild, chunk cycling). gen_wait_sec is time blocked at finalize in step 3.2.
+    # ratio = interleaved / (interleaved + wait): closer to 1.0 = better overlap.
+    total_overlap_interleaved_sec = 0.0
     total_overlap_gen_wait_sec = 0.0
+    version_bumped_early = False
     while pending_chunk is not None:
-        # 3.1 Run as many training steps as fit while the chunk is in-flight.
-        # When generation is slower than training this fills idle time
-        # with useful work instead of blocking at finalize_chunk.
+        # 3.1 Run training steps while chunks generate. When the in-flight chunk
+        # finishes mid-training, finalize it immediately and dispatch the next one
+        # so rollout engines stay busy throughout training (continuous overlap).
         iter_train_start = time.time()
-        # shard_refs is None until the first chunk is finalized and the buffer
-        # has enough samples to build training batches (>= train_batch_size).
         if not training_done and shard_refs is not None:
             while train_step_count < steps_per_epoch:
                 train_metrics = run_training_step(engines=training_engines,
                                                   shard_refs=shard_refs,
                                                   logger=logger,
                                                   train_step_timeout=train_step_timeout)
+
                 for k, v in train_metrics.items():
                     epoch_metrics.setdefault(k, []).append(v)
                 global_step += 1
@@ -912,82 +1055,223 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                        step=global_step)
 
                 # ESS-driven early stop
-                ess = train_metrics.get('ess_factor', None)
-                if not sync_triggered_this_epoch:
-                    if ess is not None and ess < ess_sync_threshold:
-                        logger.info(f"[Epoch {epoch+1}][Step {train_step_count}] "
-                                    f"ESS={ess:.4f} < {ess_sync_threshold}, ending training early "
-                                    f"({steps_per_epoch - train_step_count} steps skipped)")
-                        training_done = True
-                        ess_break     = True
-
-                    elif fixed_sync_interval and \
-                         train_step_count % fixed_sync_interval == 0:
-                        logger.info(f"[Epoch {epoch+1}][Step {train_step_count}] "
-                                    f"Fixed interval sync, ending training early")
-                        training_done = True
-                        ess_break     = True
+                should_stop, ess = check_ess_sync(train_metrics, train_step_count,
+                                                  ess_sync_threshold, fixed_sync_interval,
+                                                  sync_triggered_this_epoch)
+                if should_stop:
+                    logger.info(f"[Epoch {epoch+1}][Step {train_step_count}] "
+                                f"Sync triggered (ESS={ess}), ending training early "
+                                f"({steps_per_epoch - train_step_count} steps skipped)")
 
                 if tracker and ess is not None:
                     tracker.log_metrics({"nccl/ess_factor": ess,
                                          "nccl/sync_triggered": 1 if sync_triggered_this_epoch else 0,
                                         }, step=global_step)
 
+                if should_stop:
+                    training_done = True
+                    ess_break     = True
+
                 if train_step_count >= steps_per_epoch:
                     training_done = True
 
-                # Stop training either when training is done (ESS/steps exhausted), or
-                # when the chunk finished generating, as there is no point holding up finalization
-                # before dispatching the next chunk.
-                if training_done or chunk_is_ready(pending_chunk):
+                if training_done:
                     break
 
-        # 3.2 Finalize current chunk
-        iter_train_sec = time.time() - iter_train_start
-        total_overlap_train_sec += iter_train_sec
-        gen_wait_start = time.time()
-        cs = finalize_chunk(chunk=pending_chunk,
-                            replay_buffer=replay_buffer,
-                            logger=logger,
-                            rollout_timeout=rollout_timeout)
-        total_overlap_gen_wait_sec += time.time() - gen_wait_start
-        chunk_stats_list.append(cs)
-        logger.info(f"[Epoch {epoch+1}] Chunk {pending_chunk.chunk_idx + 1}/{total_chunks} finalized, "
-                    f"replay buffer: {len(replay_buffer)} samples")
+                # Mid-training chunk cycling: if the in-flight chunk finished
+                # while we were training, finalize it now and dispatch the next
+                # one so rollout engines stay busy instead of idling.
+                if pending_chunk is not None and chunk_is_ready(pending_chunk):
+                    logger.info(f"[Epoch {epoch+1}] Chunk {pending_chunk.chunk_idx + 1}/{total_chunks} "
+                                f"finalized mid-training, replay buffer: {len(replay_buffer)} samples")
 
-        # Rebuild training shards when new data arrives. The size check
-        # (len != shard_buffer_size) avoids redundant rebuilds when a chunk
-        # added zero usable samples, e.g., all sequences were truncated or zero-length.
-        if len(replay_buffer) >= train_batch_size and len(replay_buffer) != shard_buffer_size:
-            train_batches_padded = prepare_training_batches(replay_buffer=replay_buffer,
-                                                            batch_size=train_batch_size,
-                                                            num_engines=num_engines,
-                                                            seed=seed,
-                                                            epoch=epoch * total_chunks + shard_rebuild_count)
-            shard_refs = shard_and_put(train_batches_padded, num_engines=num_engines)
-            shard_buffer_size    = len(replay_buffer)
-            shard_rebuild_count += 1
-            samples_per_engine   = len(replay_buffer) // num_engines
-            micro_per_engine     = len(train_batches_padded) // num_engines
-            logger.info(f"[Epoch {epoch+1}] Training shards {'rebuilt' if shard_rebuild_count > 1 else 'prepared'}: "
-                        f"{len(replay_buffer)} replay samples / {num_engines} engines "
-                        f"= {samples_per_engine} samples/engine / bs={train_batch_size} "
-                        f"= {micro_per_engine} micro-batches/engine, "
-                        f"{steps_per_epoch} pass(es)")
+                    pending_chunk, chunk_idx = cycle_chunk(pending_chunk=pending_chunk,
+                                                           replay_buffer=replay_buffer,
+                                                           dataloader_iter=dataloader_iter,
+                                                           rollout_engines=rollout_engines,
+                                                           epoch=epoch,
+                                                           rollout_policy_version=rollout_policy_version,
+                                                           chunk_size=chunk_size,
+                                                           chunk_idx=chunk_idx,
+                                                           chunk_stats_list=chunk_stats_list,
+                                                           logger=logger,
+                                                           rollout_timeout=rollout_timeout)
 
-        # 3.4 NCCL sync opportunity. After finalize_chunk, all rollout engine
-        # actors have empty FIFO mailboxes, i.e., no pending generate calls, so the
-        # NCCL collective executes immediately without queuing behind other work.
-        # We only sync once per epoch, as further training would just go stale again.
-        if ess_break and not sync_triggered_this_epoch and not is_last_epoch:
+                    result = try_rebuild_shards(replay_buffer=replay_buffer,
+                                                train_batch_size=train_batch_size,
+                                                num_engines=num_engines,
+                                                seed=seed,
+                                                epoch=epoch * total_chunks,
+                                                shard_buffer_size=shard_buffer_size,
+                                                shard_rebuild_count=shard_rebuild_count,
+                                                min_new_samples=shard_rebuild_min_samples)
+                    if result:
+                        shard_refs, shard_buffer_size, shard_rebuild_count, _ = result
+
+        # 3.1a Drain-mode training: when steps_per_epoch is exhausted but chunks
+        # remain, keep training on the growing replay buffer instead of idling.
+        # Runs whether the chunk is ready or not — trains on existing shards while
+        # waiting, and cycles chunks as they finish (same pattern as main training).
+        # ESS/fixed_sync can still trigger ess_break to stop and force a sync.
+        # Drain steps are capped per epoch (not per outer-loop iteration) to prevent
+        # excessive training on increasingly off-policy data.
+        if training_done and not ess_break and shard_refs is not None and pending_chunk is not None:
+            drain_step_limit = min(steps_per_epoch, drain_epoch_limit - drain_steps_this_epoch)
+            if drain_step_limit > 0:
+                drain_steps_taken = 0
+                logger.info(f"[Epoch {epoch+1}] Drain training: up to {drain_step_limit} steps "
+                            f"(epoch total: {drain_steps_this_epoch}/{drain_epoch_limit}) "
+                            f"on {len(replay_buffer)} replay samples")
+
+                while drain_steps_taken < drain_step_limit:
+                    train_metrics = run_training_step(engines=training_engines,
+                                                      shard_refs=shard_refs,
+                                                      logger=logger,
+                                                      train_step_timeout=train_step_timeout)
+                    for k, v in train_metrics.items():
+                        epoch_metrics.setdefault(k, []).append(v)
+
+                    global_step += 1
+                    train_step_count += 1
+                    drain_steps_taken += 1
+                    drain_steps_this_epoch += 1
+
+                    if drain_steps_taken % 10 == 0 or drain_steps_taken == 1:
+                        metric_str = ", ".join(f"{k}={v:.4f}" for k, v in train_metrics.items())
+                        logger.info(f"[Epoch {epoch+1}][Drain Step {drain_steps_taken}/{drain_step_limit}] {metric_str}")
+
+                    if tracker:
+                        tracker.log_metrics({f"train/{k}": v for k, v in train_metrics.items()},
+                                           step=global_step)
+
+                    # ESS/fixed_sync check
+                    should_stop, ess = check_ess_sync(train_metrics,
+                                                      train_step_count,
+                                                      ess_sync_threshold,
+                                                      fixed_sync_interval,
+                                                      sync_triggered_this_epoch)
+                    if tracker and ess is not None:
+                        tracker.log_metrics({"nccl/ess_factor": ess,
+                                             "nccl/sync_triggered": 1 if sync_triggered_this_epoch else 0,
+                                            }, step=global_step)
+
+                    if should_stop:
+                        logger.info(f"[Epoch {epoch+1}][Drain Step {drain_steps_taken}] "
+                                    f"Sync triggered (ESS={ess}), ending drain training")
+                        ess_break = True
+                        break
+
+                    # Mid-drain chunk cycling: finalize ready chunks and dispatch next
+                    if pending_chunk is not None and chunk_is_ready(pending_chunk):
+                        logger.info(f"[Epoch {epoch+1}] Chunk finalized mid-drain, "
+                                    f"replay buffer: {len(replay_buffer)} samples")
+                        pending_chunk, chunk_idx = cycle_chunk(pending_chunk=pending_chunk,
+                                                               replay_buffer=replay_buffer,
+                                                               dataloader_iter=dataloader_iter,
+                                                               rollout_engines=rollout_engines,
+                                                               epoch=epoch,
+                                                               rollout_policy_version=rollout_policy_version,
+                                                               chunk_size=chunk_size,
+                                                               chunk_idx=chunk_idx,
+                                                               chunk_stats_list=chunk_stats_list,
+                                                               logger=logger,
+                                                               rollout_timeout=rollout_timeout)
+
+                        result = try_rebuild_shards(replay_buffer=replay_buffer,
+                                                    train_batch_size=train_batch_size,
+                                                    num_engines=num_engines,
+                                                    seed=seed,
+                                                    epoch=epoch * total_chunks,
+                                                    shard_buffer_size=shard_buffer_size,
+                                                    shard_rebuild_count=shard_rebuild_count,
+                                                    min_new_samples=shard_rebuild_min_samples)
+                        if result:
+                            shard_refs, shard_buffer_size, shard_rebuild_count, _ = result
+
+                    if pending_chunk is None:
+                        break
+
+        # 3.1b Pre-dispatch lookahead in drain mode.
+        # When training is done and there are more chunks, dispatch the next
+        # chunk BEFORE finalizing the current one. This way rollout engines
+        # generate the next chunk while finalize_chunk blocks on the current one.
+        # In training mode (training_done=False), we dispatch at the bottom
+        # of the loop (step 3.5) so training overlaps in the next iteration.
+        if training_done and not ess_break:
+            lookahead = dispatch_one_chunk(dataloader_iter=dataloader_iter,
+                                           rollout_engines=rollout_engines,
+                                           epoch=epoch,
+                                           policy_version=rollout_policy_version,
+                                           chunk_size=chunk_size,
+                                           chunk_idx=chunk_idx,
+                                           logger=logger)
+            if lookahead is not None:
+                chunk_idx += 1
+
+        else:
+            lookahead = None
+
+        # 3.2 Finalize current chunk (may already be finalized mid-training)
+        if pending_chunk is not None:
+            iter_train_sec = time.time() - iter_train_start
+            total_overlap_interleaved_sec += iter_train_sec
+            gen_wait_start = time.time()
+            cs = finalize_chunk(chunk=pending_chunk,
+                                replay_buffer=replay_buffer,
+                                logger=logger,
+                                rollout_timeout=rollout_timeout)
+
+            total_overlap_gen_wait_sec += time.time() - gen_wait_start
+            chunk_stats_list.append(cs)
+
+            logger.info(f"[Epoch {epoch+1}] Chunk {pending_chunk.chunk_idx + 1}/{total_chunks} finalized, "
+                        f"replay buffer: {len(replay_buffer)} samples")
+
+            # Rebuild training shards when new data arrives (force=True at loop boundary).
+            result = try_rebuild_shards(replay_buffer=replay_buffer,
+                                        train_batch_size=train_batch_size,
+                                        num_engines=num_engines,
+                                        seed=seed,
+                                        epoch=epoch * total_chunks,
+                                        shard_buffer_size=shard_buffer_size,
+                                        shard_rebuild_count=shard_rebuild_count,
+                                        force=True)
+            if result:
+                shard_refs, shard_buffer_size, shard_rebuild_count, train_batches_padded = result
+                samples_per_engine = len(replay_buffer) // num_engines
+                micro_per_engine   = len(train_batches_padded) // num_engines
+
+                logger.info(f"[Epoch {epoch+1}] Training shards {'rebuilt' if shard_rebuild_count > 1 else 'prepared'}: "
+                            f"{len(replay_buffer)} replay samples / {num_engines} engines "
+                            f"= {samples_per_engine} samples/engine / bs={train_batch_size} "
+                            f"= {micro_per_engine} micro-batches/engine, "
+                            f"{steps_per_epoch} pass(es)")
+        else:
+            # pending_chunk was already finalized mid-training and no more chunks remain
+            iter_train_sec = time.time() - iter_train_start
+            total_overlap_interleaved_sec += iter_train_sec
+
+        # 3.4 NCCL sync when ESS/fixed_sync triggers. Bump policy_version first
+        # so the sync broadcasts the updated weights. Without this, policy_version
+        # equals rollout_policy_version within an epoch and the sync would be skipped,
+        # causing repeated ESS breaks with stale rollout weights across epochs.
+        if ess_break and train_step_count > 0 and policy_version == rollout_policy_version:
+            policy_version       += 1
+            version_bumped_early = True
+
+        if ess_break and not sync_triggered_this_epoch and not is_last_epoch and policy_version != rollout_policy_version:
             try:
                 logger.info(f"[Epoch {epoch+1}] NCCL sync at chunk boundary "
                             f"(v{rollout_policy_version} -> v{policy_version})")
-                sync_weights_nccl(training_engines=training_engines,
-                                  rollout_engines=rollout_engines,
-                                  version=policy_version,
-                                  logger=logger,
-                                  sync_timeout=sync_timeout)
+                _, finalize_refs = sync_weights_nccl(training_engines=training_engines,
+                                                     rollout_engines=rollout_engines,
+                                                     version=policy_version,
+                                                     logger=logger,
+                                                     sync_timeout=sync_timeout)
+                # Wait for finalize here since ess_break stops generation —
+                # engines must finish loading before the next epoch dispatches.
+                ray_get_with_timeout(refs=finalize_refs, timeout=sync_timeout,
+                                     description=f"finalize weight sync v{policy_version}", logger=logger)
                 rollout_policy_version = policy_version
                 sync_triggered_this_epoch = True
 
@@ -1002,7 +1286,14 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
             # this epoch and would be evicted or reset in post-training cleanup.
             pending_chunk = None
 
-        else:
+        elif lookahead is not None:
+            # Drain mode: lookahead was pre-dispatched in step 3.1b.
+            # It's already generating while we finalized + rebuilt above.
+            pending_chunk = lookahead
+
+        elif not training_done:
+            # Training mode: dispatch now. Training will overlap with this
+            # chunk's generation in the next loop iteration.
             pending_chunk = dispatch_one_chunk(dataloader_iter=dataloader_iter,
                                                rollout_engines=rollout_engines,
                                                epoch=epoch,
@@ -1010,25 +1301,26 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                                chunk_size=chunk_size,
                                                chunk_idx=chunk_idx,
                                                logger=logger)
-            chunk_idx += 1
+            if pending_chunk is not None:
+                chunk_idx += 1
+
+        else:
+            # Drain mode but dataloader exhausted: dispatch in step 3.1b
+            # already returned None, so no more chunks to generate.
+            pending_chunk = None
 
     # 4. Bulk training: finish remaining steps after all chunks are finalized.
     # This runs when generation completes faster than training (e.g., small
     # prompts, few chunks). The interleaved loop above consumed as many steps
     # as it could; this block handles the remainder up to steps_per_epoch.
     if not training_done and len(replay_buffer) >= train_batch_size:
-        if shard_refs is None or len(replay_buffer) != shard_buffer_size:
-            train_batches_padded = prepare_training_batches(replay_buffer=replay_buffer,
-                                                            batch_size=train_batch_size,
-                                                            num_engines=num_engines,
-                                                            seed=seed,
-                                                            epoch=epoch * total_chunks + shard_rebuild_count)
-
-            shard_refs = shard_and_put(train_batches_padded, num_engines=num_engines)
-            shard_buffer_size    = len(replay_buffer)
-            shard_rebuild_count += 1
-            samples_per_engine   = len(replay_buffer) // num_engines
-            micro_per_engine     = len(train_batches_padded) // num_engines
+        result = try_rebuild_shards(replay_buffer, train_batch_size, num_engines, seed,
+                                    epoch * total_chunks, shard_buffer_size, shard_rebuild_count,
+                                    force=(shard_refs is None))
+        if result:
+            shard_refs, shard_buffer_size, shard_rebuild_count, train_batches_padded = result
+            samples_per_engine = len(replay_buffer) // num_engines
+            micro_per_engine   = len(train_batches_padded) // num_engines
             logger.info(f"[Epoch {epoch+1}] Bulk training shards {'rebuilt' if shard_rebuild_count > 1 else 'prepared'}: "
                         f"{len(replay_buffer)} replay samples / {num_engines} engines "
                         f"= {samples_per_engine} samples/engine / bs={train_batch_size} "
@@ -1042,6 +1334,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                                train_step_timeout=train_step_timeout)
             for k, v in train_metrics.items():
                 epoch_metrics.setdefault(k, []).append(v)
+
             global_step += 1
             train_step_count += 1
 
@@ -1055,30 +1348,32 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                    step=global_step)
 
             # ESS check in bulk mode, as all chunks finalized, engines idle
-            ess = train_metrics.get('ess_factor', None)
-            should_break = False
+            should_break, ess = check_ess_sync(train_metrics, train_step_count,
+                                                ess_sync_threshold, fixed_sync_interval,
+                                                sync_triggered_this_epoch)
+            if should_break:
+                # Bump version before sync so broadcast uses updated version
+                if policy_version == rollout_policy_version:
+                    policy_version += 1
+                    version_bumped_early = True
 
-            if not sync_triggered_this_epoch:
-                if ess is not None and ess < ess_sync_threshold:
-                    logger.info(f"[Epoch {epoch+1}][Step {train_step_count}] "
-                                f"ESS={ess:.4f} < {ess_sync_threshold}, ending training early")
-                    should_break = True
+                try:
+                    _, finalize_refs = sync_weights_nccl(training_engines=training_engines,
+                                                         rollout_engines=rollout_engines,
+                                                         version=policy_version,
+                                                         logger=logger,
+                                                         sync_timeout=sync_timeout)
 
-                elif fixed_sync_interval and \
-                     train_step_count % fixed_sync_interval == 0:
-                    should_break = True
+                    ray_get_with_timeout(refs=finalize_refs,
+                                         timeout=sync_timeout,
+                                         description=f"finalize weight sync v{policy_version}",
+                                         logger=logger)
 
-                if should_break:
-                    try:
-                        sync_weights_nccl(training_engines=training_engines,
-                                          rollout_engines=rollout_engines,
-                                          version=policy_version,
-                                          logger=logger,
-                                          sync_timeout=sync_timeout)
-                        rollout_policy_version = policy_version
-                        sync_triggered_this_epoch = True
-                    except Exception as e:
-                        logger.warning(f"[Epoch {epoch+1}] Inline NCCL sync failed: {e}")
+                    rollout_policy_version = policy_version
+                    sync_triggered_this_epoch = True
+
+                except Exception as e:
+                    logger.warning(f"[Epoch {epoch+1}] Inline NCCL sync failed: {e}")
 
             if tracker and ess is not None:
                 tracker.log_metrics({"nccl/ess_factor": ess,
@@ -1089,10 +1384,9 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                 break
 
     # 5. Post-training bookkeeping.
-    # Only bump policy_version if at least one training step ran. Otherwise
-    # sync/eviction logic sees a version change with no actual weight update,
-    # causing unnecessary syncs or incorrect staleness estimates.
-    if train_step_count > 0:
+    # Only bump policy_version if at least one training step ran AND the version
+    # wasn't already bumped at step 3.4 (ESS-triggered mid-epoch sync).
+    if train_step_count > 0 and not version_bumped_early:
         policy_version += 1
 
     if max_lag > 0:
@@ -1108,16 +1402,16 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
     generation_time = time.time() - generation_start_time
     if chunk_stats_list:
         rollout_metrics = aggregate_chunk_stats(chunk_stats_list=chunk_stats_list,
-                                               generation_time=generation_time,
-                                               wall_time=time.time() - epoch_start_time)
+                                                generation_time=generation_time,
+                                                wall_time=time.time() - epoch_start_time)
     else:
         logger.warning(f"[Epoch {epoch+1}] No chunks were finalized — dataloader may be empty")
         rollout_metrics = rollout_stats.summarize(rollout_stats.new_accumulator(), rollout_time=generation_time)
         rollout_metrics["rollout_time_with_overlap"] = time.time() - epoch_start_time
 
     # 7. Overlap efficiency metrics
-    interleaved_total = total_overlap_train_sec + total_overlap_gen_wait_sec
-    overlap_ratio = total_overlap_train_sec / interleaved_total if interleaved_total > 0 else 0.0
+    interleaved_total = total_overlap_interleaved_sec + total_overlap_gen_wait_sec
+    overlap_ratio = total_overlap_interleaved_sec / interleaved_total if interleaved_total > 0 else 0.0
 
     return {'rollout_metrics': rollout_metrics,
             'epoch_metrics': epoch_metrics,
@@ -1128,7 +1422,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
             'train_time': time.time() - train_start_time,
             'sync_performed': sync_triggered_this_epoch,
             'data_policy_version': data_policy_version,
-            'overlap_train_sec': total_overlap_train_sec,
+            'overlap_interleaved_sec': total_overlap_interleaved_sec,
             'overlap_gen_wait_sec': total_overlap_gen_wait_sec,
             'overlap_ratio': overlap_ratio}
 
@@ -1246,13 +1540,15 @@ if __name__ == "__main__":
 
     if weight_sync_method == "nccl":
         nccl_port = config.run.nccl_sync_port if config.run.nccl_sync_port else config.run.ray_master_port + 100
+        nccl_sync_backend = config.run.nccl_sync_backend
         nccl_world_size, nccl_gname = init_nccl_weight_sync(training_engines=training_engines,
                                                             rollout_engines=rollout_engines,
                                                             master_addr=master_addr,
                                                             nccl_port=nccl_port,
                                                             tp_size=int(config.rollout.tensor_parallel_size),
                                                             logger=logger,
-                                                            init_timeout=config.run.init_timeout)
+                                                            init_timeout=config.run.init_timeout,
+                                                            backend=nccl_sync_backend)
         logger.info(f"Weight sync: NCCL (port={nccl_port}, world_size={nccl_world_size}) with NCCL group name {nccl_gname}")
 
     else:
@@ -1367,6 +1663,7 @@ if __name__ == "__main__":
     # 11. Training and rollout loop
     ########
     entire_training_start_time = time.time()
+    pre_dispatched_chunk = None  # early dispatch from previous epoch's checkpoint save
 
     for epoch in range(start_epoch, number_of_epochs):
         epoch_start_time = time.time()
@@ -1394,7 +1691,9 @@ if __name__ == "__main__":
                                        train_step_timeout=train_step_timeout,
                                        sync_timeout=sync_timeout,
                                        tracker=tracker,
-                                       logger=logger)
+                                       logger=logger,
+                                       pre_dispatched_chunk=pre_dispatched_chunk)
+            pre_dispatched_chunk = None  # consumed
 
         else:
             result = run_epoch_sync(epoch=epoch,
@@ -1467,19 +1766,21 @@ if __name__ == "__main__":
 
         # Log overlap efficiency metrics
         if overlap_enabled:
-            o_train = result['overlap_train_sec']
+            o_interleaved = result['overlap_interleaved_sec']
             o_wait = result['overlap_gen_wait_sec']
             o_ratio = result['overlap_ratio']
-            logger.info(f"[Epoch {epoch+1}] Overlap: interleaved_train={o_train:.2f}s, "
+            logger.info(f"[Epoch {epoch+1}] Overlap: interleaved={o_interleaved:.2f}s, "
                         f"gen_wait={o_wait:.2f}s, ratio={o_ratio:.2%}")
             if tracker:
-                tracker.log_metrics({"overlap/interleaved_train_sec": o_train,
+                tracker.log_metrics({"overlap/interleaved_sec": o_interleaved,
                                      "overlap/gen_wait_sec": o_wait,
                                      "overlap/ratio": o_ratio,
                                     }, step=global_step)
 
         # End-of-epoch weight sync
         sync_success = result['sync_performed']
+        nccl_finalize_refs = None
+        pre_dispatched_chunk = None  # may be set by NCCL async path below
 
         if not sync_success and not is_last_epoch:
             if weight_sync_method == "nccl":
@@ -1489,15 +1790,42 @@ if __name__ == "__main__":
                     logger.info(f"[Epoch {epoch+1}] End-of-epoch NCCL sync "
                                 f"(v{rollout_policy_version} -> v{policy_version})...")
                     try:
-                        sync_weights_nccl(training_engines=training_engines,
-                                          rollout_engines=rollout_engines,
-                                          version=policy_version,
-                                          logger=logger,
-                                          sync_timeout=sync_timeout)
+                        # Fire async sync runs in background thread so we can
+                        # dispatch generation with OLD weights concurrently.
+                        sync_future = sync_weights_nccl_async(training_engines=training_engines,
+                                                              rollout_engines=rollout_engines,
+                                                              version=policy_version,
+                                                              logger=logger,
+                                                              sync_timeout=sync_timeout)
+
+                        # Dispatch next epoch's first chunk with OLD weights while sync runs.
+                        # The generate.remote() queues in each engine's Ray mailbox. If sync's
+                        # receive_all_weights_nccl.remote() arrives first, generate waits (gets new weights).
+                        # If generate arrives first, sync waits (generate uses old weights).
+                        # Either way, no corruption — just version staleness on the overlapped chunk.
+                        # Skip when max_lag=0 (strict on-policy): the next epoch resets the buffer
+                        # and any stale chunk would poison the clean buffer with off-policy data.
+                        if overlap_enabled and not is_last_epoch and overlap_max_lag > 0:
+                            rollout_dataloader.batch_sampler.set_epoch(epoch + 1)
+                            early_iter = iter(rollout_dataloader)
+                            pre_dispatched_chunk = dispatch_one_chunk(dataloader_iter=early_iter,
+                                                                      rollout_engines=rollout_engines,
+                                                                      epoch=epoch + 1,
+                                                                      policy_version=rollout_policy_version,
+                                                                      chunk_size=chunk_size,
+                                                                      chunk_idx=0,
+                                                                      logger=logger)
+                            if pre_dispatched_chunk is not None:
+                                logger.info(f"[Epoch {epoch+1}] Early dispatch: next epoch's first chunk "
+                                            f"generating concurrently with weight sync")
+
+                        # Now wait for sync to complete.
+                        _, nccl_finalize_refs = sync_future.result(timeout=sync_timeout)
                         rollout_policy_version = policy_version
                         sync_success = True
 
                     except Exception as e:
+                        nccl_finalize_refs = None
                         logger.warning(f"[Epoch {epoch+1}] NCCL sync failed: {e}, falling back to direct")
                         try:
                             sync_success = sync_weights_direct(training_engines=training_engines,
@@ -1530,6 +1858,28 @@ if __name__ == "__main__":
                 if sync_success:
                     rollout_policy_version = policy_version
                     logger.info(f"[Epoch {epoch+1}] Direct sync successful")
+
+        # Wait for NCCL finalize if it was dispatched non-blocking above.
+        if sync_success and weight_sync_method == "nccl" and nccl_finalize_refs is not None:
+            ray_get_with_timeout(refs=nccl_finalize_refs,
+                                 timeout=sync_timeout,
+                                 description=f"finalize weight sync v{policy_version}",
+                                 logger=logger)
+            nccl_finalize_refs = None
+
+        # Early dispatch for non-NCCL sync methods (NCCL path dispatches above, concurrently with sync).
+        if pre_dispatched_chunk is None and overlap_enabled and not is_last_epoch and sync_success:
+            rollout_dataloader.batch_sampler.set_epoch(epoch + 1)
+            early_iter = iter(rollout_dataloader)
+            pre_dispatched_chunk = dispatch_one_chunk(dataloader_iter=early_iter,
+                                                      rollout_engines=rollout_engines,
+                                                      epoch=epoch + 1,
+                                                      policy_version=rollout_policy_version,
+                                                      chunk_size=chunk_size,
+                                                      chunk_idx=0,
+                                                      logger=logger)
+            if pre_dispatched_chunk is not None:
+                logger.info(f"[Epoch {epoch+1}] Early dispatch: next epoch's first chunk generating during checkpoint save")
 
         # Save checkpoint
         should_save_disk = (checkpoint_save_interval > 0 and
