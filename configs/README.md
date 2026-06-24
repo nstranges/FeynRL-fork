@@ -36,6 +36,7 @@ All `main_*.py` entry points accept the following arguments:
 | `method` | Set automatically by entry point | `"rl"` \| `"sl"` \| `"cl"` \| `"eval"` | `"rl"` |
 | `checkpoint_dir` | Directory for saving checkpoints | Path string | `"./ckps"`, `"/data/ckps"` |
 | `checkpoint_save_interval` | Save checkpoint every N epochs; 0 = end only (default: `1`) | Integer ≥ 0 | `1`, `5`, `0` |
+| `enable_saving_resume_state` | Whether each checkpoint also writes the DeepSpeed optimizer/scheduler/RNG state (`ds_engine/`) needed to resume training. `true` (default) → checkpoints are resumable. `false` → skip `ds_engine/` to save significant disk space; HF weights are still saved (usable for eval/inference/weight-sync), but the checkpoints are **NOT resumable** and `--resume_from` on them raises an error. Applies to `main_rl`, `main_sl`, `main_cl`. | Boolean | `true`, `false` |
 
 #### NCCL / Multi-Node
 
