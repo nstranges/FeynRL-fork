@@ -599,7 +599,7 @@ if __name__ == "__main__":
                                      label="cl",
                                      zero_stage=config.deepspeed.zero_optimization.get("stage", 0),
                                      model_dtype=config.model.dtype,
-                                     save_optimizer_state=config.run.save_optimizer_state,
+                                     enable_saving_resume_state=config.run.enable_saving_resume_state,
                                      ref_model_name=config.model.ref_model or config.model.name,
                                      processor=processor)
 

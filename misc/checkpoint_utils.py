@@ -200,13 +200,11 @@ def resume_from_checkpoint(resume_path, model_engine, world_size, logger, zero_s
     with open(state_path) as f:
         training_state = json.load(f)
 
-    if not training_state.get('save_optimizer_state', True):
-        raise RuntimeError(
-            f"Checkpoint at {resume_path} was saved with save_optimizer_state=False. "
-            f"The DeepSpeed optimizer/scheduler/RNG state was not written, so this "
-            f"checkpoint cannot be resumed. To resume training, use a checkpoint saved "
-            f"with save_optimizer_state=True (the default)."
-        )
+    if not training_state.get('enable_saving_resume_state', True):
+        raise RuntimeError(f"Checkpoint at {resume_path} was saved with enable_saving_resume_state=False. "
+                           f"The DeepSpeed optimizer/scheduler/RNG state was not written, so this checkpoint "
+                           f"cannot be resumed. To resume training, use a checkpoint saved "
+                           f"with enable_saving_resume_state=True (the default).")
 
     saved_epoch = training_state['epoch']
     global_step = training_state['global_step']
@@ -288,7 +286,7 @@ def resume_from_checkpoint(resume_path, model_engine, world_size, logger, zero_s
     return start_epoch, global_step
 
 
-def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_path, peft_config, rank, world_size, logger, label, zero_stage=None, model_dtype=None, ref_model_name=None, save_optimizer_state=True, processor=None):
+def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_path, peft_config, rank, world_size, logger, label, zero_stage=None, model_dtype=None, ref_model_name=None, enable_saving_resume_state=True, processor=None):
     '''
         Save a full training checkpoint: HF-compatible weights, model config,
         generation config, tokenizer/processor, DeepSpeed engine state (optimizer/scheduler/RNG),
@@ -375,7 +373,7 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
     barrier_with_error_check(succeeded=save_ok, device=model_engine.device, label=f"{label}_save_config")
 
     # 3. Save DeepSpeed engine state (optimizer, scheduler, RNG) for resume
-    if save_optimizer_state:
+    if enable_saving_resume_state:
         engine_state_dir = os.path.join(model_path, "ds_engine")
         if rank == 0:
             os.makedirs(engine_state_dir, exist_ok=True)
@@ -391,7 +389,7 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
 
         model_engine.save_checkpoint(engine_state_dir, tag="policy", client_state=client_state)
     else:
-        logger.info(f"[Epoch {epoch+1}] Skipping DeepSpeed engine state save (save_optimizer_state=False)")
+        logger.info(f"[Epoch {epoch+1}] Skipping DeepSpeed engine state save (enable_saving_resume_state=False)")
 
     # 4. Training metadata and completion marker on rank 0
     if rank == 0:
@@ -403,7 +401,7 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
                           'use_peft': peft_config.use_peft,
                           'peft_type': getattr(peft_config, 'peft_type', None) if peft_config.use_peft else None,
                           'ref_model_name': ref_model_name,
-                          'save_optimizer_state': save_optimizer_state}
+                          'enable_saving_resume_state': enable_saving_resume_state}
 
         state_file = os.path.join(model_path, "training_state.json")
         with open(state_file, "w") as f:
