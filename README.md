@@ -23,36 +23,24 @@
 
 The main goal of FeynRL is simple: make new algorithms easy to implement, easy to debug, and still possible to train at scale. The codebase is designed so that **algorithmic logic stays local** and **systems logic stays explicit**, which makes the framework easier to reason about, easier to extend, and more reliable to debug.
 
-### 💡 Why use FeynRL?
+### 💡 Why FeynRL?
 
-FeynRL is a good fit if your goal is not only to run an existing recipe, but to **build and test new post-training methods**.
+Most post-training frameworks optimize for the largest built-in feature surface, which makes them powerful but hard to modify once you want to try something new. FeynRL makes the opposite trade-off: it optimizes for **clarity, locality of change, and algorithm development**. Adding a new method usually means writing a single file with its own loss and update logic, not threading changes through the orchestration, rollout, and data layers.
 
-- **Algorithm-first design** — Most method changes stay local: you can add new objectives, rewards, baselines, or update rules without reshaping the full stack.
+- **Algorithm-first** — New objectives, rewards, baselines, or update rules stay local. Algorithm code stays algorithmic; systems code stays explicit.
+- **One framework across post-training** — SFT, DPO, and RL share the same workflow and config for both LLMs and VLMs, so comparisons are easy and infrastructure isn't duplicated.
+- **Scales from the start** — The same code runs single-GPU debugging or large multi-node jobs, backed by DeepSpeed, Ray, and vLLM with sync/async execution and adaptive weight sync.
 
-- **Clear separation of concerns** — Algorithm code stays algorithmic, and systems code stays systems. That keeps the codebase easier to understand, test, and extend.
+FeynRL is built for anyone who wants to **deeply understand training of large models, become an expert, and build new methods and ideas**. It's written to be read and learned from, so you can trace exactly how rollouts, losses, and weight syncs fit together, experiment with your own methods, and grow from running recipes to designing them. You can still use it as a ready-made recipe out of the box; the difference is that nothing stays a black box when you're ready to look inside.
 
-- **One framework across post-training** — SFT, DPO, and RL share the same workflow and configuration system for both LLMs and VLMs, making comparisons easier and reducing duplicated infrastructure.
-
-- **Scales beyond toy settings** — Use the same framework for local single-GPU debugging or large multi-node distributed runs.
-
-FeynRL may not be the best fit if your main priority is the largest built-in feature surface out of the box, or if you mainly want a framework already optimized around a narrow workflow and do not expect to modify it much.
-
-### 🎯 Why We Built This
-
-There are already several strong open-source frameworks for post-training large models. Many are powerful and feature-rich, but they are often optimized around a narrower set of methods or execution patterns, and can become hard to modify once you want to try something new.
-
-FeynRL was built to make a different trade-off. Instead of optimizing first for the largest feature surface, it optimizes first for **clarity, locality of change, and algorithm development**. The codebase is structured so that algorithmic ideas are easy to implement and reason about, while the distributed systems layer remains explicit rather than hidden behind heavy abstractions. In practice, implementing a new algorithm typically means writing a single file with its own loss and update logic, not threading changes through the orchestration, rollout, and data layers.
-
-The framework is designed for scale from the start. It supports large-scale training with DeepSpeed, Ray, and vLLM, including sync and async execution modes, adaptive weight synchronization, and multi-node runs. The goal is to make it possible to do both: **move fast on algorithms and still run realistic experiments at scale**.
-
-This is the first public release, so expect rough edges. We are open-sourcing FeynRL not just as a library, but as a foundation for building new post-training methods with the community.
+This is the first public release, so expect rough edges. We're open-sourcing it as a foundation for post-training research with the community.
 
 ## ✅ What's Included
 
 For a detailed breakdown of the architecture, see the **[Architecture Overview](docs/ARCHITECTURE.md)**.
 
 - 🧪 **Training paradigms**: RL (PPO, GRPO, CISPO, P3O), preference-based learning (DPO), and supervised fine-tuning (SFT)
-- 🧠🖼️ **LLMs and VLMs**: train text-only language models or vision-language (image+text) models with the same recipes.
+- 🧠 **LLMs and VLMs**: train text-only language models or vision-language (image+text) models with the same recipes.
 - 🖥️ **Distributed training**: Multi-GPU and multi-node via DeepSpeed (ZeRO Stage 1/2/3)
 - 🎲 **Rollouts / inference**: vLLM-powered rollout engines with tensor parallelism
 - 🛰️ **Orchestration**: Ray for scheduling training and rollout workers across nodes
