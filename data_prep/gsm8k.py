@@ -103,5 +103,3 @@ if __name__ == "__main__":
     print(f"Train file: {train_file_name} with {len(train_dataset)} examples.")
     print(f"Val file: {val_file_name} with {len(val_dataset)} examples.")
     print(f"Test file: {test_file_name} with {len(test_dataset)} examples.")
-    print("Done.")
-    

@@ -32,6 +32,12 @@ class Run(BaseModel):
     # Save a disk checkpoint every N epochs for persistence/resumability.
     # 0 = only at end.
     checkpoint_save_interval: int | None = 1
+    # When True (default), each checkpoint also writes DeepSpeed optimizer/scheduler/RNG
+    # state to ds_engine/, which is required to resume training from that checkpoint.
+    # Set to False to skip ds_engine/ and reduce disk usage when resumability is not needed
+    # (e.g. eval-only jobs, final checkpoints). Checkpoints saved with save_optimizer_state=False
+    # are NOT resumable — attempting to resume from them will raise an error.
+    save_optimizer_state: bool = True
 
     # NCCL configuration for network transport.
     # Leave nccl_socket_ifname and nccl_ib_hca null for single-node or when NCCL auto-detection works.

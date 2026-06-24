@@ -551,6 +551,7 @@ if __name__ == "__main__":
                                      label="sl",
                                      zero_stage=config.deepspeed.zero_optimization.get("stage", 0),
                                      model_dtype=config.model.dtype,
+                                     save_optimizer_state=config.run.save_optimizer_state,
                                      processor=processor)
 
     total_training_time = time.time() - training_start_time
