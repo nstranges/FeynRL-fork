@@ -17,9 +17,9 @@ run:
   # Save a disk checkpoint every N epochs for persistence/resumability.
   # 0 = only at end. Only applies when weight_sync_method="direct".
   checkpoint_save_interval: 1
-  # Set to false to skip saving ds_engine/ (optimizer/scheduler/RNG state) at each checkpoint.
+  # Set to false to skip saving states for resume like optimizer/scheduler/RNG state at each checkpoint.
   # Saves significant disk space but makes checkpoints NOT resumable. Default: true.
-  save_optimizer_state: true
+  enable_saving_resume_state: true
 
   # NCCL fabric config. Leave null for auto-detect (works for single-node and
   # most multi-node setups). Only set if fabric init fails. See docs/TROUBLESHOOTING.md.
