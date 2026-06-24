@@ -23,7 +23,7 @@
 
 The main goal of FeynRL is simple: make new algorithms easy to implement, easy to debug, and still possible to train at scale. The codebase is designed so that **algorithmic logic stays local** and **systems logic stays explicit**, which makes the framework easier to reason about, easier to extend, and more reliable to debug.
 
-### 💡 Why FeynRL?
+### 🎯 Why FeynRL?
 
 Most post-training frameworks optimize for the largest built-in feature surface, which makes them powerful but hard to modify once you want to try something new. FeynRL makes the opposite trade-off: it optimizes for **clarity, locality of change, and algorithm development**. Adding a new method usually means writing a single file with its own loss and update logic, not threading changes through the orchestration, rollout, and data layers.
 
