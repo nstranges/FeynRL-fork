@@ -76,6 +76,13 @@ def load_checkpoint_for_resume(resume_path,
     with open(state_path) as f:
         training_state = json.load(f)
 
+    # Reject checkpoints saved without resume state (no ds_engine/ written).
+    if not training_state.get('enable_saving_resume_state', True):
+        raise RuntimeError(f"Checkpoint at {resume_path} was saved with enable_saving_resume_state=False. "
+                           f"The DeepSpeed optimizer/scheduler/RNG state was not written, so this "
+                           f"checkpoint cannot be resumed. To resume training, use a checkpoint saved "
+                           f"with enable_saving_resume_state=True (the default).")
+
     epoch = training_state['epoch']
     policy_version = training_state['policy_version']
     global_step = training_state['global_step']
@@ -141,7 +148,7 @@ def save_checkpoint(epoch,
                     rank,
                     logger,
                     save_timeout,
-                    save_optimizer_state=True,
+                    enable_saving_resume_state=True,
                     processor=None):
     '''
        Save model checkpoint. This must run on all ranks for ZeRO-3.
@@ -150,11 +157,7 @@ def save_checkpoint(epoch,
        CHECKPOINT_COMPLETE marker for crash-safe.
 
        Args:
-           save_optimizer_state: When False, skip saving the DeepSpeed engine state
-                           (optimizer/scheduler/RNG). The optimizer state is
-                           typically several times larger than the raw weights,
-                           so this saves significant disk space per checkpoint.
-                           Set to False when training resume is not needed.
+           enable_saving_resume_state: When False, skip saving the DeepSpeed engine state (optimizer/scheduler/RNG).
     '''
     # Note if multi-node cluster is used, checkpoint_dir must be on a shared
     # filesystem such as NFS, Lustre, etc. or each node writes to isolated local disk
@@ -187,7 +190,7 @@ def save_checkpoint(epoch,
     # 2. save DeepSpeed engine state so we can resume training later.
     # Directory creation happens inside save_engine_state on DS rank 0.
     engine_state_dir = os.path.join(model_path, "ds_engine")
-    state_futures = [engine.save_engine_state.remote(engine_state_dir, save_optimizer_state) for engine in training_engines]
+    state_futures = [engine.save_engine_state.remote(engine_state_dir, enable_saving_resume_state) for engine in training_engines]
     ray_get_with_timeout(refs=state_futures,
                          timeout=save_timeout,
                          description=f"engine state save (epoch {epoch+1})",
@@ -212,7 +215,7 @@ def save_checkpoint(epoch,
                           'policy_version': version,
                           'global_step': global_step,
                           'training_gpus': len(training_engines),
-                          'save_optimizer_state': save_optimizer_state,
+                          'enable_saving_resume_state': enable_saving_resume_state,
                          }
         state_file = os.path.join(model_path, "training_state.json")
         with open(state_file, "w") as f:
