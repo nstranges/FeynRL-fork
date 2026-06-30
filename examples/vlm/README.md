@@ -11,6 +11,7 @@ vlm/
 │   │   └── qwen2.5-vl-3b-instruct/        # SFT on MM-Math with Qwen2.5-VL-3B-Instruct
 │   └── snake/
 │       ├── snake.py                        # Snake environment and BFS oracle
+│       ├── prepare_data.py                 # Oracle-imitation dataset generator
 │       └── smolvlm2-500m-video-instruct/  # Snake game SFT with SmolVLM2-500M-Video-Instruct
 ├── rl/
 │   └── mm_math/
@@ -156,23 +157,6 @@ Replace `model.name` with your checkpoint path and `data.test_files_path` with y
 
 ---
 
-## Snake Game — SmolVLM2-500M-Video-Instruct
+## Snake Game
 
-A 500 M VLM trained to play classic Snake by imitating a BFS oracle — each step is a supervised prediction of the next move from a single rendered frame.
-
-| Item              | Value                                                                                                                     |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Model             | `HuggingFaceTB/SmolVLM2-500M-Video-Instruct`                                                                             |
-| Task              | Snake (10×10 grid, predict UP/DOWN/LEFT/RIGHT from a single frame)                                                        |
-| Algorithm         | SFT                                                                                                                       |
-| Hardware          | 8×A100 40 GB GPUs                                                                                                         |
-| Experiment README | [`sft/snake/smolvlm2-500m-video-instruct/README.md`](sft/snake/smolvlm2-500m-video-instruct/README.md)                   |
-| Training config   | [`sft/snake/smolvlm2-500m-video-instruct/train.yaml`](sft/snake/smolvlm2-500m-video-instruct/train.yaml)                 |
-
-| Avg Score | Avg Steps |
-| --------: | --------: |
-|      31.8 |     296.6 |
-
-<video src="sft/snake/smolvlm2-500m-video-instruct/results/snake_game_003.mp4" autoplay loop muted playsinline width="480"></video>
-
-See the [experiment README](sft/snake/smolvlm2-500m-video-instruct/README.md) for the full quickstart, data prep script, interactive UI, and all rollout videos.
+A VLM trained to play classic Snake from pixel observations via supervised imitation of a BFS oracle. See [`sft/snake/README.md`](sft/snake/README.md) for the full experiment overview, environment description, and results.

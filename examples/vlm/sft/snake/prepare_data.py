@@ -10,7 +10,7 @@ The oracle uses BFS to find the shortest path to food, falling back to a
 flood-fill survival heuristic when no direct path exists.
 
 Run:
-    python examples/vlm/sft/snake/smolvlm2-500m-video-instruct/prepare_data.py \
+    python examples/vlm/sft/snake/prepare_data.py \
         --output_dir ./data/snake_sft \
         --num_train_episodes 4000 \
         --num_val_episodes 400
@@ -26,7 +26,7 @@ import sys
 import pandas as pd
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, ".."))               # examples/vlm/sft/snake/ — for snake.py
+sys.path.insert(0, _HERE)                                        # same dir — for snake.py
 sys.path.insert(0, os.path.join(_HERE, "..", "..", "..", ".."))  # repo root
 
 from snake import SnakeEnv, PROMPT, GRID_INNER
