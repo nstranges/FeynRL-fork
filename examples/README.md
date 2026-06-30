@@ -4,23 +4,24 @@ A curated set of FeynRL experiments organized by model type, algorithm, and data
 
 ## Directory Structure
 
-```
+```text
 examples/
-  llm/        ← Text-only language models
-    rl/
-      gsm8k/
-        qwen2.5-1.5b-instruct/
-        qwen3-4b-thinking-2507/
-  vlm/        ← Visual language models (image + text)
-    games/                         ← shared game environments
-    sft/
-      mm_math/
-        qwen2.5-vl-3b-instruct/
-      snake/
-        smolvlm2-500m-video-instruct/
-    rl/
-      mm_math/
-        qwen2.5-vl-3b-instruct/
+├── llm/                                              # Text-only language models
+│   └── rl/
+│       └── gsm8k/
+│           ├── qwen2.5-1.5b-instruct/               # GRPO on GSM8K
+│           └── qwen3-4b-thinking-2507/              # GRPO on DeepScaler
+├── vlm/                                             # Visual language models (image + text)
+│   ├── sft/
+│   │   ├── mm_math/
+│   │   │   └── qwen2.5-vl-3b-instruct/             # SFT on MM-Math
+│   │   └── snake/
+│   │       ├── snake.py                             # Snake environment and BFS oracle
+│   │       └── smolvlm2-500m-video-instruct/        # Snake game SFT
+│   └── rl/
+│       └── mm_math/
+│           └── qwen2.5-vl-3b-instruct/             # GRPO on MM-Math
+└── README.md
 ```
 
 ---
