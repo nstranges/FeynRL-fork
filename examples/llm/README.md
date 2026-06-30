@@ -4,12 +4,13 @@ Text-only language model experiments using FeynRL's RL (GRPO) pipeline on mathem
 
 ## Directory Layout
 
-```
+```text
 llm/
-  rl/
-    gsm8k/
-      qwen2.5-1.5b-instruct/      ← GRPO on GSM8K with Qwen2.5-1.5B-Instruct
-      qwen3-4b-thinking-2507/     ← GRPO on DeepScaler with Qwen3-4B-Thinking-2507
+├── rl/
+│   └── gsm8k/
+│       ├── qwen2.5-1.5b-instruct/      # GRPO on GSM8K with Qwen2.5-1.5B-Instruct
+│       └── qwen3-4b-thinking-2507/     # GRPO on DeepScaler with Qwen3-4B-Thinking-2507
+└── README.md
 ```
 
 ---

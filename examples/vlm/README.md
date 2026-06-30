@@ -4,18 +4,18 @@ Visual Language Model (VLM) experiments fine-tune multimodal models on image+tex
 
 ## Directory Layout
 
-```
+```text
 vlm/
-  games/                          ← shared game environments
-    snake.py
-  sft/
-    mm_math/
-      qwen2.5-vl-3b-instruct/    ← SFT on MM-Math with Qwen2.5-VL-3B-Instruct
-    snake/
-      smolvlm2-500m-video-instruct/  ← Snake game SFT with SmolVLM2-500M
-  rl/
-    mm_math/
-      qwen2.5-vl-3b-instruct/    ← GRPO on MM-Math with Qwen2.5-VL-3B-Instruct
+├── sft/
+│   ├── mm_math/
+│   │   └── qwen2.5-vl-3b-instruct/        # SFT on MM-Math with Qwen2.5-VL-3B-Instruct
+│   └── snake/
+│       ├── snake.py                        # Snake environment and BFS oracle
+│       └── smolvlm2-500m-video-instruct/  # Snake game SFT with SmolVLM2-500M-Video-Instruct
+├── rl/
+│   └── mm_math/
+│       └── qwen2.5-vl-3b-instruct/        # GRPO on MM-Math with Qwen2.5-VL-3B-Instruct
+└── README.md
 ```
 
 ---

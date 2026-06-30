@@ -27,9 +27,9 @@ import random
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, "..", "..", ".."))  # examples/vlm/ — for games/
+sys.path.insert(0, os.path.join(_HERE, ".."))              # examples/vlm/sft/snake/ — for snake.py
 
-from games.snake import SnakeEnv, GRID_INNER
+from snake import SnakeEnv, GRID_INNER
 
 try:
     from flask import Flask, jsonify

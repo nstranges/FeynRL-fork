@@ -11,7 +11,7 @@ flood-fill survival heuristic when no direct path exists.
 
 Run:
     python examples/vlm/sft/snake/smolvlm2-500m-video-instruct/prepare_data.py \
-        --output_dir ./data/vla-games/snake_sft \
+        --output_dir ./data/snake_sft \
         --num_train_episodes 4000 \
         --num_val_episodes 400
 """
@@ -26,10 +26,10 @@ import sys
 import pandas as pd
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, "..", "..", ".."))   # examples/vlm/ — for games/
-sys.path.insert(0, os.path.join(_HERE, "..", "..", "..", "..", ".."))  # repo root
+sys.path.insert(0, os.path.join(_HERE, ".."))               # examples/vlm/sft/snake/ — for snake.py
+sys.path.insert(0, os.path.join(_HERE, "..", "..", "..", ".."))  # repo root
 
-from games.snake import SnakeEnv, PROMPT, GRID_INNER
+from snake import SnakeEnv, PROMPT, GRID_INNER
 
 
 def parse_args() -> argparse.Namespace:

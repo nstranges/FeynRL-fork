@@ -50,8 +50,8 @@ peft:
 data:
   train_ratios: {"train": 1.0}
   # Update these paths after running prepare_snake_sft.py.
-  train_files_path: ["./data/vla-games/snake_sft/train.parquet"]
-  val_files_path:   ["./data/vla-games/snake_sft/val.parquet"]
+  train_files_path: ["./data/snake_sft/train.parquet"]
+  val_files_path:   ["./data/snake_sft/val.parquet"]
   num_workers: 4
   max_seq_len: 2048
   prompt_key: "prompt"

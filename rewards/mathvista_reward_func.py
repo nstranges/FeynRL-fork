@@ -5,13 +5,17 @@ from typing import Any, Dict
 
 
 def _extract_option_letter(text: str) -> str | None:
-    """Return the last isolated A/B/C/D letter in the response."""
+    """
+    Return the last isolated A/B/C/D letter in the response.
+    """
     hits = re.findall(r'(?<![A-Za-z])([A-D])(?![A-Za-z])', text)
     return hits[-1].upper() if hits else None
 
 
 def _extract_last_number(text: str) -> float | None:
-    """Return the last integer or decimal number appearing in the response."""
+    """
+        Return the last integer or decimal number appearing in the response.
+    """
     hits = re.findall(r'-?\d+(?:\.\d+)?', text)
     if not hits:
         return None

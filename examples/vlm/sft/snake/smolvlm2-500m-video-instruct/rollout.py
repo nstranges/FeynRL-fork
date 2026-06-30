@@ -33,10 +33,10 @@ from peft import PeftModel
 from transformers import AutoProcessor
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, "..", "..", ".."))   # examples/vlm/ — for games/
-sys.path.insert(0, os.path.join(_HERE, "..", "..", "..", "..", ".."))  # repo root
+sys.path.insert(0, os.path.join(_HERE, ".."))               # examples/vlm/sft/snake/ — for snake.py
+sys.path.insert(0, os.path.join(_HERE, "..", "..", "..", ".."))  # repo root
 
-from games.snake import SnakeEnv, PROMPT, ACTIONS
+from snake import SnakeEnv, PROMPT, ACTIONS
 from misc.model_loading import build_hf_model
 
 
