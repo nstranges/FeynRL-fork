@@ -1,0 +1,41 @@
+{
+  "results": [
+    {
+      "game": 0,
+      "score": 38,
+      "steps": 395,
+      "snake_length": 41,
+      "saved": "./checkpoints/rollouts/snake_sft_smol/snake/snake_game_000.mp4"
+    },
+    {
+      "game": 1,
+      "score": 30,
+      "steps": 232,
+      "snake_length": 33,
+      "saved": "./checkpoints/rollouts/snake_sft_smol/snake/snake_game_001.mp4"
+    },
+    {
+      "game": 2,
+      "score": 18,
+      "steps": 169,
+      "snake_length": 21,
+      "saved": "./checkpoints/rollouts/snake_sft_smol/snake/snake_game_002.mp4"
+    },
+    {
+      "game": 3,
+      "score": 40,
+      "steps": 393,
+      "snake_length": 43,
+      "saved": "./checkpoints/rollouts/snake_sft_smol/snake/snake_game_003.mp4"
+    },
+    {
+      "game": 4,
+      "score": 33,
+      "steps": 294,
+      "snake_length": 36,
+      "saved": "./checkpoints/rollouts/snake_sft_smol/snake/snake_game_004.mp4"
+    }
+  ],
+  "avg_score": 31.8,
+  "avg_steps": 296.6
+}

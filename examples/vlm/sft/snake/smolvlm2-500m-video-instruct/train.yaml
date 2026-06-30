@@ -1,0 +1,81 @@
+run:
+  project_name: "feynrl-vlm"
+  logger_type: "mlflow"
+  tracking_uri: ""
+  checkpoint_dir: "./ckps/snake-sft/smolvlm2-500m"
+  seed: 42
+  checkpoint_save_interval: 1
+  nccl_socket_ifname: null
+  nccl_ib_hca: null
+
+train:
+  alg_name: "sft"
+  optimizer_name: "adamw"
+  lr: 1.0e-5
+  adam_epsilon: 1.0e-8
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  warmup_steps_ratio: 0.05
+  clip_grad_norm: 1.0
+  lr_scheduler: "WarmupCosineLR"
+  total_number_of_epochs: 50
+  # Full dataset: 879 301 rows → 54 956 micro-batches at (2×8).
+  # Split into 10 equal slices so each epoch is ~1/10 of the data and checkpoints
+  # are saved 10× more frequently. Total training is identical (50 × 5 496 = 54 960 ≈ 54 956).
+  # 8×A100 40 GB: 54 956 / 10 = 5 496  [effective batch = 2×8×2 = 32]
+  micro_batches_per_epoch: 5496
+  dynamic_ratio_every_step: false
+  train_batch_size_per_gpu: 2
+  gradient_accumulation_steps: 2
+  val_batch_size_per_gpu: 4
+  normalize_loss: true
+
+model:
+  name: "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+  dtype: "bfloat16"
+  trust_remote_code: false
+  model_class: "vlm"
+  gradient_checkpointing: true
+  attn_implementation: "flash_attention_2"
+
+peft:
+  use_peft: true
+  peft_type: "lora"
+  task_type: "CAUSAL_LM"
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+data:
+  train_ratios: {"train": 1.0}
+  # Update these paths after running prepare_snake_sft.py.
+  train_files_path: ["./data/vla-games/snake_sft/train.parquet"]
+  val_files_path:   ["./data/vla-games/snake_sft/val.parquet"]
+  num_workers: 4
+  max_seq_len: 2048
+  prompt_key: "prompt"
+  answer_key: "answer"
+  image_key: "image_bytes"
+  max_image_pixels: 401408
+
+deepspeed:
+  zero_optimization:
+    stage: 2
+    contiguous_gradients: true
+    overlap_comm: true
+    reduce_scatter: true
+    reduce_bucket_size: "auto"
+    allgather_bucket_size: "auto"
+  prescale_gradients: false
+  data_types:
+    grad_accum_dtype: "fp32"
+  steps_per_print: 50
+  wall_clock_breakdown: false
+  flops_profiler:
+    enabled: false
+    profile_step: 10
+    module_depth: -1
+    top_modules: 1
+    detailed: true
+    output_file: null

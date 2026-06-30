@@ -104,9 +104,9 @@ peft:
   lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 data:
-  train_ratios: {"deepscaler_preview_processed_123245_wsp_train": 1.0}
-  train_files_path: ["./data/deepscaler/deepscaler_preview_processed_123245_wsp_train.parquet"]
-  val_files_path: ["./data/deepscaler/deepscaler_preview_processed_123245_wsp_val.parquet"]
+  train_ratios: {"deepscaler_train": 1.0}
+  train_files_path: ["./data/deepscaler/deepscaler_train.parquet"]
+  val_files_path: ["./data/deepscaler/deepscaler_val.parquet"]
   num_workers: 4
   max_seq_len: 4096
   prompt_key: "prompt"
