@@ -70,12 +70,12 @@ A 500 M VLM learns to play Snake from pixel observations via supervised imitatio
 | SFT    |      31.8 |     296.6 |
 
 ```bash
-python examples/vlm/sft/snake/smolvlm2-500m-video-instruct/prepare_data.py \
+python examples/vlm/sft/snake/prepare_data.py \
     --output_dir ./data/vla-games/snake_sft
 python main_sft.py --config examples/vlm/sft/snake/smolvlm2-500m-video-instruct/train.yaml
 ```
 
-See the [experiment README](vlm/sft/snake/smolvlm2-500m-video-instruct/README.md) for videos, rollout instructions, and the interactive UI.
+See the [experiment README](vlm/sft/snake/README.md) for the training progression, rollout instructions, and the interactive UI.
 
 ---
 

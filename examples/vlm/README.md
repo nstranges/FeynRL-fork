@@ -27,7 +27,7 @@ Both experiments below use the same model and dataset; SFT runs supervised fine-
 
 ### Dataset
 
-[MM-Math](https://huggingface.co/datasets/...) is a multimodal math reasoning dataset. Each row contains an image alongside a math problem and worked solution.
+[MM-Math](https://huggingface.co/datasets/THU-KEG/MM_Math) is a multimodal math reasoning dataset. Each row contains an image alongside a math problem and worked solution.
 
 Prepare the train/val/test parquet files with:
 
