@@ -32,7 +32,7 @@ Both experiments below use the same model and dataset; SFT runs supervised fine-
 Prepare the train/val/test parquet files with:
 
 ```bash
-python data_prep/mm_math.py --output_dir ./data/mm_math
+python data_prep/mm_math.py --local_dir ./data/mm_math
 ```
 
 This produces:
@@ -43,6 +43,24 @@ This produces:
 Update `data.train_files_path` / `data.val_files_path` / `data.test_files_path` in the configs if you place them elsewhere.
 
 For other supported eval benchmarks ([Geometry3K](https://huggingface.co/datasets/hiyouga/geometry3k), [MathVista](https://huggingface.co/datasets/AI4Math/MathVista)), prepare the corresponding test parquets and swap `data.test_files_path` accordingly.
+
+### Sample Processed Row
+
+The parquet rows look like a compact Hugging Face dataset card entry: one image, one chat-style prompt, the full worked solution for SFT, and a short extracted answer for evaluation.
+
+| Field | Sample value |
+| ----- | ------------ |
+| `image` | ![MM-Math sample](sft/mm_math/mm_math_sample.png) |
+| `question` | `As shown in the figure, fold the rectangular paper ABCD so that edge DC falls on the diagonal line AC, with the fold line being CE, and point D falling on point F on the diagonal line. If AB=6 and AD=8, what is the length of ED?` |
+| `prompt` | <pre><code>[{"role": "system", "content": "You are a helpful assistant. Solve the math problem shown in the image."}, {"role": "user", "content": "As shown in the figure, fold the rectangular paper ABCD so that edge DC falls on the diagonal line AC, with the fold line being CE, and point D falling on point F on the diagonal line. If AB=6 and AD=8, what is the length of ED?"}]</code></pre> |
+| `answer` | <pre><code>Solution: In rectangle $ABCD$, $AB=6$, $AD=8$, \\ \n$\\therefore$ $DC=6$, \\ \n$\\therefore$ $AC=\\sqrt{AD^{2}+DC^{2}}=10$, \\ \nFrom the folding, it follows that $\\triangle DEC \\cong \\triangle FEC$, \\ \n$\\therefore$ $FC=DC=6$, $DE=FE$, \\ \nLet $ED=x$, then $FE=x$, $AF=AC−CF=4$, $AE=8−x$, \\ \nIn $\\triangle AEF$: $AF^{2}+EF^{2}=AE^{2}$, \\ \n$4^{2}+x^{2}=(8−x)^{2}$, \\ \nSolving this yields: $x=\\boxed{3}$.</code></pre> |
+| `solution` | `3` |
+| `image_bytes` | PNG-encoded bytes for the image above |
+| `year` | `eight` |
+| `difficult` | `medium` |
+| `knowledge` | `{"level_1": "Transformations of Shapes", "level_2": "Symmetry of Shapes"}` |
+| `split` | `train` |
+| `index` | `0` |
 
 ---
 
@@ -158,5 +176,7 @@ Replace `model.name` with your checkpoint path and `data.test_files_path` with y
 ---
 
 ## Snake Game
+
+![Snake training progression](sft/snake/snake_progression.gif)
 
 A VLM trained to play classic Snake from pixel observations via supervised imitation of a BFS oracle. See [`sft/snake/README.md`](sft/snake/README.md) for the full experiment overview, environment description, and results.
