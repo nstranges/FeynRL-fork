@@ -42,8 +42,8 @@ Text-only models fine-tuned on math reasoning datasets with SFT and GRPO. See [`
 **Quick start:**
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/eval.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml --experiment_id ....
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/eval.yaml --experiment_id ....
 ```
 
 ### RL (GRPO)
@@ -56,8 +56,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/s
 **Quick start:**
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_sync.yaml
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/eval.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_sync.yaml --experiment_id ....
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/eval.yaml --experiment_id ....
 ```
 
 ---
@@ -75,8 +75,8 @@ Vision-language models fine-tuned on math reasoning and game control. See [`vlm/
 | GRPO   | **34.0%** | **34.1%** | **62.0%** |
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/train.yaml
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/eval.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/train.yaml --experiment_id ....
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/eval.yaml --experiment_id ....
 ```
 
 ### Snake Game (SmolVLM2-500M-Video-Instruct)
@@ -90,7 +90,7 @@ A 500 M VLM learns to play Snake from pixel observations via supervised imitatio
 ```bash
 python examples/vlm/sft/snake/prepare_data.py \
     --output_dir ./data/vla-games/snake_sft
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/vlm/sft/snake/smolvlm2-500m-video-instruct/train.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/vlm/sft/snake/smolvlm2-500m-video-instruct/train.yaml --experiment_id ....
 ```
 
 See the [experiment README](vlm/sft/snake/README.md) for the training progression, rollout instructions, and the interactive UI.
