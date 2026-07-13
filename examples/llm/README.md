@@ -32,7 +32,7 @@ llm/
 ### Data Preparation
 
 ```bash
-python data_prep/gsm8k.py --local_dir ./data --system_prompt ""
+python data_prep/gsm8k.py --local_dir ./data --system_prompt "" --no_system_role
 ```
 
 The script writes `gsm8k_processed_{run_id}_ns_train.parquet`, `..._val.parquet`, and `..._test.parquet` under `./data/`. Update `data.train_files_path`, `data.val_files_path` (training config), and `data.test_files_path` (evaluation config) to match.
