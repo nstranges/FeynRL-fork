@@ -2,6 +2,8 @@
 
 Text-only language model experiments using FeynRL's SFT and RL (GRPO) pipelines on mathematical reasoning datasets.
 
+> **Note:** Commands below pass `--experiment_id EXPNAME` — replace `EXPNAME` with your own experiment name/ID. It's used to name the output directory for logs, checkpoints, and metrics.
+
 ## Directory Layout
 
 ```text
@@ -40,7 +42,7 @@ The script writes `gsm8k_processed_{run_id}_ns_train.parquet`, `..._val.parquet`
 ### Training
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml --experiment_id ....
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml --experiment_id EXPNAME
 ```
 
 ![FeynRL loss curve](sft/gsm8k/gemma-2-2b-it/feynrl_loss_curve.png)
@@ -75,7 +77,7 @@ SFT improves pass@1 by **+10.78 pp** over the base model.
 ### Reproducing Evaluation
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/eval.yaml --experiment_id ....
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/eval.yaml --experiment_id EXPNAME
 ```
 
 Replace `model.name` with your checkpoint path and `data.test_files_path` with your target benchmark parquet.
@@ -89,8 +91,8 @@ The following applies to the RL (GRPO) experiments below.
 - **Algorithm:** GRPO
 - **DeepSpeed:** ZeRO stage 2/3, bf16
 - **Hardware:** 8×H100 GPUs with CUDA v12.4
-- **Training:** `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/<dataset>/<model>/train_sync.yaml --experiment_id ....`
-- **Evaluation:** `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/rl/<dataset>/<model>/eval.yaml --experiment_id ....`
+- **Training:** `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/<dataset>/<model>/train_sync.yaml --experiment_id EXPNAME`
+- **Evaluation:** `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/rl/<dataset>/<model>/eval.yaml --experiment_id EXPNAME`
 
 ### Shared Evaluation Protocol
 
@@ -129,10 +131,10 @@ The script writes `gsm8k_processed_{run_id}_ns_train.parquet` and `gsm8k_process
 
 ```bash
 # Synchronous (no overlap)
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_sync.yaml --experiment_id ....
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_sync.yaml --experiment_id EXPNAME
 
 # Asynchronous (with overlap)
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_async.yaml --experiment_id ....
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_async.yaml --experiment_id EXPNAME
 ```
 
 The reward curves below overlay the sync and async runs over the first hour of wall-clock training time.
@@ -186,10 +188,10 @@ At 1 hour, the sync run reaches **0.894** reward and the async run reaches **0.8
 
 ```bash
 # Synchronous (no overlap)
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen3-4b-thinking-2507/train_sync.yaml --experiment_id ....
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen3-4b-thinking-2507/train_sync.yaml --experiment_id EXPNAME
 
 # Asynchronous (with overlap)
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen3-4b-thinking-2507/train_async.yaml --experiment_id ....
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen3-4b-thinking-2507/train_async.yaml --experiment_id EXPNAME
 ```
 
 The reward curves below overlay the sync and async runs over the first 8 hours of wall-clock training time.
