@@ -78,7 +78,7 @@ The parquet rows look like a compact Hugging Face dataset card entry: one image,
 ### Training
 
 ```bash
-python main_sft.py --config examples/vlm/sft/mm_math/qwen2.5-vl-3b-instruct/train.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/vlm/sft/mm_math/qwen2.5-vl-3b-instruct/train.yaml
 ```
 
 ### Key Training Settings
@@ -108,7 +108,7 @@ Evaluated on MM-Math test, Geometry3K, and MathVista using greedy decoding (temp
 ### Reproducing Evaluation
 
 ```bash
-python main_eval.py --config examples/vlm/sft/mm_math/qwen2.5-vl-3b-instruct/eval.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/vlm/sft/mm_math/qwen2.5-vl-3b-instruct/eval.yaml
 ```
 
 Replace `model.name` with your checkpoint path and `data.test_files_path` with your target benchmark parquet.
@@ -130,7 +130,7 @@ Replace `model.name` with your checkpoint path and `data.test_files_path` with y
 ### Training
 
 ```bash
-python main_rl.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/train.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/train.yaml
 ```
 
 ### Key Training Settings
@@ -168,7 +168,7 @@ GRPO improves pass@1 by **+11.0 pp** on MM-Math, **+5.6 pp** on Geometry3K, and 
 ### Reproducing Evaluation
 
 ```bash
-python main_eval.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/eval.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/eval.yaml
 ```
 
 Replace `model.name` with your checkpoint path and `data.test_files_path` with your target benchmark parquet.
