@@ -1,11 +1,14 @@
 # LLM Experiments
 
-Text-only language model experiments using FeynRL's RL (GRPO) pipeline on mathematical reasoning datasets.
+Text-only language model experiments using FeynRL's SFT and RL (GRPO) pipelines on mathematical reasoning datasets.
 
 ## Directory Layout
 
 ```text
 llm/
+├── sft/
+│   └── gsm8k/
+│       └── gemma-2-2b-it/              # SFT on GSM8K with Gemma-2-2B-it
 ├── rl/
 │   └── gsm8k/
 │       ├── qwen2.5-1.5b-instruct/      # GRPO on GSM8K with Qwen2.5-1.5B-Instruct
@@ -15,7 +18,73 @@ llm/
 
 ---
 
-## Shared Setup
+## Gemma-2-2B-it — GSM8K (SFT)
+
+| Item              | Value                                                                                   |
+| ------------------ | ---------------------------------------------------------------------------------------- |
+| Model              | `google/gemma-2-2b-it`                                                                  |
+| Training dataset   | [GSM8K](https://huggingface.co/datasets/openai/gsm8k)                                  |
+| Algorithm          | SFT (supervised fine-tuning)                                                             |
+| DeepSpeed          | ZeRO stage 3, bf16                                                                       |
+| Training config    | [`sft/gsm8k/gemma-2-2b-it/train.yaml`](sft/gsm8k/gemma-2-2b-it/train.yaml)             |
+| Evaluation config  | [`sft/gsm8k/gemma-2-2b-it/eval.yaml`](sft/gsm8k/gemma-2-2b-it/eval.yaml)               |
+
+### Data Preparation
+
+```bash
+python data_prep/gsm8k.py --local_dir ./data --system_prompt ""
+```
+
+The script writes `gsm8k_processed_{run_id}_ns_train.parquet`, `..._val.parquet`, and `..._test.parquet` under `./data/`. Update `data.train_files_path`, `data.val_files_path` (training config), and `data.test_files_path` (evaluation config) to match.
+
+### Training
+
+```bash
+python main_sft.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml
+```
+
+![FeynRL loss curve](sft/gsm8k/gemma-2-2b-it/feynrl_loss_curve.png)
+
+### Evaluation Results
+
+Evaluated on the GSM8K test set with `n_samples=8`, temperature `1.0`.
+
+| Model  | GSM8K pass@1 |
+| ------ | -----------: |
+| Base   |       21.81% |
+| FeynRL |   **32.59%** |
+
+SFT improves pass@1 by **+10.78 pp** over the base model.
+
+### Key Training Settings
+
+| Parameter             | Value                       |
+| ---------------------- | --------------------------- |
+| Model                  | google/gemma-2-2b-it        |
+| Dataset                | GSM8K                       |
+| Learning rate          | 1e-5                        |
+| LR scheduler           | WarmupCosineLR (10% warmup) |
+| Train batch per GPU    | 1                           |
+| Gradient accumulation  | 16                          |
+| Micro batches / epoch  | 416                         |
+| Max sequence length    | 4096                        |
+| DeepSpeed              | ZeRO stage 3, bf16          |
+| LoRA                   | disabled (full fine-tune)   |
+| Total epochs           | 2                           |
+
+### Reproducing Evaluation
+
+```bash
+python main_eval.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/eval.yaml
+```
+
+Replace `model.name` with your checkpoint path and `data.test_files_path` with your target benchmark parquet.
+
+---
+
+## RL Shared Setup
+
+The following applies to the RL (GRPO) experiments below.
 
 - **Algorithm:** GRPO
 - **DeepSpeed:** ZeRO stage 2/3, bf16

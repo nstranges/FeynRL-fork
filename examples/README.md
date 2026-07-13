@@ -7,6 +7,9 @@ A curated set of FeynRL experiments organized by model type, algorithm, and data
 ```text
 examples/
 ├── llm/                                              # Text-only language models
+│   ├── sft/
+│   │   └── gsm8k/
+│   │       └── gemma-2-2b-it/                       # SFT on GSM8K
 │   └── rl/
 │       └── gsm8k/
 │           ├── qwen2.5-1.5b-instruct/               # GRPO on GSM8K
@@ -28,7 +31,22 @@ examples/
 
 ## LLM — Mathematical Reasoning
 
-Text-only models trained with GRPO on math reasoning datasets. See [`llm/README.md`](llm/README.md) for full details and reproduction instructions.
+Text-only models fine-tuned on math reasoning datasets with SFT and GRPO. See [`llm/README.md`](llm/README.md) for full details and reproduction instructions.
+
+### SFT
+
+| Model         | Dataset | GSM8K pass@1 (base → FeynRL) |
+| ------------- | ------- | ------------------------------: |
+| Gemma-2-2B-it | GSM8K   |            21.81% → **32.59%** |
+
+**Quick start:**
+
+```bash
+python main_sft.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml
+python main_eval.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/eval.yaml
+```
+
+### RL (GRPO)
 
 | Model                   | Dataset    | Avg pass@1 (base → FeynRL) | Avg pass@16 (base → FeynRL) |
 | ----------------------- | ---------- | -------------------------: | --------------------------: |
