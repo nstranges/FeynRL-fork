@@ -4,22 +4,27 @@ import re
 import datasets
 # adopted based on https://github.com/volcengine/verl/blob/main/examples/data_preprocess/gsm8k.py
 
-def create_prompt(question, system_prompt):
+def create_prompt(question, system_prompt, merge_system_into_user=False):
     '''
        This creates general message with or without system prompt.
     '''
     if system_prompt:
-        message = [
-                    {"role": "system", "content": system_prompt}, 
-                    {"role": "user", "content": question}
-                  ]
+        if merge_system_into_user:
+            message = [
+                        {"role": "user", "content": system_prompt + "\n\n" + question}
+                      ]
+        else:
+            message = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": question}
+                      ]
 
     else:
-        message = [ 
+        message = [
                     {"role": "user", "content": question}
                   ]
 
-    return message     
+    return message
 
 def extract_solution(solution_str):
     '''
@@ -42,7 +47,7 @@ def make_map_fn(split, params):
         question   = example.pop("question")
         answer_raw = example.pop("answer")
         solution   = extract_solution(answer_raw)
-        data       = {"prompt": create_prompt(question, params.system_prompt),
+        data       = {"prompt": create_prompt(question, params.system_prompt, params.no_system_role),
                       "answer": answer_raw, # this will be used for training which contains the both training traces and final answer after ####.
                       "solution": solution, # this will be used for evaluation.
                       "split": split,
@@ -69,6 +74,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_proc", type=int, default=4)
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Ratio of training data to use for validation")
     parser.add_argument("--seed", type=int, default=123345)
+    parser.add_argument("--no_system_role", action="store_true", default=False, help="Merge system prompt into user turn, for models (e.g. Gemma) that don't support a system role")
     args = parser.parse_args()
 
     ########
