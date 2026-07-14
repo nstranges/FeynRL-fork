@@ -44,7 +44,7 @@ Text-only models fine-tuned on math reasoning datasets with SFT and GRPO. See [`
 **Quick start:**
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sl.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml --experiment_id EXPNAME
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/eval.yaml --experiment_id EXPNAME
 ```
 
@@ -92,7 +92,7 @@ A 500 M VLM learns to play Snake from pixel observations via supervised imitatio
 ```bash
 python examples/vlm/sft/snake/prepare_data.py \
     --output_dir ./data/vla-games/snake_sft
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/vlm/sft/snake/smolvlm2-500m-video-instruct/train.yaml --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sl.py --config examples/vlm/sft/snake/smolvlm2-500m-video-instruct/train.yaml --experiment_id EXPNAME
 ```
 
 See the [experiment README](vlm/sft/snake/README.md) for the training progression, rollout instructions, and the interactive UI.
@@ -102,7 +102,7 @@ See the [experiment README](vlm/sft/snake/README.md) for the training progressio
 ## Reproducing Any Experiment
 
 1. **Prepare data** — run the dataset-specific prep script or download a pre-built parquet
-2. **Train** — `python main_rl.py --config <train_config>` (RL) or `python main_sft.py --config <train_config>` (SFT)
+2. **Train** — `python main_rl.py --config <train_config>` (RL) or `python main_sl.py --config <train_config>` (SFT)
 3. **Evaluate** — `python main_eval.py --config <eval_config>` (math benchmarks) or the rollout script (game tasks)
 
 Update `model.name`, `run.checkpoint_dir`, and `data.*_files_path` in the configs to point at your local paths before running.

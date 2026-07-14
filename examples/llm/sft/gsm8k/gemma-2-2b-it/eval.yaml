@@ -9,7 +9,6 @@ run:
   seed: 42
   rollout_timeout: 3600
   init_timeout: 3600
-  dump_eval_records: True
 
 reward:
   broadcast: False

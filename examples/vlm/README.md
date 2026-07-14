@@ -80,7 +80,7 @@ The parquet rows look like a compact Hugging Face dataset card entry: one image,
 ### Training
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/vlm/sft/mm_math/qwen2.5-vl-3b-instruct/train.yaml --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sl.py --config examples/vlm/sft/mm_math/qwen2.5-vl-3b-instruct/train.yaml --experiment_id EXPNAME
 ```
 
 ### Key Training Settings

@@ -34,15 +34,15 @@ llm/
 ### Data Preparation
 
 ```bash
-python data_prep/gsm8k.py --local_dir ./data --system_prompt "" --no_system_role
+python data_prep/gsm8k.py --local_dir ./data --system_prompt ""
 ```
 
-The script writes `gsm8k_processed_{run_id}_ns_train.parquet`, `..._val.parquet`, and `..._test.parquet` under `./data/`. Update `data.train_files_path`, `data.val_files_path` (training config), and `data.test_files_path` (evaluation config) to match. NOTE: `--no_system_role` is required for Gemma-2-2B-it as it does not support the system role.
+The script writes `gsm8k_processed_{run_id}_ns_train.parquet`, `..._val.parquet`, and `..._test.parquet` under `./data/`. Update `data.train_files_path`, `data.val_files_path` (training config), and `data.test_files_path` (evaluation config) to match. Also rename the `data.train_ratios` key to match the new parquet filename stem (e.g. `gsm8k_processed_{run_id}_ns_train`) — it must match the training file's basename exactly, or startup fails with `Dataset/ratio key mismatch`.
 
 ### Training
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sft.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sl.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml --experiment_id EXPNAME
 ```
 
 ![FeynRL loss curve](sft/gsm8k/gemma-2-2b-it/feynrl_loss_curve.png)
@@ -125,7 +125,7 @@ Downstream evaluation reports pass@1 and pass@16 across 10 mathematical reasonin
 python data_prep/gsm8k.py --local_dir ./data --system_prompt ""
 ```
 
-The script writes `gsm8k_processed_{run_id}_ns_train.parquet` and `gsm8k_processed_{run_id}_ns_val.parquet` under `./data/`. Update `data.train_files_path` and `data.val_files_path` in the training config to match.
+The script writes `gsm8k_processed_{run_id}_ns_train.parquet` and `gsm8k_processed_{run_id}_ns_val.parquet` under `./data/`. Update `data.train_files_path` and `data.val_files_path` in the training config to match. Also rename the `data.train_ratios` key to match the new parquet filename stem (e.g. `gsm8k_processed_{run_id}_ns_train`) — it must match the training file's basename exactly, or startup fails with `Dataset/ratio key mismatch`.
 
 ### Training
 
